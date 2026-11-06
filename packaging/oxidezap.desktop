@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=OxideZap
+GenericName=WhatsApp Web Client
+Comment=A lightweight WhatsApp Web desktop client for Linux
+Exec=oxidezap %u
+Icon=oxidezap
+Terminal=false
+Categories=Network;InstantMessaging;
+Keywords=WhatsApp;chat;messaging;
+StartupWMClass=oxidezap
+StartupNotify=true
+MimeType=x-scheme-handler/whatsapp;
+X-GNOME-UsesNotifications=true

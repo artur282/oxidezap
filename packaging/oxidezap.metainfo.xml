@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.artur282.OxideZap</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>OxideZap</name>
+  <summary>A lightweight WhatsApp Web desktop client for Linux</summary>
+  <description>
+    <p>
+      OxideZap wraps the official WhatsApp Web interface in a native desktop shell
+      built with Rust and GPUI.
+    </p>
+    <p>
+      It supports multiple isolated accounts, a system tray, native notifications,
+      an application lock, and a native settings window. The WhatsApp Web page runs
+      in WebKitGTK; the shell does not bundle a second browser engine.
+    </p>
+  </description>
+  <launchable type="desktop-id">oxidezap.desktop</launchable>
+  <url type="homepage">https://github.com/artur282/oxidezap</url>
+  <url type="bugtracker">https://github.com/artur282/oxidezap/issues</url>
+  <developer id="io.github.artur282">
+    <name>artur282</name>
+  </developer>
+  <categories>
+    <category>Network</category>
+    <category>InstantMessaging</category>
+  </categories>
+  <provides>
+    <binary>oxidezap</binary>
+  </provides>
+  <releases>
+    <release version="0.1.0" date="2026-11-06">
+      <description>
+        <p>Initial release.</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

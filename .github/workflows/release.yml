@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build release archive
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang cmake ninja-build \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libgtk-3-dev libxkbcommon-dev libfontconfig1-dev \
+            libfreetype-dev libvulkan-dev libx11-dev libxcb1-dev \
+            libwayland-dev libssl-dev
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package release archive
+        run: |
+          set -eu
+          name="oxidezap-${GITHUB_REF_NAME}-x86_64-linux"
+          mkdir -p "dist/${name}/packaging" "dist/${name}/assets"
+          cp target/release/oxidezap "dist/${name}/oxidezap"
+          cp README.md LICENSE install.sh "dist/${name}/"
+          chmod +x "dist/${name}/oxidezap" "dist/${name}/install.sh"
+          cp packaging/oxidezap.desktop packaging/oxidezap.metainfo.xml \
+            "dist/${name}/packaging/"
+          cp assets/oxidezap.svg "dist/${name}/assets/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/oxidezap-*.tar.gz
+          fail_on_unmatched_files: true
+          generate_release_notes: true
