@@ -402,7 +402,7 @@ fn create_entry(
     connect_webview_signals(&webview, account_id, events.clone());
     connect_downloads(&context, account_id, events, downloads_dir);
     webview.connect_key_press_event(|webview, event| {
-        if try_paste_files(webview, event) {
+        if try_paste_clipboard(webview, event) {
             glib::Propagation::Stop
         } else {
             glib::Propagation::Proceed
@@ -763,16 +763,23 @@ const PASTE_HELPER: &str = r#"
 
   function inputFor(kind) {
     var inputs = document.querySelectorAll('input[type="file"]');
+    if (kind === "media") {
+      // Only the photos/videos input advertises video. Image-only inputs
+      // (notably the sticker input) would turn a pasted screenshot into a
+      // sticker, so they are never selected here.
+      for (var m = 0; m < inputs.length; m++) {
+        var media = inputs[m];
+        if (media.isConnected === false) continue;
+        if (/video/i.test((media.accept || "").trim())) return media;
+      }
+      return null;
+    }
     for (var i = 0; i < inputs.length; i++) {
       var input = inputs[i];
       if (input.isConnected === false) continue;
       var accept = (input.accept || "").trim();
-      if (kind === "media") {
-        if (/video/i.test(accept)) return input;
-      } else {
-        if (accept === "" || accept === "*" || accept === "*/*") return input;
-        if (!/image/i.test(accept) && !/video/i.test(accept)) return input;
-      }
+      if (accept === "" || accept === "*" || accept === "*/*") return input;
+      if (!/image/i.test(accept) && !/video/i.test(accept)) return input;
     }
     return null;
   }
@@ -898,7 +905,7 @@ const PASTE_HELPER: &str = r#"
 })();
 "#;
 
-fn try_paste_files(webview: &webkit2gtk::WebView, event: &gtk::gdk::EventKey) -> bool {
+fn try_paste_clipboard(webview: &webkit2gtk::WebView, event: &gtk::gdk::EventKey) -> bool {
     let is_paste = event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK)
         && (event.keyval() == gtk::gdk::keys::constants::v
             || event.keyval() == gtk::gdk::keys::constants::V);
@@ -908,71 +915,111 @@ fn try_paste_files(webview: &webkit2gtk::WebView, event: &gtk::gdk::EventKey) ->
 
     let clipboard = gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD);
     let uris = clipboard.wait_for_uris();
-    if uris.is_empty() {
-        return false;
-    }
+    if !uris.is_empty() {
+        let mut total = 0u64;
+        let mut files: Vec<(String, String, Vec<String>)> = Vec::new();
+        for uri in uris {
+            let Ok(url) = url::Url::parse(uri.as_str()) else {
+                continue;
+            };
+            if url.scheme() != "file" {
+                continue;
+            }
+            let Ok(path) = url.to_file_path() else {
+                continue;
+            };
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            total = total.saturating_add(metadata.len());
+            if total > PASTE_MAX_BYTES {
+                crate::notify::notify(
+                    "File too large",
+                    "Use the attach button for files over 64 MB.",
+                    None,
+                );
+                return true;
+            }
 
-    let mut total = 0u64;
-    let mut files: Vec<(String, String, Vec<String>)> = Vec::new();
-    for uri in uris {
-        let Ok(url) = url::Url::parse(uri.as_str()) else {
-            continue;
-        };
-        if url.scheme() != "file" {
-            continue;
-        }
-        let Ok(path) = url.to_file_path() else {
-            continue;
-        };
-        let Ok(metadata) = std::fs::metadata(&path) else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        total = total.saturating_add(metadata.len());
-        if total > PASTE_MAX_BYTES {
-            crate::notify::notify(
-                "File too large",
-                "Use the attach button for files over 64 MB.",
-                None,
-            );
-            return true;
-        }
-
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file")
-            .to_string();
-        let mime = mime_for_path(&path);
-        let Ok(mut handle) = std::fs::File::open(&path) else {
-            continue;
-        };
-        let mut chunks = Vec::new();
-        let mut buffer = vec![0u8; PASTE_CHUNK_BYTES];
-        loop {
-            match handle.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    chunks.push(glib::base64_encode(&buffer[..read]).to_string());
-                }
-                Err(error) => {
-                    warn!(%error, path = %path.display(), "could not read a pasted file");
-                    chunks.clear();
-                    break;
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("file")
+                .to_string();
+            let mime = mime_for_path(&path);
+            let Ok(mut handle) = std::fs::File::open(&path) else {
+                continue;
+            };
+            let mut chunks = Vec::new();
+            let mut buffer = vec![0u8; PASTE_CHUNK_BYTES];
+            loop {
+                match handle.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        chunks.push(glib::base64_encode(&buffer[..read]).to_string());
+                    }
+                    Err(error) => {
+                        warn!(%error, path = %path.display(), "could not read a pasted file");
+                        chunks.clear();
+                        break;
+                    }
                 }
             }
+            if !chunks.is_empty() {
+                files.push((name, mime, chunks));
+            }
         }
-        if !chunks.is_empty() {
-            files.push((name, mime, chunks));
+
+        if !files.is_empty() {
+            queue_paste_files(webview, files);
+            return true;
         }
     }
 
-    if files.is_empty() {
+    // Screenshots and images copied by image editors live in the clipboard as
+    // image data instead of a file URI. Encode them as PNG so WhatsApp can
+    // attach them exactly like a pasted image file.
+    let Some(pixbuf) = clipboard.wait_for_image() else {
+        return false;
+    };
+    let bytes = match pixbuf.save_to_bufferv("png", &[]) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(%error, "could not encode the clipboard image");
+            return false;
+        }
+    };
+    if bytes.is_empty() {
         return false;
     }
+    if bytes.len() as u64 > PASTE_MAX_BYTES {
+        crate::notify::notify(
+            "Image too large",
+            "Use the attach button for images over 64 MB.",
+            None,
+        );
+        return true;
+    }
+    let files = vec![(
+        "screenshot.png".to_string(),
+        "image/png".to_string(),
+        base64_chunks(&bytes),
+    )];
+    queue_paste_files(webview, files);
+    true
+}
 
+fn base64_chunks(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .chunks(PASTE_CHUNK_BYTES)
+        .map(|chunk| glib::base64_encode(chunk).to_string())
+        .collect()
+}
+
+fn queue_paste_files(webview: &webkit2gtk::WebView, files: Vec<(String, String, Vec<String>)>) {
     let metadata: Vec<serde_json::Value> = files
         .iter()
         .map(|(name, mime, _)| serde_json::json!({ "name": name, "type": mime }))
@@ -990,7 +1037,6 @@ fn try_paste_files(webview: &webkit2gtk::WebView, event: &gtk::gdk::EventKey) ->
     queue.push_back("__oxidezapPaste.commit();".to_string());
 
     run_script_queue(webview.clone(), Rc::new(RefCell::new(queue)));
-    true
 }
 
 fn run_script_queue(webview: webkit2gtk::WebView, queue: Rc<RefCell<VecDeque<String>>>) {
@@ -1048,6 +1094,18 @@ mod tests {
         assert_eq!(sanitize_filename("photo.jpg"), "photo.jpg");
         assert_eq!(sanitize_filename("../../etc/passwd"), ".._.._etc_passwd");
         assert_eq!(sanitize_filename(""), "download");
+    }
+
+    #[test]
+    fn base64_chunks_round_trip() {
+        let bytes = vec![0x5a; PASTE_CHUNK_BYTES + 5];
+        let chunks = base64_chunks(&bytes);
+        assert_eq!(chunks.len(), 2);
+        let decoded: Vec<u8> = chunks
+            .iter()
+            .flat_map(|chunk| glib::base64_decode(chunk))
+            .collect();
+        assert_eq!(decoded, bytes);
     }
 
     #[test]

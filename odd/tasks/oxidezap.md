@@ -25,7 +25,7 @@ S8. **App lock**: optional Argon2id password. Lock on launch, on hide, and after
 
 S9. **Links and downloads**: external `http(s)`, `mailto:`, and `tel:` links open in the system browser/app; `wa.me`, `chat.whatsapp.com`, and `web.whatsapp.com` stay in the app. Internal `whatsapp.net` utility pages (for example `flows.whatsapp.net/flows/cache_management/`) stay in the webview and never open a browser tab. Downloads go to `~/Downloads` and produce a native notification with the destination. `whatsapp://` arguments open the matching chat.
 
-S12. **Clipboard file paste**: pressing `Ctrl+V` with file URIs from the file manager reads the files and injects them into WhatsApp Web's own attach flow. Images and supported videos use the media input; documents and fallbacks use the document input. The total is capped at 64 MB per paste; larger files must use the attach button.
+S12. **Clipboard paste**: pressing `Ctrl+V` with file URIs from the file manager reads the files and injects them into WhatsApp Web's own attach flow. Screenshots and image data stored directly in the GTK clipboard are encoded as PNG and injected the same way. Images use only the photo/video input (the input that advertises video), never image-only inputs such as the sticker input, so pasted screenshots are sent as photos. Documents and fallbacks use the document input. The total is capped at 64 MB per paste; larger files must use the attach button.
 
 S10. **Quality**: unit tests for settings serialization, unread parsing, shortcut parsing, account path isolation, and lock hashing. A `--smoke-test` mode starts the app on a real X11 display with a local HTML page, verifies the embedded webview and transient geometry, prints `SMOKE OK`, and exits 0. Xvfb cannot present GPUI because it lacks DRI3, so the smoke test is local-only. CI runs formatting, Clippy, tests, and a release build on Ubuntu 24.04.
 
@@ -42,6 +42,7 @@ S11. **Packaging**: `install.sh` installs the binary to `~/.local/bin`, the `.de
 - T7 Packaging, CI, install script, README final pass, icon PNGs. Route: delegated (independent delivery unit). Status: done.
 - T8 Tests, smoke test, local verification, screenshots. Route: inline + delegated verifier if a high-risk item is named. Status: done.
 - T9 Clipboard file paste: file-URI interception, base64 chunk transport, WhatsApp attach-menu injection, 64 MB cap. Route: inline. Status: done.
+- T10 Clipboard image paste: GTK clipboard image extraction, PNG encoding, base64 transport, photo-input selection that excludes the sticker input. Route: inline. Status: done.
 
 ## Log
 
@@ -87,3 +88,14 @@ L11 (2026-11-06, user report verbatim):
 > cuando quiero pegar con ctrl + v un archivo,foto,video que copie no me deja pegarlo tengo que darle al boton de adjuntar
 
 Diagnosis: WebKitGTK exposes a file copied in the file manager as a `text/uri-list` clipboard string, not as `clipboardData.files`. WhatsApp Web only attaches from `clipboardData.files`, so Ctrl+V inserted nothing. Fix: a WebView `key-press-event` handler recognizes Ctrl+V, reads GTK clipboard URIs, filters local files, and streams the bytes as base64 chunks into a page helper. The helper creates `File` objects, finds or mounts WhatsApp's media/document file input through the attach menu, sets `input.files`, and dispatches `change`/`input`. Media uses the media input; documents and fallback use the document input. Total paste size is capped at 64 MB; larger files show a notification and must use the attach button. Unit/mock verification covers base64 chunk assembly and `input.files` injection; live chat verification is pending a fresh WhatsApp login because the test session reached the QR page.
+
+L12 (2026-11-06, user reports verbatim):
+
+> listo ahora el problema que tengo es que si tengo imagenes en el portapapeles al moemnto de pegarlas no me deja
+> ejemplo hago una captur de pantalla no la puede pegar
+
+> ya se pega correctamente pero al momento de enviar se envia como un stiker
+
+> listo ya se envia bien
+
+Diagnosis: a screenshot lives in the GTK clipboard as `image/png` data, not as a `text/uri-list`, so the file-only paste handler returned false and WebKit's default paste did not attach it. Fix: after the file-URI path finds nothing, `try_paste_clipboard` reads `wait_for_image()`, encodes the pixbuf as PNG, chunks it with the existing base64 transport, and injects it as `screenshot.png` with type `image/png`. The first version selected any input whose `accept` mentioned image or video, which could pick WhatsApp's image-only sticker input; the sent message was a sticker. The helper now selects only the video-capable photos/videos input, and never the sticker input. Added a base64 chunk round-trip test. Verification: `cargo test` -> 37 passed, 0 failed; `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings` clean; installed release; a screenshot pasted into the self chat previewed as a normal photo and arrived as `Foto`, not a sticker. The user confirmed: "listo ya se envia bien".

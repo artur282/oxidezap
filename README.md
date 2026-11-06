@@ -50,7 +50,7 @@ That split matters:
 ### Native shell
 
 - **Custom GPUI titlebar** with the account name, unread badge, settings, lock, minimize, maximize, and close controls, plus drag and edge-resize support.
-- **Clipboard file paste.** Copy a file, photo, or video in the file manager and press `Ctrl+V` in a chat: OxideZap injects it into WhatsApp's attachment flow. Files over 64 MB should use the attach button.
+- **Clipboard paste.** Copy a file, photo, video, or a screenshot/image from the clipboard and press `Ctrl+V` in a chat: OxideZap injects it into WhatsApp's attachment flow. Screenshots and image data are encoded as PNG and sent as photos, never as stickers. Files over 64 MB should use the attach button.
 - **Settings window** with Accounts, Appearance, Notifications, General, Security, and About sections.
 - **Themes**: System, Light, and Dark for the native shell.
 - **WhatsApp zoom** from 80% to 150%.
