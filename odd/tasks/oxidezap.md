@@ -25,6 +25,8 @@ S8. **App lock**: optional Argon2id password. Lock on launch, on hide, and after
 
 S9. **Links and downloads**: external `http(s)`, `mailto:`, and `tel:` links open in the system browser/app; `wa.me`, `chat.whatsapp.com`, and `web.whatsapp.com` stay in the app. Internal `whatsapp.net` utility pages (for example `flows.whatsapp.net/flows/cache_management/`) stay in the webview and never open a browser tab. Downloads go to `~/Downloads` and produce a native notification with the destination. `whatsapp://` arguments open the matching chat.
 
+S12. **Clipboard file paste**: pressing `Ctrl+V` with file URIs from the file manager reads the files and injects them into WhatsApp Web's own attach flow. Images and supported videos use the media input; documents and fallbacks use the document input. The total is capped at 64 MB per paste; larger files must use the attach button.
+
 S10. **Quality**: unit tests for settings serialization, unread parsing, shortcut parsing, account path isolation, and lock hashing. A `--smoke-test` mode starts the app on a real X11 display with a local HTML page, verifies the embedded webview and transient geometry, prints `SMOKE OK`, and exits 0. Xvfb cannot present GPUI because it lacks DRI3, so the smoke test is local-only. CI runs formatting, Clippy, tests, and a release build on Ubuntu 24.04.
 
 S11. **Packaging**: `install.sh` installs the binary to `~/.local/bin`, the `.desktop` entry, the icon, and the `whatsapp://` handler. A GitHub Actions workflow builds release artifacts and runs tests. README documents requirements, build, install, usage, limitations, and the unofficial status.
@@ -39,6 +41,7 @@ S11. **Packaging**: `install.sh` installs the binary to `~/.local/bin`, the `.de
 - T6 Tray, badge, native notifications plumbing, autostart, global shortcut. Route: delegated (independent integration unit) after T2 interfaces. Status: done.
 - T7 Packaging, CI, install script, README final pass, icon PNGs. Route: delegated (independent delivery unit). Status: done.
 - T8 Tests, smoke test, local verification, screenshots. Route: inline + delegated verifier if a high-risk item is named. Status: done.
+- T9 Clipboard file paste: file-URI interception, base64 chunk transport, WhatsApp attach-menu injection, 64 MB cap. Route: inline. Status: done.
 
 ## Log
 
@@ -78,3 +81,9 @@ L10 (2026-11-06, user report verbatim):
 > una cosa cuando abro la apliacion aveces se abren dos
 
 Diagnosis: two launches could both call `send_to_running`, both see no socket, and then race to bind it. The losing `listen` was treated as a non-fatal warning, so the second process continued and opened a second GPUI window. Fix: `single_instance::acquire_lock` takes an exclusive non-blocking `flock` on `$XDG_RUNTIME_DIR/oxidezap-<uid>.lock`; the lock lives for the process lifetime. If it is already held, the new process waits for the owner's socket and forwards the request, then exits instead of starting a duplicate. Added a lock exclusivity/drop test. Verified with two simultaneous launches: one process and one window; a second launch after startup exits with status 0 and forwards `show`.
+
+L11 (2026-11-06, user report verbatim):
+
+> cuando quiero pegar con ctrl + v un archivo,foto,video que copie no me deja pegarlo tengo que darle al boton de adjuntar
+
+Diagnosis: WebKitGTK exposes a file copied in the file manager as a `text/uri-list` clipboard string, not as `clipboardData.files`. WhatsApp Web only attaches from `clipboardData.files`, so Ctrl+V inserted nothing. Fix: a WebView `key-press-event` handler recognizes Ctrl+V, reads GTK clipboard URIs, filters local files, and streams the bytes as base64 chunks into a page helper. The helper creates `File` objects, finds or mounts WhatsApp's media/document file input through the attach menu, sets `input.files`, and dispatches `change`/`input`. Media uses the media input; documents and fallback use the document input. Total paste size is capped at 64 MB; larger files show a notification and must use the attach button. Unit/mock verification covers base64 chunk assembly and `input.files` injection; live chat verification is pending a fresh WhatsApp login because the test session reached the QR page.

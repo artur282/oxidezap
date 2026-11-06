@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -394,11 +395,19 @@ fn create_entry(
         settings.set_enable_mediasource(true);
         settings.set_enable_smooth_scrolling(true);
         settings.set_enable_developer_extras(cfg!(debug_assertions));
+        settings.set_enable_write_console_messages_to_stdout(cfg!(debug_assertions));
     }
     webview.set_zoom_level(zoom);
 
     connect_webview_signals(&webview, account_id, events.clone());
     connect_downloads(&context, account_id, events, downloads_dir);
+    webview.connect_key_press_event(|webview, event| {
+        if try_paste_files(webview, event) {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
 
     window.add(&webview);
     window.realize();
@@ -734,6 +743,300 @@ fn unique_download_path(dir: &Path, filename: &str) -> PathBuf {
         }
     }
     path
+}
+
+const PASTE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const PASTE_CHUNK_BYTES: usize = 3 * 1024 * 1024;
+
+const PASTE_HELPER: &str = r#"
+(function () {
+  if (window.__oxidezapPaste) return;
+
+  function decode(b64) {
+    if (typeof Uint8Array.fromBase64 === "function") {
+      return Uint8Array.fromBase64(b64);
+    }
+    var bin = atob(b64), n = bin.length, out = new Uint8Array(n);
+    for (var i = 0; i < n; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function inputFor(kind) {
+    var inputs = document.querySelectorAll('input[type="file"]');
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
+      if (input.isConnected === false) continue;
+      var accept = (input.accept || "").trim();
+      if (kind === "media") {
+        if (/video/i.test(accept)) return input;
+      } else {
+        if (accept === "" || accept === "*" || accept === "*/*") return input;
+        if (!/image/i.test(accept) && !/video/i.test(accept)) return input;
+      }
+    }
+    return null;
+  }
+
+  function clickAttach() {
+    var selectors = [
+      '[data-icon="plus"]',
+      '[data-icon="attach-menu-plus"]',
+      '[data-icon="clip"]',
+      '[data-testid="clip"]',
+      '[data-testid*="attach"]',
+      'button[title="Attach"]',
+      'button[title="Adjuntar"]',
+      '[aria-label="Attach"]',
+      '[aria-label="Adjuntar"]',
+      '[title="Attach"]',
+      '[title="Adjuntar"]',
+      '[aria-label*="Attach"]',
+      '[aria-label*="Adjuntar"]',
+      '[title*="Attach"]',
+      '[title*="Adjuntar"]'
+    ];
+    for (var i = 0; i < selectors.length; i++) {
+      var button = document.querySelector(selectors[i]);
+      if (!button) continue;
+      (button.closest('button,[role="button"],div[role="button"]') || button).click();
+      return true;
+    }
+    return false;
+  }
+
+  function clickItem(kind) {
+    var selectors = kind === "media"
+      ? ['[data-testid="attach-image"]', '[data-icon="media-multiple"]', '[aria-label*="Photos"]', '[aria-label*="hoto"]', '[aria-label*="Fotos"]', '[aria-label*="Imagen"]', '[title*="Photos"]', '[title*="Fotos"]']
+      : ['[data-testid="attach-document"]', '[data-icon="document"]', '[aria-label*="Document"]', '[aria-label*="ocument"]', '[aria-label*="Documento"]', '[title*="Document"]', '[title*="Documento"]'];
+    for (var i = 0; i < selectors.length; i++) {
+      var item = document.querySelector(selectors[i]);
+      if (item) {
+        (item.closest('li,button,[role="button"],div[role="button"]') || item).click();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function inject(input, files) {
+    try {
+      var dt = new DataTransfer();
+      for (var i = 0; i < files.length; i++) dt.items.add(files[i]);
+      input.value = "";
+      input.files = dt.files;
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    } catch (error) {
+      console.warn("OxideZap paste: " + error);
+      return false;
+    }
+  }
+
+  function attach(files) {
+    if (!files.length) return;
+    var media = files.every(function (file) {
+      return /^image\//.test(file.type || "") ||
+        file.type === "video/mp4" || file.type === "video/3gpp" || file.type === "video/quicktime";
+    });
+    var kind = media ? "media" : "doc";
+    var existing = inputFor(kind);
+    if (existing) {
+      inject(existing, files);
+      return;
+    }
+
+    if (!clickAttach()) {
+      var fallback = inputFor("doc");
+      if (fallback) {
+        inject(fallback, files);
+        return;
+      }
+    }
+    var tries = 0;
+    function poll() {
+      var input = inputFor(kind);
+      if (input) {
+        inject(input, files);
+        return;
+      }
+      if (tries++ === 2) clickItem(kind);
+      if (tries < 40) {
+        setTimeout(poll, 75);
+        return;
+      }
+      // A photo/video input is not always mounted; the document input accepts
+      // every file and is a safe fallback so the paste is never lost.
+      var fallback = inputFor("doc");
+      if (fallback) {
+        inject(fallback, files);
+      } else {
+        console.warn("OxideZap paste: attach input not found");
+      }
+    }
+    setTimeout(poll, 75);
+  }
+
+  window.__oxidezapPaste = {
+    files: [],
+    begin: function (metadata) {
+      this.files = metadata.map(function (item) {
+        return { name: item.name, type: item.type, parts: [] };
+      });
+    },
+    chunk: function (index, b64) {
+      if (this.files[index]) this.files[index].parts.push(decode(b64));
+    },
+    commit: function () {
+      var files = this.files.map(function (file) {
+        return new File(file.parts, file.name, { type: file.type || "application/octet-stream" });
+      });
+      this.files = [];
+      attach(files);
+    }
+  };
+})();
+"#;
+
+fn try_paste_files(webview: &webkit2gtk::WebView, event: &gtk::gdk::EventKey) -> bool {
+    let is_paste = event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK)
+        && (event.keyval() == gtk::gdk::keys::constants::v
+            || event.keyval() == gtk::gdk::keys::constants::V);
+    if !is_paste {
+        return false;
+    }
+
+    let clipboard = gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD);
+    let uris = clipboard.wait_for_uris();
+    if uris.is_empty() {
+        return false;
+    }
+
+    let mut total = 0u64;
+    let mut files: Vec<(String, String, Vec<String>)> = Vec::new();
+    for uri in uris {
+        let Ok(url) = url::Url::parse(uri.as_str()) else {
+            continue;
+        };
+        if url.scheme() != "file" {
+            continue;
+        }
+        let Ok(path) = url.to_file_path() else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        total = total.saturating_add(metadata.len());
+        if total > PASTE_MAX_BYTES {
+            crate::notify::notify(
+                "File too large",
+                "Use the attach button for files over 64 MB.",
+                None,
+            );
+            return true;
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let mime = mime_for_path(&path);
+        let Ok(mut handle) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut chunks = Vec::new();
+        let mut buffer = vec![0u8; PASTE_CHUNK_BYTES];
+        loop {
+            match handle.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    chunks.push(glib::base64_encode(&buffer[..read]).to_string());
+                }
+                Err(error) => {
+                    warn!(%error, path = %path.display(), "could not read a pasted file");
+                    chunks.clear();
+                    break;
+                }
+            }
+        }
+        if !chunks.is_empty() {
+            files.push((name, mime, chunks));
+        }
+    }
+
+    if files.is_empty() {
+        return false;
+    }
+
+    let metadata: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(name, mime, _)| serde_json::json!({ "name": name, "type": mime }))
+        .collect();
+    let mut queue = VecDeque::new();
+    queue.push_back(format!(
+        "{PASTE_HELPER}\n__oxidezapPaste.begin({});",
+        serde_json::to_string(&metadata).unwrap_or_else(|_| "[]".to_string())
+    ));
+    for (index, (_, _, chunks)) in files.iter().enumerate() {
+        for chunk in chunks {
+            queue.push_back(format!("__oxidezapPaste.chunk({index}, \"{chunk}\");"));
+        }
+    }
+    queue.push_back("__oxidezapPaste.commit();".to_string());
+
+    run_script_queue(webview.clone(), Rc::new(RefCell::new(queue)));
+    true
+}
+
+fn run_script_queue(webview: webkit2gtk::WebView, queue: Rc<RefCell<VecDeque<String>>>) {
+    let Some(script) = queue.borrow_mut().pop_front() else {
+        return;
+    };
+    let next_webview = webview.clone();
+    webview.evaluate_javascript(
+        &script,
+        None,
+        None,
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            if let Err(error) = result {
+                warn!(%error, "could not inject a pasted file");
+                return;
+            }
+            run_script_queue(next_webview, queue);
+        },
+    );
+}
+
+fn mime_for_path(path: &Path) -> String {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "3gp" => "video/3gpp",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 #[cfg(test)]
