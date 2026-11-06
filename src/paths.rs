@@ -15,6 +15,7 @@ pub struct Paths {
     pub settings_file: PathBuf,
     pub accounts_dir: PathBuf,
     pub socket_file: PathBuf,
+    pub lock_file: PathBuf,
 }
 
 impl Paths {
@@ -40,6 +41,7 @@ impl Paths {
 
         let uid = unsafe { libc::getuid() };
         let socket_file = runtime_dir.join(format!("{APP_ID}-{uid}.sock"));
+        let lock_file = runtime_dir.join(format!("{APP_ID}-{uid}.lock"));
 
         let config_dir = project.config_dir().to_path_buf();
         let data_dir = project.data_dir().to_path_buf();
@@ -55,6 +57,7 @@ impl Paths {
             settings_file,
             accounts_dir,
             socket_file,
+            lock_file,
         })
     }
 
@@ -124,6 +127,7 @@ mod tests {
             settings_file: PathBuf::from("/tmp/config/settings.json"),
             accounts_dir: PathBuf::from("/tmp/data/accounts"),
             socket_file: PathBuf::from("/tmp/run/oxidezap.sock"),
+            lock_file: PathBuf::from("/tmp/run/oxidezap.lock"),
         };
         assert_eq!(
             paths.account_data_dir("a"),

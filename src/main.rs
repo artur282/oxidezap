@@ -71,18 +71,37 @@ fn main() -> Result<()> {
     paths.ensure()?;
     paths.write_runtime_assets()?;
 
-    if !smoke {
+    let _instance_lock = if !smoke {
         let forwarded: Vec<String> = args
             .iter()
             .filter(|arg| arg.as_str() != "--autostart")
             .cloned()
             .collect();
-        if single_instance::send_to_running(&paths.socket_file, &forwarded) {
-            return Ok(());
+        match single_instance::acquire_lock(&paths.lock_file)? {
+            Some(lock) => {
+                // An older build may still own the socket without taking the
+                // lock file; forward to it before becoming the primary instance.
+                if single_instance::send_to_running(&paths.socket_file, &forwarded) {
+                    return Ok(());
+                }
+                Some(lock)
+            }
+            None => {
+                // Another process is starting or running. Wait briefly for its
+                // socket instead of starting a second application window.
+                if single_instance::send_to_running_with_retry(&paths.socket_file, &forwarded) {
+                    return Ok(());
+                }
+                tracing::warn!("another OxideZap instance is already running; exiting");
+                return Ok(());
+            }
         }
-        if quit_requested {
-            return Ok(());
-        }
+    } else {
+        None
+    };
+
+    if quit_requested && !smoke {
+        return Ok(());
     }
 
     let settings = if smoke {
@@ -202,6 +221,7 @@ fn smoke_paths() -> Result<Paths> {
         settings_file: root.join("config/settings.json"),
         accounts_dir: root.join("data/accounts"),
         socket_file: root.join("instance.sock"),
+        lock_file: root.join("instance.lock"),
     })
 }
 

@@ -1,9 +1,11 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
@@ -40,6 +42,36 @@ impl InstanceMessage {
     }
 }
 
+pub struct InstanceLock {
+    _file: fs::File,
+}
+
+/// Take an exclusive, non-blocking lock for this user's OxideZap instance.
+///
+/// The lock is released automatically when the file handle is dropped, so a
+/// crashed process cannot leave a lock that blocks the next start. The socket
+/// alone is not enough: two processes can both observe a missing socket and
+/// race to bind it, which produced two application windows.
+pub fn acquire_lock(path: &Path) -> Result<Option<InstanceLock>> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("could not open the instance lock {}", path.display()))?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(Some(InstanceLock { _file: file }));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Ok(None);
+    }
+    Err(error).with_context(|| format!("could not lock {}", path.display()))
+}
+
 pub struct InstanceListener {
     path: PathBuf,
     _thread: JoinHandle<()>,
@@ -69,6 +101,18 @@ pub fn send_to_running(path: &Path, args: &[String]) -> bool {
     }
     let _ = stream.flush();
     true
+}
+
+pub fn send_to_running_with_retry(path: &Path, args: &[String]) -> bool {
+    for attempt in 0..50 {
+        if send_to_running(path, args) {
+            return true;
+        }
+        if attempt < 49 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    false
 }
 
 pub fn listen(path: &Path, tx: Sender<InstanceMessage>) -> Result<InstanceListener> {
@@ -145,6 +189,17 @@ mod tests {
             ))
         );
         assert_eq!(InstanceMessage::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn lock_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.lock");
+        let first = acquire_lock(&path).unwrap();
+        assert!(first.is_some());
+        assert!(acquire_lock(&path).unwrap().is_none());
+        drop(first);
+        assert!(acquire_lock(&path).unwrap().is_some());
     }
 
     #[test]
