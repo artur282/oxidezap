@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{unbounded, Sender};
+use anyhow::{Context, Result, anyhow};
+use crossbeam_channel::{Sender, unbounded};
 use gtk::prelude::*;
 use tracing::{debug, info, warn};
 use webkit2gtk::{
@@ -502,6 +502,11 @@ fn connect_webview_signals(
         let Some(uri) = request.uri().map(|uri| uri.to_string()) else {
             return false;
         };
+        if links::is_internal_url(&uri) {
+            debug!(%uri, "allowed an internal WhatsApp navigation");
+            decision.use_();
+            return true;
+        }
         match links::classify(&uri) {
             LinkAction::Allow => {
                 decision.use_();
@@ -529,6 +534,10 @@ fn connect_webview_signals(
     webview.connect_create(move |webview, action| {
         let request = action.request()?;
         let uri = request.uri().map(|uri| uri.to_string())?;
+        if links::is_internal_url(&uri) {
+            debug!(%uri, "ignored an internal WhatsApp popup");
+            return None;
+        }
         match links::classify(&uri) {
             LinkAction::Allow => {
                 webview.load_uri(&uri);

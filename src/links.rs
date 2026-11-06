@@ -37,6 +37,21 @@ pub fn classify(raw: &str) -> LinkAction {
     }
 }
 
+/// WhatsApp background/utility pages live on `whatsapp.net` (for example
+/// `flows.whatsapp.net/flows/cache_management/`). They must not open a system
+/// browser tab or replace the chat view; new-window requests for them are
+/// ignored.
+pub fn is_internal_url(raw: &str) -> bool {
+    let Ok(url) = Url::parse(raw.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "whatsapp.net" || host.ends_with(".whatsapp.net")
+}
+
 pub fn is_whatsapp_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     host == "whatsapp.com"
@@ -126,6 +141,18 @@ mod tests {
             classify("whatsapp://chat?code=abc123"),
             LinkAction::WhatsApp("https://chat.whatsapp.com/abc123".to_string())
         );
+    }
+
+    #[test]
+    fn whatsapp_net_utility_pages_are_internal() {
+        assert!(is_internal_url(
+            "https://flows.whatsapp.net/flows/cache_management/"
+        ));
+        assert!(is_internal_url("https://mmg.whatsapp.net/file"));
+        assert!(!is_internal_url("https://web.whatsapp.com/"));
+        assert!(!is_internal_url("https://wa.me/5491100000000"));
+        assert!(!is_internal_url("https://evilwhatsapp.net/"));
+        assert!(!is_internal_url("https://whatsapp.net.evil.test/"));
     }
 
     #[test]
