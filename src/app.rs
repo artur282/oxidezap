@@ -30,7 +30,7 @@ use crate::ui::settings_window::SettingsWindow;
 use crate::webview::{
     GtkCommand, GtkEvent, GtkHandle, LoadState, OVERLAY_MARGIN, TITLEBAR_HEIGHT, WHATSAPP_URL,
 };
-use crate::x11::X11;
+use crate::x11::{WindowInfo, X11, select_account_window};
 
 pub trait AppModelEntityExt {
     fn update_settings(&self, cx: &mut App, update: impl FnOnce(&mut Settings));
@@ -253,6 +253,7 @@ impl AppModel {
                     }
                     Err(_) => {
                         self.account_windows.remove(&id);
+                        self.account_xids.remove(&id);
                     }
                 }
             }
@@ -428,6 +429,7 @@ impl AppModel {
                 return;
             }
             self.account_windows.remove(account_id);
+            self.account_xids.remove(account_id);
         }
         if !self.pending_accounts.insert(account_id.to_string()) {
             return;
@@ -442,6 +444,7 @@ impl AppModel {
         account: Account,
         handle: WindowHandle<AccountWindow>,
         html: Option<String>,
+        known_windows: Vec<u32>,
         cx: &mut Context<Self>,
     ) {
         self.account_windows.insert(account.id.clone(), handle);
@@ -451,13 +454,19 @@ impl AppModel {
             .unwrap_or(1.0);
         self.scales.insert(account.id.clone(), scale);
 
-        match self.try_tag_account(&account.id) {
-            Ok(AccountTag::Tagged | AccountTag::Closed) => {}
-            Ok(AccountTag::Pending) => self.schedule_account_tag(&account.id, cx),
+        let title = account_window_title(&account.name);
+        let parent_xid = match self.try_tag_account(&account.id, &title, &known_windows) {
+            Ok(AccountTag::Tagged) => self.account_xids.get(&account.id).copied(),
+            Ok(AccountTag::Closed) => None,
+            Ok(AccountTag::Pending) => {
+                self.schedule_account_tag(&account.id, &title, &known_windows, cx);
+                None
+            }
             Err(error) => {
                 warn!(account_id = %account.id, %error, "could not tag the GPUI window");
+                None
             }
-        }
+        };
 
         self.startup_html = None;
         let startup_url = self.startup_url.take();
@@ -472,6 +481,7 @@ impl AppModel {
         };
         self.gtk.send(GtkCommand::Create {
             account_id: account.id.clone(),
+            parent_xid,
             data_dir: self.paths.account_data_dir(&account.id),
             cache_dir: self.paths.account_cache_dir(&account.id),
             url,
@@ -833,10 +843,11 @@ impl AppModel {
     fn update_account_title(&self, account_id: &str, cx: &mut Context<Self>) {
         let name = self.account_name(account_id);
         let unread = self.account_unread(account_id);
+        let base_title = account_window_title(&name);
         let title = if unread > 0 {
-            format!("OxideZap — {name} ({unread})")
+            format!("{base_title} ({unread})")
         } else {
-            format!("OxideZap — {name}")
+            base_title
         };
         if let Some(handle) = self.account_windows.get(account_id).copied() {
             let _ = handle.update(cx, |_, window, _| window.set_window_title(&title));
@@ -871,19 +882,32 @@ impl AppModel {
     /// Tries to tag the GPUI window without blocking. Returns `Pending` when
     /// the window is not in the X11 tree yet so the caller can retry on a
     /// timer instead of sleeping on the foreground thread.
-    fn try_tag_account(&mut self, account_id: &str) -> Result<AccountTag> {
+    fn try_tag_account(
+        &mut self,
+        account_id: &str,
+        expected_title: &str,
+        known_windows: &[u32],
+    ) -> Result<AccountTag> {
         if !self.account_windows.contains_key(account_id) {
             return Ok(AccountTag::Closed);
         }
-        let xid = if let Some(xid) = self.x11.find_account_window(account_id)? {
-            xid
-        } else if let Some(xid) = self.x11.find_untagged_account_window()? {
-            self.x11.tag_account(xid, account_id)?;
-            xid
-        } else {
+        let candidates: Vec<WindowInfo> = self
+            .x11
+            .account_window_candidates()?
+            .into_iter()
+            .map(|window| WindowInfo {
+                window,
+                title: self.x11.title_of(window),
+                account_tag: self.x11.account_for(window),
+            })
+            .collect();
+        let Some(xid) =
+            select_account_window(known_windows, &candidates, account_id, expected_title)
+        else {
             return Ok(AccountTag::Pending);
         };
 
+        self.x11.tag_account(xid, account_id)?;
         self.account_xids.insert(account_id.to_string(), xid);
         if self.hidden_accounts.contains(account_id) {
             if let Err(error) = self.x11.unmap(xid) {
@@ -893,13 +917,23 @@ impl AppModel {
         Ok(AccountTag::Tagged)
     }
 
-    fn schedule_account_tag(&mut self, account_id: &str, cx: &mut Context<Self>) {
+    fn schedule_account_tag(
+        &mut self,
+        account_id: &str,
+        expected_title: &str,
+        known_windows: &[u32],
+        cx: &mut Context<Self>,
+    ) {
         let weak = cx.weak_entity();
         let id = account_id.to_string();
+        let title = expected_title.to_string();
+        let known_windows = known_windows.to_vec();
         cx.spawn(async move |_, cx| {
             for _ in 0..ACCOUNT_TAG_ATTEMPTS {
                 Timer::after(ACCOUNT_TAG_RETRY_INTERVAL).await;
-                match weak.update(cx, |model, _| model.try_tag_account(&id)) {
+                match weak.update(cx, |model, _| {
+                    model.try_tag_account(&id, &title, &known_windows)
+                }) {
                     Ok(Ok(AccountTag::Tagged | AccountTag::Closed)) => return,
                     Ok(Ok(AccountTag::Pending)) => {}
                     Ok(Err(error)) => {
@@ -1060,6 +1094,13 @@ impl AppModel {
     }
 }
 
+/// Title GPUI assigns to an account window before the unread suffix is added.
+/// Window discovery matches this exact prefix, so keep the format in sync with
+/// `AccountWindow::render`.
+fn account_window_title(name: &str) -> String {
+    format!("OxideZap — {name}")
+}
+
 fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx: &mut App) {
     let data = {
         let model_ref = model.read(cx);
@@ -1106,7 +1147,7 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
     let options = WindowOptions {
         window_bounds: Some(window_bounds),
         titlebar: Some(TitlebarOptions {
-            title: Some(SharedString::from(format!("OxideZap — {}", account.name))),
+            title: Some(SharedString::from(account_window_title(&account.name))),
             appears_transparent: false,
             traffic_light_position: None,
         }),
@@ -1124,6 +1165,14 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
         tabbing_identifier: None,
     };
 
+    let known_windows = model
+        .read(cx)
+        .x11
+        .account_window_candidates()
+        .unwrap_or_else(|error| {
+            debug!(%error, "could not snapshot the account windows before opening one");
+            Vec::new()
+        });
     let model_for_view = model.clone();
     let account_for_view = account.id.clone();
     let model_for_close = model.clone();
@@ -1161,7 +1210,7 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
 
     model.update(cx, |model, cx| {
         model.pending_accounts.remove(&account_id);
-        model.finish_open_account(account, handle, html, cx);
+        model.finish_open_account(account, handle, html, known_windows, cx);
     });
 }
 
@@ -1250,5 +1299,15 @@ fn open_lock_window_deferred(model: Entity<AppModel>, cx: &mut App) {
             error!(%error, "could not open the lock window");
             model.update(cx, |model, _| model.pending_lock = false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_window_title_is_the_discovery_identity() {
+        assert_eq!(account_window_title("Work"), "OxideZap — Work");
     }
 }

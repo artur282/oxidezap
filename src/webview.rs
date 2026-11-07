@@ -18,7 +18,7 @@ use webkit2gtk::{
 
 use crate::links::{self, LinkAction};
 use crate::unread::parse_unread;
-use crate::x11::X11;
+use crate::x11::{Geometry, X11};
 
 /// The height of the native GPUI titlebar, in logical pixels. The WebKit
 /// overlay is positioned below it using the window scale factor.
@@ -86,6 +86,9 @@ pub enum GtkEvent {
 pub enum GtkCommand {
     Create {
         account_id: String,
+        /// GPUI window the overlay is anchored to. `None` means discovery
+        /// failed and the account tag will be used once as a fallback.
+        parent_xid: Option<u32>,
         data_dir: PathBuf,
         cache_dir: PathBuf,
         url: String,
@@ -265,6 +268,9 @@ struct WebEntry {
     window: gtk::Window,
     webview: webkit2gtk::WebView,
     xid: u32,
+    /// Cached GPUI window XID. Synchronization never scans the X11 tree while
+    /// this XID is valid.
+    parent_xid: Option<u32>,
     visible: bool,
     scale: f32,
     zoom: f64,
@@ -279,12 +285,27 @@ impl WebEntry {
         }
         self.last_geometry = None;
     }
+
+    fn set_parent_xid(&mut self, xid: u32) {
+        if self.parent_xid != Some(xid) {
+            self.parent_xid = Some(xid);
+            self.transient_for = None;
+            self.last_geometry = None;
+        }
+    }
+
+    fn forget_parent_xid(&mut self) {
+        self.parent_xid = None;
+        self.transient_for = None;
+        self.last_geometry = None;
+    }
 }
 
 fn handle_command(command: GtkCommand, state: &mut GtkState) {
     match command {
         GtkCommand::Create {
             account_id,
+            parent_xid,
             data_dir,
             cache_dir,
             url,
@@ -307,7 +328,13 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 state.notifications_enabled,
                 state.paste.clone(),
             ) {
-                Ok(entry) => {
+                Ok(mut entry) => {
+                    if let Some(parent_xid) = parent_xid {
+                        entry.set_parent_xid(parent_xid);
+                    }
+                    if let Some(previous) = state.entries.remove(&account_id) {
+                        previous.window.close();
+                    }
                     let xid = entry.xid;
                     state.entries.insert(account_id.clone(), entry);
                     let _ = state.events.send(GtkEvent::Ready { account_id, xid });
@@ -458,6 +485,7 @@ fn create_entry(
         window,
         webview,
         xid,
+        parent_xid: None,
         visible: show,
         scale,
         zoom,
@@ -798,6 +826,12 @@ fn connect_downloads(
     });
 }
 
+/// Positions every visible overlay over its cached GPUI parent window.
+///
+/// The parent XID is remembered on the entry when the overlay is created, so
+/// this 100 ms pass only reads the geometry of a known window. The account tag
+/// is consulted once as a fallback when the cached XID became invalid, which
+/// covers a window that was recreated without a new `Create` command.
 fn sync_overlays(state: &mut GtkState) {
     let x11 = &state.x11;
     for (account_id, entry) in state.entries.iter_mut() {
@@ -805,14 +839,10 @@ fn sync_overlays(state: &mut GtkState) {
             entry.hide();
             continue;
         }
-        let Ok(Some(parent)) = x11.find_account_window(account_id) else {
+        let Some(parent) = resolve_parent_xid(x11, account_id, entry) else {
             entry.hide();
             continue;
         };
-        if !x11.is_viewable(parent).unwrap_or(false) {
-            entry.hide();
-            continue;
-        }
         let Ok(geometry) = x11.geometry(parent) else {
             entry.hide();
             continue;
@@ -821,14 +851,10 @@ fn sync_overlays(state: &mut GtkState) {
             entry.hide();
             continue;
         };
-        let titlebar = (TITLEBAR_HEIGHT * entry.scale).round().max(1.0) as u32;
-        let margin = (OVERLAY_MARGIN * entry.scale).round().max(1.0) as u32;
-        let width = u32::from(geometry.width).saturating_sub(margin * 2);
-        let height = u32::from(geometry.height).saturating_sub(titlebar + margin);
-        if width < 20 || height < 20 {
+        let Some(target) = overlay_target(&geometry, root_x, root_y, entry.scale) else {
             entry.hide();
             continue;
-        }
+        };
 
         if entry.transient_for != Some(parent) {
             if let Err(error) = x11.set_transient(entry.xid, parent) {
@@ -838,12 +864,6 @@ fn sync_overlays(state: &mut GtkState) {
             entry.last_geometry = None;
         }
 
-        let target = (
-            root_x + margin as i32,
-            root_y + titlebar as i32,
-            width,
-            height,
-        );
         if entry.last_geometry != Some(target) {
             if let Err(error) = x11.configure(entry.xid, target.0, target.1, target.2, target.3) {
                 debug!(%error, "could not position the WebKit overlay");
@@ -856,6 +876,51 @@ fn sync_overlays(state: &mut GtkState) {
             let _ = x11.raise(entry.xid);
         }
     }
+}
+
+/// Returns the cached GPUI parent XID when the window is still viewable. A
+/// missing or invalid XID falls back to the account tag, which also refreshes
+/// the cache explicitly for the next synchronization tick.
+fn resolve_parent_xid(x11: &X11, account_id: &str, entry: &mut WebEntry) -> Option<u32> {
+    if let Some(parent) = entry.parent_xid {
+        match x11.is_viewable(parent) {
+            Ok(true) => return Some(parent),
+            Ok(false) => return None,
+            Err(error) => {
+                debug!(%error, "cached GPUI parent XID is stale; falling back to the account tag");
+                entry.forget_parent_xid();
+            }
+        }
+    }
+    let parent = x11.find_account_window(account_id).ok().flatten()?;
+    entry.set_parent_xid(parent);
+    if !x11.is_viewable(parent).unwrap_or(false) {
+        return None;
+    }
+    Some(parent)
+}
+
+/// Computes the overlay rectangle for a parent window, or `None` when the
+/// window is too small to host the web content.
+fn overlay_target(
+    geometry: &Geometry,
+    root_x: i32,
+    root_y: i32,
+    scale: f32,
+) -> Option<(i32, i32, u32, u32)> {
+    let titlebar = (TITLEBAR_HEIGHT * scale).round().max(1.0) as u32;
+    let margin = (OVERLAY_MARGIN * scale).round().max(1.0) as u32;
+    let width = u32::from(geometry.width).saturating_sub(margin * 2);
+    let height = u32::from(geometry.height).saturating_sub(titlebar + margin);
+    if width < 20 || height < 20 {
+        return None;
+    }
+    Some((
+        root_x + margin as i32,
+        root_y + titlebar as i32,
+        width,
+        height,
+    ))
 }
 
 fn install_css() {
@@ -1676,5 +1741,47 @@ mod tests {
         });
 
         assert_eq!(result.outcome, PasteOutcome::TooLarge { image: false });
+    }
+
+    #[test]
+    fn overlay_target_follows_the_parent_geometry() {
+        let geometry = Geometry {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+
+        assert_eq!(
+            overlay_target(&geometry, 50, 60, 1.0),
+            Some((54, 102, 792, 554))
+        );
+    }
+
+    #[test]
+    fn overlay_target_scales_the_titlebar_and_margin() {
+        let geometry = Geometry {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+
+        assert_eq!(
+            overlay_target(&geometry, 50, 60, 2.0),
+            Some((58, 144, 784, 508))
+        );
+    }
+
+    #[test]
+    fn overlay_target_rejects_windows_too_small_for_the_content() {
+        let geometry = Geometry {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 600,
+        };
+
+        assert_eq!(overlay_target(&geometry, 0, 0, 1.0), None);
     }
 }
