@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use crossbeam_channel::Receiver;
 use gpui::{
     App, Bounds, Context, Entity, SharedString, Timer, TitlebarOptions, Window,
@@ -17,7 +17,9 @@ use crate::links;
 use crate::lock;
 use crate::notify;
 use crate::paths::{APP_ID, Paths};
-use crate::settings::{Account, SavedBounds, Settings};
+use crate::settings::{
+    Account, SETTINGS_SAVE_DEBOUNCE, SaveDebounce, SavedBounds, Settings, SettingsWriter,
+};
 use crate::shortcut::Shortcut;
 use crate::single_instance::{InstanceListener, InstanceMessage};
 use crate::theme::Theme;
@@ -38,6 +40,15 @@ impl AppModelEntityExt for Entity<AppModel> {
     fn update_settings(&self, cx: &mut App, update: impl FnOnce(&mut Settings)) {
         self.update(cx, |model, cx| model.update_settings(cx, update));
     }
+}
+
+const ACCOUNT_TAG_ATTEMPTS: usize = 40;
+const ACCOUNT_TAG_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+enum AccountTag {
+    Tagged,
+    Pending,
+    Closed,
 }
 
 pub struct SmokeState {
@@ -75,6 +86,9 @@ pub struct AppModel {
     pending_accounts: HashSet<String>,
     pending_settings: bool,
     pending_lock: bool,
+    hidden_accounts: HashSet<String>,
+    settings_writer: SettingsWriter,
+    save_debounce: SaveDebounce,
     last_idle_check: Instant,
     last_scale_check: Instant,
     last_notifications: Vec<(String, Instant)>,
@@ -129,6 +143,9 @@ impl AppModel {
             pending_accounts: HashSet::new(),
             pending_settings: false,
             pending_lock: false,
+            hidden_accounts: HashSet::new(),
+            settings_writer: SettingsWriter::start(),
+            save_debounce: SaveDebounce::default(),
             last_idle_check: Instant::now(),
             last_scale_check: Instant::now(),
             last_notifications: Vec::new(),
@@ -272,7 +289,7 @@ impl AppModel {
             } => {
                 debug!(%account_id, %title, unread, "webview title changed");
                 if self.settings.set_unread(&account_id, unread) {
-                    self.save_settings();
+                    self.save_settings(cx);
                     self.update_account_title(&account_id, cx);
                     self.update_tray();
                 }
@@ -324,7 +341,7 @@ impl AppModel {
                 }
             }
             GtkEvent::OpenExternal { url } => {
-                links::open_external(&url);
+                Self::open_external(cx, &url);
             }
             GtkEvent::WhatsAppUrl { account_id, url } => {
                 self.open_url_in_account(&account_id, &url, cx);
@@ -381,7 +398,7 @@ impl AppModel {
                     return;
                 }
             }
-            links::open_external(url);
+            Self::open_external(cx, url);
             return;
         }
 
@@ -394,7 +411,7 @@ impl AppModel {
                 }
             }
         }
-        links::open_external(url);
+        Self::open_external(cx, url);
     }
 
     pub fn open_account_window(&mut self, account_id: &str, cx: &mut Context<Self>) {
@@ -428,15 +445,15 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) {
         self.account_windows.insert(account.id.clone(), handle);
+        self.hidden_accounts.remove(&account.id);
         let scale = handle
             .update(cx, |_, window, _| window.scale_factor())
             .unwrap_or(1.0);
         self.scales.insert(account.id.clone(), scale);
 
-        match self.find_and_tag_account(&account.id) {
-            Ok(xid) => {
-                self.account_xids.insert(account.id.clone(), xid);
-            }
+        match self.try_tag_account(&account.id) {
+            Ok(AccountTag::Tagged | AccountTag::Closed) => {}
+            Ok(AccountTag::Pending) => self.schedule_account_tag(&account.id, cx),
             Err(error) => {
                 warn!(account_id = %account.id, %error, "could not tag the GPUI window");
             }
@@ -448,7 +465,7 @@ impl AppModel {
             Some(links::LinkAction::WhatsApp(web)) => web,
             Some(links::LinkAction::Allow) => startup_url.clone().unwrap_or_default(),
             Some(links::LinkAction::External(url)) => {
-                links::open_external(&url);
+                Self::open_external(cx, &url);
                 WHATSAPP_URL.to_string()
             }
             None => WHATSAPP_URL.to_string(),
@@ -465,7 +482,7 @@ impl AppModel {
         });
 
         self.settings.active_account = Some(account.id.clone());
-        self.save_settings();
+        self.save_settings(cx);
         self.update_tray();
 
         let _ = handle.update(cx, |_, window, _| window.activate_window());
@@ -572,6 +589,7 @@ impl AppModel {
     }
 
     fn hide_account_window(&mut self, account_id: &str, cx: &mut Context<Self>) {
+        self.hidden_accounts.insert(account_id.to_string());
         if let Some(xid) = self.account_xids.get(account_id).copied() {
             if let Err(error) = self.x11.unmap(xid) {
                 warn!(%error, "could not hide the GPUI window");
@@ -592,6 +610,7 @@ impl AppModel {
             self.open_lock_window(cx);
             return;
         }
+        self.hidden_accounts.remove(account_id);
         if let Some(xid) = self.account_xids.get(account_id).copied() {
             let _ = self.x11.map(xid);
             let _ = self.x11.activate(xid);
@@ -604,9 +623,18 @@ impl AppModel {
     }
 
     fn any_account_visible(&self) -> bool {
-        self.account_xids
-            .values()
-            .any(|xid| self.x11.is_viewable(*xid).unwrap_or(false))
+        self.account_windows.keys().any(|account_id| {
+            if self.hidden_accounts.contains(account_id) {
+                return false;
+            }
+            // A window that is still waiting to be tagged counts as visible;
+            // otherwise a toggle during the first few milliseconds would show
+            // it again instead of hiding it.
+            match self.account_xids.get(account_id) {
+                Some(xid) => self.x11.is_viewable(*xid).unwrap_or(true),
+                None => true,
+            }
+        })
     }
 
     pub fn on_account_close_requested(
@@ -639,7 +667,7 @@ impl AppModel {
             });
             account.maximized = maximized;
         }
-        self.save_settings();
+        self.save_settings(cx);
 
         if self.settings.close_to_tray {
             self.hide_account_window(account_id, cx);
@@ -649,6 +677,7 @@ impl AppModel {
         self.account_windows.remove(account_id);
         self.account_xids.remove(account_id);
         self.scales.remove(account_id);
+        self.hidden_accounts.remove(account_id);
         self.gtk.close(account_id);
         window.remove_window();
         if self.account_windows.is_empty() {
@@ -659,14 +688,14 @@ impl AppModel {
     pub fn add_account(&mut self, cx: &mut Context<Self>) {
         let name = format!("Account {}", self.settings.accounts.len() + 1);
         let id = self.settings.add_account(name);
-        self.save_settings();
+        self.save_settings(cx);
         self.open_account_window(&id, cx);
         self.update_tray();
     }
 
     pub fn rename_account(&mut self, account_id: &str, name: &str, cx: &mut Context<Self>) {
         if self.settings.rename_account(account_id, name) {
-            self.save_settings();
+            self.save_settings(cx);
             self.update_account_title(account_id, cx);
             self.update_tray();
             cx.refresh_windows();
@@ -682,9 +711,10 @@ impl AppModel {
         }
         self.account_xids.remove(account_id);
         self.scales.remove(account_id);
+        self.hidden_accounts.remove(account_id);
         self.gtk.close(account_id);
         self.settings.remove_account(account_id);
-        self.save_settings();
+        self.save_settings(cx);
         self.update_tray();
         cx.refresh_windows();
 
@@ -740,7 +770,7 @@ impl AppModel {
     }
 
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
-        self.save_settings();
+        self.save_settings(cx);
         if let Err(error) = autostart::apply(self.settings.start_at_login, &self.paths) {
             warn!(%error, "could not update the autostart entry");
         }
@@ -759,10 +789,45 @@ impl AppModel {
         cx.refresh_windows();
     }
 
-    fn save_settings(&self) {
-        if let Err(error) = self.settings.save(&self.paths.settings_file) {
-            warn!(%error, "could not save settings");
-        }
+    /// Coalesces a settings change and writes it after a short quiet period.
+    /// No disk I/O happens on the GPUI thread.
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(generation) = self.save_debounce.mark_dirty() else {
+            return;
+        };
+        cx.spawn(async move |model, cx| {
+            Timer::after(SETTINGS_SAVE_DEBOUNCE).await;
+            let _ = model.update(cx, |model, _cx| {
+                if model.save_debounce.timer_fired(generation) {
+                    model.flush_settings();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn flush_settings(&mut self) {
+        self.settings_writer
+            .save(self.settings.clone(), self.paths.settings_file.clone());
+    }
+
+    /// Writes the current settings before the process exits. This is the only
+    /// path that waits for the writer.
+    fn save_settings_now(&mut self) {
+        self.save_debounce.clear();
+        self.settings_writer
+            .save_and_wait(self.settings.clone(), self.paths.settings_file.clone());
+    }
+
+    fn open_external(cx: &mut Context<Self>, url: &str) {
+        let url = url.to_string();
+        cx.background_executor()
+            .spawn(async move {
+                // open 5.4 probes each launcher for up to 250 ms, so it must
+                // never run on the foreground thread.
+                links::open_external(&url);
+            })
+            .detach();
     }
 
     fn update_account_title(&self, account_id: &str, cx: &mut Context<Self>) {
@@ -803,18 +868,50 @@ impl AppModel {
         true
     }
 
-    fn find_and_tag_account(&self, account_id: &str) -> Result<u32> {
-        if let Some(xid) = self.x11.find_account_window(account_id)? {
-            return Ok(xid);
+    /// Tries to tag the GPUI window without blocking. Returns `Pending` when
+    /// the window is not in the X11 tree yet so the caller can retry on a
+    /// timer instead of sleeping on the foreground thread.
+    fn try_tag_account(&mut self, account_id: &str) -> Result<AccountTag> {
+        if !self.account_windows.contains_key(account_id) {
+            return Ok(AccountTag::Closed);
         }
-        for _ in 0..40 {
-            if let Some(xid) = self.x11.find_untagged_account_window()? {
-                self.x11.tag_account(xid, account_id)?;
-                return Ok(xid);
+        let xid = if let Some(xid) = self.x11.find_account_window(account_id)? {
+            xid
+        } else if let Some(xid) = self.x11.find_untagged_account_window()? {
+            self.x11.tag_account(xid, account_id)?;
+            xid
+        } else {
+            return Ok(AccountTag::Pending);
+        };
+
+        self.account_xids.insert(account_id.to_string(), xid);
+        if self.hidden_accounts.contains(account_id) {
+            if let Err(error) = self.x11.unmap(xid) {
+                warn!(account_id = %account_id, %error, "could not hide the tagged GPUI window");
             }
-            std::thread::sleep(Duration::from_millis(5));
         }
-        Err(anyhow!("the account window was not found in the X11 tree"))
+        Ok(AccountTag::Tagged)
+    }
+
+    fn schedule_account_tag(&mut self, account_id: &str, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        let id = account_id.to_string();
+        cx.spawn(async move |_, cx| {
+            for _ in 0..ACCOUNT_TAG_ATTEMPTS {
+                Timer::after(ACCOUNT_TAG_RETRY_INTERVAL).await;
+                match weak.update(cx, |model, _| model.try_tag_account(&id)) {
+                    Ok(Ok(AccountTag::Tagged | AccountTag::Closed)) => return,
+                    Ok(Ok(AccountTag::Pending)) => {}
+                    Ok(Err(error)) => {
+                        warn!(account_id = %id, %error, "could not tag the GPUI window");
+                        return;
+                    }
+                    Err(_) => return,
+                }
+            }
+            warn!(account_id = %id, "the account window was not found in the X11 tree");
+        })
+        .detach();
     }
 
     fn open_url_in_account(&mut self, account_id: &str, url: &str, cx: &mut Context<Self>) {
@@ -848,7 +945,7 @@ impl AppModel {
                 }
             }
         }
-        self.save_settings();
+        self.save_settings_now();
         self.gtk.quit();
         if let Some(tray) = &self.tray {
             tray.shutdown();

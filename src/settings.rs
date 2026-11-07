@@ -1,7 +1,9 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use crossbeam_channel::{Sender, bounded, unbounded};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -10,6 +12,9 @@ pub const SETTINGS_VERSION: u32 = 1;
 pub const MIN_ZOOM: f64 = 0.8;
 pub const MAX_ZOOM: f64 = 1.5;
 pub const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+W";
+/// How long a settings change waits before it is written, so that bursts of
+/// unread/title events coalesce into a single save.
+pub const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -307,6 +312,119 @@ pub fn clamp_zoom(zoom: f64) -> f64 {
     zoom.clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
+/// Coalesces many settings changes into one debounced write.
+///
+/// The caller marks the state dirty, starts one timer when `mark_dirty`
+/// returns a generation, and only writes when that generation is reported by
+/// `timer_fired`. Later changes reuse the running timer instead of scheduling
+/// another one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SaveDebounce {
+    dirty: bool,
+    scheduled: bool,
+    generation: u64,
+}
+
+impl SaveDebounce {
+    /// Marks the settings dirty. Returns the generation to pass to
+    /// `timer_fired` when a new timer must be started, or `None` when a timer
+    /// is already pending.
+    pub fn mark_dirty(&mut self) -> Option<u64> {
+        self.dirty = true;
+        if self.scheduled {
+            return None;
+        }
+        self.scheduled = true;
+        self.generation = self.generation.wrapping_add(1);
+        Some(self.generation)
+    }
+
+    /// Reports whether the timer with this generation should write. A stale
+    /// timer never consumes a newer dirty state.
+    pub fn timer_fired(&mut self, generation: u64) -> bool {
+        if !self.scheduled || generation != self.generation {
+            return false;
+        }
+        self.scheduled = false;
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// Cancels a pending timer, for example when the process is quitting and
+    /// the settings are written synchronously.
+    pub fn clear(&mut self) {
+        self.dirty = false;
+        self.scheduled = false;
+    }
+}
+
+/// Serializes settings writes on a worker thread so JSON serialization and
+/// disk I/O never run on the UI thread. A single worker also keeps writes
+/// ordered: the last snapshot received is the last one written.
+pub struct SettingsWriter {
+    tx: Sender<WriteRequest>,
+}
+
+struct WriteRequest {
+    settings: Settings,
+    path: PathBuf,
+    done: Option<Sender<()>>,
+}
+
+impl SettingsWriter {
+    pub fn start() -> Self {
+        let (tx, rx) = unbounded::<WriteRequest>();
+        let thread = std::thread::Builder::new()
+            .name("oxidezap-settings".to_string())
+            .spawn(move || {
+                while let Ok(request) = rx.recv() {
+                    if let Err(error) = request.settings.save(&request.path) {
+                        warn!(%error, "could not save settings");
+                    }
+                    if let Some(done) = request.done {
+                        let _ = done.send(());
+                    }
+                }
+            });
+        if let Err(error) = thread {
+            warn!(%error, "could not start the settings writer thread");
+        }
+        Self { tx }
+    }
+
+    /// Queues a save without blocking. The single worker writes snapshots in
+    /// the order they were queued, so the newest state always wins.
+    pub fn save(&self, settings: Settings, path: PathBuf) {
+        let request = WriteRequest {
+            settings,
+            path,
+            done: None,
+        };
+        if let Err(error) = self.tx.send(request) {
+            let request = error.0;
+            let _ = request.settings.save(&request.path);
+        }
+    }
+
+    /// Queues the final save and waits for the worker to finish it. Used when
+    /// quitting so the process does not exit before the last state is stored.
+    pub fn save_and_wait(&self, settings: Settings, path: PathBuf) {
+        let (done_tx, done_rx) = bounded(1);
+        let request = WriteRequest {
+            settings,
+            path,
+            done: Some(done_tx),
+        };
+        if let Err(error) = self.tx.send(request) {
+            let request = error.0;
+            let _ = request.settings.save(&request.path);
+            return;
+        }
+        if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            warn!("settings writer did not confirm the final save");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,5 +596,71 @@ mod tests {
     fn account_initials_are_derived_from_the_name() {
         assert_eq!(Account::with_id("a", "  work").initial(), "W");
         assert_eq!(Account::with_id("a", "").initial(), "?");
+    }
+
+    #[test]
+    fn debounce_coalesces_rapid_changes() {
+        let mut debounce = SaveDebounce::default();
+        let generation = debounce.mark_dirty().expect("a timer is scheduled");
+        assert_eq!(debounce.mark_dirty(), None);
+        assert_eq!(debounce.mark_dirty(), None);
+        assert!(debounce.timer_fired(generation));
+        assert!(!debounce.timer_fired(generation));
+    }
+
+    #[test]
+    fn debounce_schedules_again_after_a_write() {
+        let mut debounce = SaveDebounce::default();
+        let first = debounce.mark_dirty().expect("a timer is scheduled");
+        assert!(debounce.timer_fired(first));
+        let second = debounce.mark_dirty().expect("a new timer is scheduled");
+        assert_ne!(first, second);
+        assert!(debounce.timer_fired(second));
+    }
+
+    #[test]
+    fn a_stale_timer_does_not_consume_a_newer_change() {
+        let mut debounce = SaveDebounce::default();
+        let first = debounce.mark_dirty().expect("a timer is scheduled");
+        assert!(debounce.timer_fired(first));
+        let second = debounce.mark_dirty().expect("a new timer is scheduled");
+        assert!(!debounce.timer_fired(first));
+        assert!(debounce.timer_fired(second));
+    }
+
+    #[test]
+    fn clearing_the_debounce_discards_the_pending_write() {
+        let mut debounce = SaveDebounce::default();
+        let generation = debounce.mark_dirty().expect("a timer is scheduled");
+        debounce.clear();
+        assert!(!debounce.timer_fired(generation));
+    }
+
+    #[test]
+    fn settings_writer_persists_the_latest_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let writer = SettingsWriter::start();
+
+        for zoom in [0.8, 0.9, 1.1, 1.2, 1.3, 1.4, 1.5] {
+            let mut settings = Settings {
+                accounts: vec![Account::with_id("acc-1", "Work")],
+                active_account: Some("acc-1".to_string()),
+                ..Settings::default()
+            };
+            settings.set_zoom(zoom);
+            writer.save(settings, path.clone());
+        }
+
+        let mut expected = Settings {
+            accounts: vec![Account::with_id("acc-1", "Work")],
+            active_account: Some("acc-1".to_string()),
+            theme: ThemeMode::Dark,
+            ..Settings::default()
+        };
+        expected.set_zoom(1.25);
+        writer.save_and_wait(expected.clone(), path.clone());
+
+        assert_eq!(Settings::load(&path).unwrap(), expected);
     }
 }

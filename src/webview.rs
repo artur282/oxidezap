@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
-use crossbeam_channel::{Sender, unbounded};
+use anyhow::{anyhow, Context, Result};
+use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use gtk::prelude::*;
 use tracing::{debug, info, warn};
 use webkit2gtk::{
@@ -204,12 +204,14 @@ pub fn spawn(
                     return;
                 }
             };
+            let paste = Rc::new(RefCell::new(PasteQueue::start()));
             let state = Rc::new(RefCell::new(GtkState {
                 events,
                 downloads_dir,
                 notifications_enabled,
                 entries: HashMap::new(),
                 x11,
+                paste: paste.clone(),
             }));
 
             let command_state = state.clone();
@@ -220,6 +222,12 @@ pub fn spawn(
                 while let Ok(command) = command_rx.try_recv() {
                     handle_command(command, &mut state);
                 }
+                glib::ControlFlow::Continue
+            });
+
+            let paste_state = state.clone();
+            glib::timeout_add_local(Duration::from_millis(20), move || {
+                dispatch_paste(&paste_state, &paste);
                 glib::ControlFlow::Continue
             });
 
@@ -250,6 +258,7 @@ struct GtkState {
     notifications_enabled: bool,
     entries: HashMap<String, WebEntry>,
     x11: X11,
+    paste: Rc<RefCell<PasteQueue>>,
 }
 
 struct WebEntry {
@@ -296,6 +305,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 state.events.clone(),
                 state.downloads_dir.clone(),
                 state.notifications_enabled,
+                state.paste.clone(),
             ) {
                 Ok(entry) => {
                     let xid = entry.xid;
@@ -374,6 +384,7 @@ fn create_entry(
     events: Sender<GtkEvent>,
     downloads_dir: PathBuf,
     notifications_enabled: bool,
+    paste: Rc<RefCell<PasteQueue>>,
 ) -> Result<WebEntry> {
     crate::paths::create_private_dir(data_dir)?;
     crate::paths::create_private_dir(cache_dir)?;
@@ -417,8 +428,9 @@ fn create_entry(
         window.clone(),
     );
     connect_downloads(&context, account_id, events, downloads_dir);
-    webview.connect_key_press_event(|webview, event| {
-        if try_paste_clipboard(webview, event) {
+    let paste_account = account_id.to_string();
+    webview.connect_key_press_event(move |_webview, event| {
+        if try_paste_clipboard(&paste_account, event, &paste) {
             glib::Propagation::Stop
         } else {
             glib::Propagation::Proceed
@@ -904,6 +916,206 @@ fn unique_download_path(dir: &Path, filename: &str) -> PathBuf {
 const PASTE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const PASTE_CHUNK_BYTES: usize = 3 * 1024 * 1024;
 
+#[derive(Debug)]
+enum PasteSource {
+    File(PathBuf),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct PasteFile {
+    name: String,
+    mime: String,
+    source: PasteSource,
+}
+
+#[derive(Debug)]
+struct PasteJob {
+    account_id: String,
+    image: bool,
+    files: Vec<PasteFile>,
+}
+
+type PastedFile = (String, String, Vec<String>);
+type PasteReady = (String, Vec<PastedFile>);
+type ScriptDone = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum PasteOutcome {
+    Ready(Vec<PastedFile>),
+    Empty,
+    TooLarge { image: bool },
+}
+
+#[derive(Debug)]
+struct PasteResult {
+    account_id: String,
+    outcome: PasteOutcome,
+}
+
+#[derive(Debug, Default)]
+struct PasteBudget {
+    used: u64,
+}
+
+impl PasteBudget {
+    fn add(&mut self, bytes: u64) -> bool {
+        self.used = self.used.saturating_add(bytes);
+        self.used <= PASTE_MAX_BYTES
+    }
+}
+
+/// Reads and encodes pasted files on one worker thread. A single worker keeps
+/// jobs ordered, and the GTK side only runs the injection script queue.
+struct PasteQueue {
+    jobs: Sender<PasteJob>,
+    results: Receiver<PasteResult>,
+    active: bool,
+    stopped: bool,
+}
+
+impl PasteQueue {
+    fn start() -> Self {
+        let (jobs, job_rx) = unbounded::<PasteJob>();
+        let (result_tx, results) = unbounded::<PasteResult>();
+        let thread = std::thread::Builder::new()
+            .name("oxidezap-paste".to_string())
+            .spawn(move || {
+                for job in job_rx {
+                    if result_tx.send(process_paste_job(job)).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(error) = thread {
+            warn!(%error, "could not start the paste worker");
+        }
+        Self {
+            jobs,
+            results,
+            active: false,
+            stopped: false,
+        }
+    }
+
+    fn submit(&self, account_id: &str, files: Vec<PasteFile>, image: bool) {
+        let job = PasteJob {
+            account_id: account_id.to_string(),
+            image,
+            files,
+        };
+        if let Err(error) = self.jobs.send(job) {
+            warn!(%error, "could not queue a clipboard paste");
+        }
+    }
+
+    fn next_ready(&mut self) -> Option<PasteReady> {
+        loop {
+            if self.stopped {
+                return None;
+            }
+            let result = match self.results.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    self.stopped = true;
+                    warn!("the paste worker stopped");
+                    return None;
+                }
+            };
+            match result.outcome {
+                PasteOutcome::Ready(files) => return Some((result.account_id, files)),
+                PasteOutcome::Empty => {
+                    debug!("clipboard paste produced no readable files");
+                }
+                PasteOutcome::TooLarge { image } => {
+                    report_paste_too_large(image);
+                }
+            }
+        }
+    }
+}
+
+fn report_paste_too_large(image: bool) {
+    if image {
+        crate::notify::notify(
+            "Image too large",
+            "Use the attach button for images over 64 MB.",
+            None,
+        );
+    } else {
+        crate::notify::notify(
+            "File too large",
+            "Use the attach button for files over 64 MB.",
+            None,
+        );
+    }
+}
+
+fn process_paste_job(job: PasteJob) -> PasteResult {
+    let mut budget = PasteBudget::default();
+    let mut files = Vec::new();
+    for file in job.files {
+        match file.source {
+            PasteSource::File(path) => {
+                let Ok(metadata) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                if !metadata.is_file() {
+                    continue;
+                }
+                if !budget.add(metadata.len()) {
+                    return PasteResult {
+                        account_id: job.account_id,
+                        outcome: PasteOutcome::TooLarge { image: job.image },
+                    };
+                }
+                match read_file_chunks(&path) {
+                    Ok(chunks) if !chunks.is_empty() => {
+                        files.push((file.name, file.mime, chunks));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(%error, path = %path.display(), "could not read a pasted file");
+                    }
+                }
+            }
+            PasteSource::Bytes(bytes) => {
+                if !budget.add(bytes.len() as u64) {
+                    return PasteResult {
+                        account_id: job.account_id,
+                        outcome: PasteOutcome::TooLarge { image: job.image },
+                    };
+                }
+                files.push((file.name, file.mime, base64_chunks(&bytes)));
+            }
+        }
+    }
+    let outcome = if files.is_empty() {
+        PasteOutcome::Empty
+    } else {
+        PasteOutcome::Ready(files)
+    };
+    PasteResult {
+        account_id: job.account_id,
+        outcome,
+    }
+}
+
+fn read_file_chunks(path: &Path) -> std::io::Result<Vec<String>> {
+    let mut handle = std::fs::File::open(path)?;
+    let mut chunks = Vec::new();
+    let mut buffer = vec![0u8; PASTE_CHUNK_BYTES];
+    loop {
+        match handle.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => chunks.push(glib::base64_encode(&buffer[..read]).to_string()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(chunks)
+}
+
 const PASTE_HELPER: &str = r#"
 (function () {
   if (window.__oxidezapPaste) return;
@@ -1061,7 +1273,11 @@ const PASTE_HELPER: &str = r#"
 })();
 "#;
 
-fn try_paste_clipboard(webview: &webkit2gtk::WebView, event: &gtk::gdk::EventKey) -> bool {
+fn try_paste_clipboard(
+    account_id: &str,
+    event: &gtk::gdk::EventKey,
+    paste: &Rc<RefCell<PasteQueue>>,
+) -> bool {
     let is_paste = event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK)
         && (event.keyval() == gtk::gdk::keys::constants::v
             || event.keyval() == gtk::gdk::keys::constants::V);
@@ -1071,73 +1287,43 @@ fn try_paste_clipboard(webview: &webkit2gtk::WebView, event: &gtk::gdk::EventKey
 
     let clipboard = gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD);
     let uris = clipboard.wait_for_uris();
-    if !uris.is_empty() {
-        let mut total = 0u64;
-        let mut files: Vec<(String, String, Vec<String>)> = Vec::new();
-        for uri in uris {
-            let Ok(url) = url::Url::parse(uri.as_str()) else {
-                continue;
-            };
-            if url.scheme() != "file" {
-                continue;
-            }
-            let Ok(path) = url.to_file_path() else {
-                continue;
-            };
-            let Ok(metadata) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            total = total.saturating_add(metadata.len());
-            if total > PASTE_MAX_BYTES {
-                crate::notify::notify(
-                    "File too large",
-                    "Use the attach button for files over 64 MB.",
-                    None,
-                );
-                return true;
-            }
-
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("file")
-                .to_string();
-            let mime = mime_for_path(&path);
-            let Ok(mut handle) = std::fs::File::open(&path) else {
-                continue;
-            };
-            let mut chunks = Vec::new();
-            let mut buffer = vec![0u8; PASTE_CHUNK_BYTES];
-            loop {
-                match handle.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        chunks.push(glib::base64_encode(&buffer[..read]).to_string());
-                    }
-                    Err(error) => {
-                        warn!(%error, path = %path.display(), "could not read a pasted file");
-                        chunks.clear();
-                        break;
-                    }
-                }
-            }
-            if !chunks.is_empty() {
-                files.push((name, mime, chunks));
-            }
+    let mut files = Vec::new();
+    for uri in uris {
+        let Ok(url) = url::Url::parse(uri.as_str()) else {
+            continue;
+        };
+        if url.scheme() != "file" {
+            continue;
         }
-
-        if !files.is_empty() {
-            queue_paste_files(webview, files);
-            return true;
+        let Ok(path) = url.to_file_path() else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
         }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let mime = mime_for_path(&path);
+        files.push(PasteFile {
+            name,
+            mime,
+            source: PasteSource::File(path),
+        });
+    }
+    if !files.is_empty() {
+        paste.borrow().submit(account_id, files, false);
+        return true;
     }
 
     // Screenshots and images copied by image editors live in the clipboard as
-    // image data instead of a file URI. Encode them as PNG so WhatsApp can
-    // attach them exactly like a pasted image file.
+    // image data instead of a file URI. The pixbuf must be read and encoded on
+    // the GTK thread; the base64 conversion runs in the paste worker.
     let Some(pixbuf) = clipboard.wait_for_image() else {
         return false;
     };
@@ -1152,20 +1338,51 @@ fn try_paste_clipboard(webview: &webkit2gtk::WebView, event: &gtk::gdk::EventKey
         return false;
     }
     if bytes.len() as u64 > PASTE_MAX_BYTES {
-        crate::notify::notify(
-            "Image too large",
-            "Use the attach button for images over 64 MB.",
-            None,
-        );
+        report_paste_too_large(true);
         return true;
     }
-    let files = vec![(
-        "screenshot.png".to_string(),
-        "image/png".to_string(),
-        base64_chunks(&bytes),
-    )];
-    queue_paste_files(webview, files);
+    paste.borrow().submit(
+        account_id,
+        vec![PasteFile {
+            name: "screenshot.png".to_string(),
+            mime: "image/png".to_string(),
+            source: PasteSource::Bytes(bytes),
+        }],
+        true,
+    );
     true
+}
+
+fn dispatch_paste(state: &Rc<RefCell<GtkState>>, paste: &Rc<RefCell<PasteQueue>>) {
+    let Ok(state) = state.try_borrow() else {
+        return;
+    };
+    let Ok(mut queue) = paste.try_borrow_mut() else {
+        return;
+    };
+    if queue.active {
+        return;
+    }
+    let Some((account_id, files)) = queue.next_ready() else {
+        return;
+    };
+    let Some(webview) = state
+        .entries
+        .get(&account_id)
+        .map(|entry| entry.webview.clone())
+    else {
+        return;
+    };
+    queue.active = true;
+    drop(queue);
+    drop(state);
+
+    let done_queue = paste.clone();
+    queue_paste_files(webview, files, move || {
+        if let Ok(mut queue) = done_queue.try_borrow_mut() {
+            queue.active = false;
+        }
+    });
 }
 
 fn base64_chunks(bytes: &[u8]) -> Vec<String> {
@@ -1175,7 +1392,11 @@ fn base64_chunks(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn queue_paste_files(webview: &webkit2gtk::WebView, files: Vec<(String, String, Vec<String>)>) {
+fn queue_paste_files(
+    webview: webkit2gtk::WebView,
+    files: Vec<PastedFile>,
+    on_done: impl FnOnce() + 'static,
+) {
     let metadata: Vec<serde_json::Value> = files
         .iter()
         .map(|(name, mime, _)| serde_json::json!({ "name": name, "type": mime }))
@@ -1192,14 +1413,21 @@ fn queue_paste_files(webview: &webkit2gtk::WebView, files: Vec<(String, String, 
     }
     queue.push_back("__oxidezapPaste.commit();".to_string());
 
-    run_script_queue(webview.clone(), Rc::new(RefCell::new(queue)));
+    let done: ScriptDone = Rc::new(RefCell::new(Some(Box::new(on_done))));
+    run_script_queue(webview, Rc::new(RefCell::new(queue)), done);
 }
 
-fn run_script_queue(webview: webkit2gtk::WebView, queue: Rc<RefCell<VecDeque<String>>>) {
+fn run_script_queue(
+    webview: webkit2gtk::WebView,
+    queue: Rc<RefCell<VecDeque<String>>>,
+    done: ScriptDone,
+) {
     let Some(script) = queue.borrow_mut().pop_front() else {
+        finish_script_queue(&done);
         return;
     };
     let next_webview = webview.clone();
+    let next_done = done.clone();
     webview.evaluate_javascript(
         &script,
         None,
@@ -1208,11 +1436,18 @@ fn run_script_queue(webview: webkit2gtk::WebView, queue: Rc<RefCell<VecDeque<Str
         move |result| {
             if let Err(error) = result {
                 warn!(%error, "could not inject a pasted file");
+                finish_script_queue(&next_done);
                 return;
             }
-            run_script_queue(next_webview, queue);
+            run_script_queue(next_webview, queue, next_done);
         },
     );
+}
+
+fn finish_script_queue(done: &ScriptDone) {
+    if let Some(callback) = done.borrow_mut().take() {
+        callback();
+    }
 }
 
 fn mime_for_path(path: &Path) -> String {
@@ -1340,5 +1575,106 @@ mod tests {
             ),
             PermissionAction::Deny
         );
+    }
+
+    #[test]
+    fn paste_budget_rejects_bytes_past_the_limit() {
+        let mut budget = PasteBudget::default();
+        assert!(budget.add(PASTE_MAX_BYTES - 1));
+        assert!(budget.add(1));
+        assert!(!budget.add(1));
+    }
+
+    #[test]
+    fn paste_job_streams_files_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.png");
+        let second_path = dir.path().join("second.pdf");
+        let first_bytes = vec![0xAB; PASTE_CHUNK_BYTES + 7];
+        std::fs::write(&first_path, &first_bytes).unwrap();
+        std::fs::write(&second_path, b"document").unwrap();
+
+        let result = process_paste_job(PasteJob {
+            account_id: "account".to_string(),
+            image: false,
+            files: vec![
+                PasteFile {
+                    name: "first.png".to_string(),
+                    mime: "image/png".to_string(),
+                    source: PasteSource::File(first_path),
+                },
+                PasteFile {
+                    name: "second.pdf".to_string(),
+                    mime: "application/pdf".to_string(),
+                    source: PasteSource::File(second_path),
+                },
+            ],
+        });
+
+        assert_eq!(result.account_id, "account");
+        let PasteOutcome::Ready(files) = result.outcome else {
+            panic!("expected pasted files");
+        };
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, "first.png");
+        assert_eq!(files[0].1, "image/png");
+        assert_eq!(files[0].2.len(), 2);
+        let decoded: Vec<u8> = files[0]
+            .2
+            .iter()
+            .flat_map(|chunk| glib::base64_decode(chunk))
+            .collect();
+        assert_eq!(decoded, first_bytes);
+        assert_eq!(files[1].0, "second.pdf");
+        assert_eq!(files[1].1, "application/pdf");
+        assert_eq!(files[1].2.len(), 1);
+    }
+
+    #[test]
+    fn paste_job_encodes_clipboard_image_bytes() {
+        let bytes: Vec<u8> = (0..PASTE_CHUNK_BYTES + 3)
+            .map(|index| index as u8)
+            .collect();
+        let result = process_paste_job(PasteJob {
+            account_id: "account".to_string(),
+            image: true,
+            files: vec![PasteFile {
+                name: "screenshot.png".to_string(),
+                mime: "image/png".to_string(),
+                source: PasteSource::Bytes(bytes.clone()),
+            }],
+        });
+
+        let PasteOutcome::Ready(files) = result.outcome else {
+            panic!("expected pasted image bytes");
+        };
+        assert_eq!(files[0].0, "screenshot.png");
+        let decoded: Vec<u8> = files[0]
+            .2
+            .iter()
+            .flat_map(|chunk| glib::base64_decode(chunk))
+            .collect();
+        assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn paste_job_rejects_oversized_files_without_reading_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(PASTE_MAX_BYTES + 1).unwrap();
+        drop(file);
+
+        let result = process_paste_job(PasteJob {
+            account_id: "account".to_string(),
+            image: false,
+            files: vec![PasteFile {
+                name: "huge.bin".to_string(),
+                mime: "application/octet-stream".to_string(),
+                source: PasteSource::File(path),
+            }],
+        });
+
+        assert_eq!(result.outcome, PasteOutcome::TooLarge { image: false });
     }
 }
