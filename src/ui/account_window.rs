@@ -1,6 +1,6 @@
 use gpui::{
     App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render,
-    ResizeEdge, SharedString, Window, div, prelude::*, px,
+    ResizeEdge, SharedString, Subscription, Window, div, prelude::*, px,
 };
 
 use crate::app::AppModel;
@@ -13,6 +13,7 @@ pub struct AccountWindow {
     account_id: String,
     focus_handle: FocusHandle,
     last_title: String,
+    appearance_subscription: Option<Subscription>,
 }
 
 impl AccountWindow {
@@ -22,6 +23,7 @@ impl AccountWindow {
             account_id,
             focus_handle: cx.focus_handle(),
             last_title: String::new(),
+            appearance_subscription: None,
         }
     }
 
@@ -50,6 +52,14 @@ impl Focusable for AccountWindow {
 
 impl Render for AccountWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The theme is resolved from the window appearance on every render, so a
+        // repaint is enough when the system appearance changes. Register once per
+        // view; a recreated window gets a new view and a new subscription.
+        if self.appearance_subscription.is_none() {
+            self.appearance_subscription =
+                Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
+        }
+
         let (theme, name, unread) = {
             let model = self.model.read(cx);
             (

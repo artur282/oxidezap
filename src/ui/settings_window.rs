@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    StatefulInteractiveElement, Window, div, prelude::*, px,
+    StatefulInteractiveElement, Subscription, Window, div, prelude::*, px,
 };
 
 use crate::app::{AppModel, AppModelEntityExt};
@@ -60,6 +60,7 @@ pub struct SettingsWindow {
     security_error: Option<String>,
     shortcut_error: Option<String>,
     remove_password_confirm: bool,
+    appearance_subscription: Option<Subscription>,
 }
 
 impl SettingsWindow {
@@ -81,6 +82,7 @@ impl SettingsWindow {
             security_error: None,
             shortcut_error: None,
             remove_password_confirm: false,
+            appearance_subscription: None,
         }
     }
 
@@ -406,7 +408,15 @@ impl SettingsWindow {
                             .text_color(theme.text_muted)
                             .child("Theme"),
                     )
-                    .child(theme_cards),
+                    .child(theme_cards)
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(
+                                "System follows the desktop color scheme live. On Linux this depends on the XDG desktop portal and the desktop settings service, so some window managers may not report changes.",
+                            ),
+                    ),
             )
             .child(
                 card(theme)
@@ -932,6 +942,14 @@ impl Focusable for SettingsWindow {
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The theme is resolved from the window appearance on every render, so a
+        // repaint is enough when the system appearance changes. Register once per
+        // view; a recreated window gets a new view and a new subscription.
+        if self.appearance_subscription.is_none() {
+            self.appearance_subscription =
+                Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
+        }
+
         let (theme, settings) = {
             let model = self.model.read(cx);
             (model.theme(window), model.settings.clone())

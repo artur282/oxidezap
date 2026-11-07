@@ -1,4 +1,6 @@
-use gpui::{App, Context, Entity, FocusHandle, Focusable, Render, Window, div, prelude::*, px};
+use gpui::{
+    App, Context, Entity, FocusHandle, Focusable, Render, Subscription, Window, div, prelude::*, px,
+};
 
 use crate::app::AppModel;
 use crate::assets::ICON_SHIELD;
@@ -10,6 +12,7 @@ pub struct LockWindow {
     password_field: Entity<TextField>,
     error: Option<String>,
     focus_handle: FocusHandle,
+    appearance_subscription: Option<Subscription>,
 }
 
 impl LockWindow {
@@ -27,6 +30,7 @@ impl LockWindow {
             password_field,
             error: None,
             focus_handle: cx.focus_handle(),
+            appearance_subscription: None,
         }
     }
 
@@ -68,6 +72,14 @@ impl Focusable for LockWindow {
 
 impl Render for LockWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The theme is resolved from the window appearance on every render, so a
+        // repaint is enough when the system appearance changes. Register once per
+        // view; a recreated window gets a new view and a new subscription.
+        if self.appearance_subscription.is_none() {
+            self.appearance_subscription =
+                Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
+        }
+
         let theme = self.model.read(cx).theme(window);
         let password_field = self.password_field.clone();
         let error = self.error.clone();
