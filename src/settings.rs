@@ -137,7 +137,21 @@ impl Settings {
             Err(error) => {
                 if path.exists() {
                     let backup = path.with_extension("json.broken");
-                    let _ = fs::copy(path, &backup);
+                    match fs::read(path) {
+                        Ok(data) => {
+                            if let Err(backup_error) =
+                                crate::paths::write_private_file(&backup, &data)
+                            {
+                                warn!(
+                                    %backup_error,
+                                    "could not write the settings backup"
+                                );
+                            }
+                        }
+                        Err(backup_error) => {
+                            warn!(%backup_error, "could not read the settings file for backup");
+                        }
+                    }
                     warn!(
                         path = %path.display(),
                         backup = %backup.display(),
@@ -162,13 +176,16 @@ impl Settings {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+            crate::paths::create_private_dir(parent)
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
         let data = serde_json::to_vec_pretty(self).context("could not serialize settings")?;
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, &data).with_context(|| format!("could not write {}", tmp.display()))?;
+        crate::paths::write_private_file(&tmp, &data)
+            .with_context(|| format!("could not write {}", tmp.display()))?;
         fs::rename(&tmp, path).with_context(|| format!("could not replace {}", path.display()))?;
+        crate::paths::restrict_file(path)
+            .with_context(|| format!("could not restrict {}", path.display()))?;
         info!(path = %path.display(), "settings saved");
         Ok(())
     }
@@ -381,6 +398,72 @@ mod tests {
         let settings = Settings::load_or_default(&path);
         assert_eq!(settings.accounts.len(), 1);
         assert!(path.with_extension("json.broken").exists());
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        fn saved_settings_are_private() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("oxidezap/settings.json");
+            Settings::default().save(&path).unwrap();
+
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+            assert!(!path.with_extension("json.tmp").exists());
+        }
+
+        #[test]
+        fn saving_corrects_existing_permissions() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            fs::write(&path, b"{}").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+            Settings::default().save(&path).unwrap();
+
+            assert_eq!(mode(&path), 0o600);
+        }
+
+        #[test]
+        fn broken_settings_backup_is_private() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            fs::write(&path, b"{not json").unwrap();
+            Settings::load_or_default(&path);
+
+            let backup = path.with_extension("json.broken");
+            assert_eq!(mode(&backup), 0o600);
+        }
+
+        #[test]
+        fn saving_replaces_a_symlinked_settings_file_without_touching_the_target() {
+            let dir = tempfile::tempdir().unwrap();
+            let victim = dir.path().join("victim.json");
+            fs::write(&victim, b"do not touch").unwrap();
+            fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+            let path = dir.path().join("settings.json");
+            std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+            Settings::default().save(&path).unwrap();
+
+            assert_eq!(mode(&path), 0o600);
+            assert!(
+                !fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(mode(&victim), 0o644);
+            assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+        }
     }
 
     #[test]

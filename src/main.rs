@@ -47,6 +47,7 @@ const SMOKE_HTML: &str = r#"<!doctype html>
 </html>"#;
 
 fn main() -> Result<()> {
+    restrict_process_umask();
     init_tracing();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -112,8 +113,12 @@ fn main() -> Result<()> {
     let start_hidden = autostart && settings.start_at_login;
 
     let (gtk_events_tx, gtk_events_rx) = unbounded();
-    let gtk: GtkHandle = webview::spawn(gtk_events_tx, paths.downloads_dir.clone())
-        .context("WebKit could not start")?;
+    let gtk: GtkHandle = webview::spawn(
+        gtk_events_tx,
+        paths.downloads_dir.clone(),
+        settings.notifications,
+    )
+    .context("WebKit could not start")?;
 
     let (instance_tx, instance_rx) = unbounded::<InstanceMessage>();
     let instance_listener: Option<InstanceListener> = if smoke {
@@ -208,6 +213,21 @@ fn init_tracing() {
         .with_target(false)
         .try_init();
 }
+
+/// Apply a restrictive file creation mask before any thread or file is
+/// created, so WebKitGTK's cookies, localStorage, IndexedDB and cache files
+/// inherit private permissions instead of the desktop default `0644`/`0755`.
+#[cfg(unix)]
+fn restrict_process_umask() {
+    // SAFETY: `umask` only modifies the process-wide mode creation mask. It is
+    // called at the start of `main`, before any worker thread exists.
+    unsafe {
+        libc::umask(0o077);
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_process_umask() {}
 
 fn smoke_paths() -> Result<Paths> {
     let root = std::env::temp_dir().join(format!("oxidezap-smoke-{}", std::process::id()));

@@ -11,8 +11,9 @@ use gtk::prelude::*;
 use tracing::{debug, info, warn};
 use webkit2gtk::{
     DownloadExt, NavigationPolicyDecision, NavigationPolicyDecisionExt, NotificationExt,
-    PermissionRequestExt, PolicyDecisionExt, PolicyDecisionType, SettingsExt, URIRequestExt,
-    WebContextExt, WebViewExt,
+    NotificationPermissionRequest, PermissionRequest, PermissionRequestExt, PolicyDecisionExt,
+    PolicyDecisionType, SettingsExt, URIRequestExt, UserMediaPermissionRequest,
+    UserMediaPermissionRequestExt, WebContextExt, WebViewExt,
 };
 
 use crate::links::{self, LinkAction};
@@ -180,7 +181,11 @@ impl GtkHandle {
     }
 }
 
-pub fn spawn(events: Sender<GtkEvent>, downloads_dir: PathBuf) -> Result<GtkHandle> {
+pub fn spawn(
+    events: Sender<GtkEvent>,
+    downloads_dir: PathBuf,
+    notifications_enabled: bool,
+) -> Result<GtkHandle> {
     let (command_tx, command_rx) = unbounded::<GtkCommand>();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
@@ -202,6 +207,7 @@ pub fn spawn(events: Sender<GtkEvent>, downloads_dir: PathBuf) -> Result<GtkHand
             let state = Rc::new(RefCell::new(GtkState {
                 events,
                 downloads_dir,
+                notifications_enabled,
                 entries: HashMap::new(),
                 x11,
             }));
@@ -241,6 +247,7 @@ pub fn spawn(events: Sender<GtkEvent>, downloads_dir: PathBuf) -> Result<GtkHand
 struct GtkState {
     events: Sender<GtkEvent>,
     downloads_dir: PathBuf,
+    notifications_enabled: bool,
     entries: HashMap<String, WebEntry>,
     x11: X11,
 }
@@ -288,6 +295,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 zoom,
                 state.events.clone(),
                 state.downloads_dir.clone(),
+                state.notifications_enabled,
             ) {
                 Ok(entry) => {
                     let xid = entry.xid;
@@ -365,11 +373,13 @@ fn create_entry(
     zoom: f64,
     events: Sender<GtkEvent>,
     downloads_dir: PathBuf,
+    notifications_enabled: bool,
 ) -> Result<WebEntry> {
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("could not create {}", data_dir.display()))?;
-    std::fs::create_dir_all(cache_dir)
-        .with_context(|| format!("could not create {}", cache_dir.display()))?;
+    crate::paths::create_private_dir(data_dir)?;
+    crate::paths::create_private_dir(cache_dir)?;
+    if let Some(account_dir) = data_dir.parent() {
+        crate::paths::create_private_dir(account_dir)?;
+    }
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title("OxideZap content");
@@ -399,7 +409,13 @@ fn create_entry(
     }
     webview.set_zoom_level(zoom);
 
-    connect_webview_signals(&webview, account_id, events.clone());
+    connect_webview_signals(
+        &webview,
+        account_id,
+        events.clone(),
+        notifications_enabled,
+        window.clone(),
+    );
     connect_downloads(&context, account_id, events, downloads_dir);
     webview.connect_key_press_event(|webview, event| {
         if try_paste_clipboard(webview, event) {
@@ -442,6 +458,8 @@ fn connect_webview_signals(
     webview: &webkit2gtk::WebView,
     account_id: &str,
     events: Sender<GtkEvent>,
+    notifications_enabled: bool,
+    parent_window: gtk::Window,
 ) {
     let load_account = account_id.to_string();
     let load_events = events.clone();
@@ -565,9 +583,52 @@ fn connect_webview_signals(
         None
     });
 
-    webview.connect_permission_request(|_webview, request| {
-        request.allow();
-        true
+    let permission_window = parent_window;
+    webview.connect_permission_request(move |webview, request| {
+        let origin = webview.uri().map(|uri| uri.to_string());
+        let kind = if request
+            .dynamic_cast_ref::<UserMediaPermissionRequest>()
+            .is_some()
+        {
+            PermissionKind::UserMedia
+        } else if request
+            .dynamic_cast_ref::<NotificationPermissionRequest>()
+            .is_some()
+        {
+            PermissionKind::Notifications
+        } else {
+            PermissionKind::Other
+        };
+        let host = origin.as_deref().and_then(origin_host);
+
+        match permission_action(origin.as_deref(), kind, notifications_enabled) {
+            PermissionAction::Allow => {
+                request.allow();
+                true
+            }
+            PermissionAction::Deny => {
+                debug!(
+                    origin = host.as_deref().unwrap_or("unknown"),
+                    ?kind,
+                    "denied a WebKit permission request"
+                );
+                request.deny();
+                true
+            }
+            PermissionAction::Prompt => {
+                let Some(media) = request.dynamic_cast_ref::<UserMediaPermissionRequest>() else {
+                    request.deny();
+                    return true;
+                };
+                prompt_user_media_permission(
+                    &permission_window,
+                    request,
+                    media,
+                    host.as_deref().unwrap_or("WhatsApp Web"),
+                );
+                true
+            }
+        }
     });
 
     let crash_account = account_id.to_string();
@@ -577,6 +638,101 @@ fn connect_webview_signals(
             account_id: crash_account.clone(),
         });
     });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionKind {
+    UserMedia,
+    Notifications,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionAction {
+    Allow,
+    Deny,
+    Prompt,
+}
+
+/// Pure permission policy so the security rules can be tested without GTK.
+/// Only WhatsApp pages may request anything, and user media always needs an
+/// explicit native confirmation.
+fn permission_action(
+    origin: Option<&str>,
+    kind: PermissionKind,
+    notifications_enabled: bool,
+) -> PermissionAction {
+    if !is_whatsapp_origin(origin) {
+        return PermissionAction::Deny;
+    }
+    match kind {
+        PermissionKind::UserMedia => PermissionAction::Prompt,
+        PermissionKind::Notifications if notifications_enabled => PermissionAction::Allow,
+        PermissionKind::Notifications | PermissionKind::Other => PermissionAction::Deny,
+    }
+}
+
+fn is_whatsapp_origin(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(origin.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    links::is_whatsapp_host(host) || links::is_internal_url(origin)
+}
+
+fn origin_host(uri: &str) -> Option<String> {
+    let url = url::Url::parse(uri.trim()).ok()?;
+    url.host_str().map(|host| host.to_string())
+}
+
+/// Ask the user before granting camera or microphone access to WhatsApp. The
+/// request stays pending until the user answers; denying it is the default.
+fn prompt_user_media_permission(
+    parent: &gtk::Window,
+    request: &PermissionRequest,
+    media: &UserMediaPermissionRequest,
+    origin: &str,
+) {
+    let (camera, microphone) = (media.is_for_video_device(), media.is_for_audio_device());
+    let device = match (camera, microphone) {
+        (true, true) => "camera and microphone",
+        (true, false) => "camera",
+        (false, true) => "microphone",
+        (false, false) => "media devices",
+    };
+
+    let dialog = gtk::MessageDialog::builder()
+        .message_type(gtk::MessageType::Question)
+        .buttons(gtk::ButtonsType::None)
+        .text(format!("Allow WhatsApp to use your {device}?"))
+        .secondary_text(format!(
+            "The request comes from {origin}. Deny it if you did not start a call or record a voice note."
+        ))
+        .build();
+    dialog.set_title("OxideZap permission request");
+    dialog.set_transient_for(Some(parent));
+    dialog.set_modal(true);
+    dialog.add_button("Deny", gtk::ResponseType::No);
+    dialog.add_button("Allow", gtk::ResponseType::Yes);
+    dialog.set_default_response(gtk::ResponseType::No);
+
+    let pending = request.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Yes {
+            info!("user allowed a WhatsApp media permission request");
+            pending.allow();
+        } else {
+            info!("user denied a WhatsApp media permission request");
+            pending.deny();
+        }
+        dialog.close();
+    });
+    dialog.show_all();
 }
 
 fn connect_downloads(
@@ -1116,5 +1272,73 @@ mod tests {
         std::fs::write(&first, b"x").unwrap();
         let second = unique_download_path(dir.path(), "file.txt");
         assert_eq!(second, dir.path().join("file (1).txt"));
+    }
+
+    #[test]
+    fn only_whatsapp_origins_may_request_permissions() {
+        assert_eq!(
+            permission_action(
+                Some("https://web.whatsapp.com/"),
+                PermissionKind::UserMedia,
+                true
+            ),
+            PermissionAction::Prompt
+        );
+        assert_eq!(
+            permission_action(
+                Some("https://web.whatsapp.com/"),
+                PermissionKind::Notifications,
+                true
+            ),
+            PermissionAction::Allow
+        );
+        assert_eq!(
+            permission_action(
+                Some("https://web.whatsapp.com/"),
+                PermissionKind::Notifications,
+                false
+            ),
+            PermissionAction::Deny
+        );
+        assert_eq!(
+            permission_action(
+                Some("https://example.com/"),
+                PermissionKind::UserMedia,
+                true
+            ),
+            PermissionAction::Deny
+        );
+        assert_eq!(
+            permission_action(
+                Some("https://web.whatsapp.com.evil.test/"),
+                PermissionKind::Notifications,
+                true
+            ),
+            PermissionAction::Deny
+        );
+        assert_eq!(
+            permission_action(None, PermissionKind::UserMedia, true),
+            PermissionAction::Deny
+        );
+    }
+
+    #[test]
+    fn unrelated_permissions_are_denied_even_on_whatsapp() {
+        assert_eq!(
+            permission_action(
+                Some("https://web.whatsapp.com/"),
+                PermissionKind::Other,
+                true
+            ),
+            PermissionAction::Deny
+        );
+        assert_eq!(
+            permission_action(
+                Some("https://flows.whatsapp.net/flows/cache_management/"),
+                PermissionKind::Other,
+                true
+            ),
+            PermissionAction::Deny
+        );
     }
 }
