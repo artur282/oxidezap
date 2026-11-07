@@ -59,6 +59,72 @@ pub struct SmokeState {
     pub verified: bool,
 }
 
+/// Maximum number of automatic reloads after a WebKit crash. A crash that
+/// happens after every retry stops the loop once this budget is spent.
+const MAX_CRASH_ATTEMPTS: u32 = 3;
+
+/// Delay before each automatic reload. One entry per allowed attempt.
+const CRASH_BACKOFF: [Duration; MAX_CRASH_ATTEMPTS as usize] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+];
+
+/// Per-account crash recovery policy. The clock is injected so the policy can
+/// be tested without waiting for real timers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CrashRecovery {
+    attempts: u32,
+    next_retry: Option<Instant>,
+    failed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrashDecision {
+    RetryAfter(Duration),
+    Exhausted,
+    Ignored,
+}
+
+impl CrashRecovery {
+    fn on_crash(&mut self, now: Instant) -> CrashDecision {
+        if self.failed || self.next_retry.is_some() {
+            return CrashDecision::Ignored;
+        }
+        if self.attempts >= MAX_CRASH_ATTEMPTS {
+            self.failed = true;
+            return CrashDecision::Exhausted;
+        }
+        let delay = CRASH_BACKOFF[self.attempts as usize];
+        self.attempts += 1;
+        self.next_retry = Some(now + delay);
+        CrashDecision::RetryAfter(delay)
+    }
+
+    fn retry_due(&self, now: Instant) -> bool {
+        self.next_retry.is_some_and(|at| now >= at)
+    }
+
+    fn take_due_retry(&mut self, now: Instant) -> bool {
+        if !self.retry_due(now) {
+            return false;
+        }
+        self.next_retry = None;
+        true
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn crash_decision(quitting: bool, recovery: &mut CrashRecovery, now: Instant) -> CrashDecision {
+    if quitting {
+        return CrashDecision::Ignored;
+    }
+    recovery.on_crash(now)
+}
+
 pub struct AppModel {
     pub paths: Paths,
     pub settings: Settings,
@@ -76,6 +142,7 @@ pub struct AppModel {
     instance_listener: Option<InstanceListener>,
     account_windows: HashMap<String, WindowHandle<AccountWindow>>,
     account_xids: HashMap<String, u32>,
+    crash_recovery: HashMap<String, CrashRecovery>,
     scales: HashMap<String, f32>,
     settings_window: Option<WindowHandle<SettingsWindow>>,
     lock_window: Option<WindowHandle<LockWindow>>,
@@ -133,6 +200,7 @@ impl AppModel {
             instance_listener,
             account_windows: HashMap::new(),
             account_xids: HashMap::new(),
+            crash_recovery: HashMap::new(),
             scales: HashMap::new(),
             settings_window: None,
             lock_window: None,
@@ -209,6 +277,7 @@ impl AppModel {
         while let Ok(event) = self.gtk_events.try_recv() {
             self.handle_gtk_event(event, cx);
         }
+        self.poll_crash_recovery();
         while let Ok(message) = self.instance_messages.try_recv() {
             self.handle_instance_message(message, cx);
         }
@@ -264,6 +333,60 @@ impl AppModel {
         }
     }
 
+    fn poll_crash_recovery(&mut self) {
+        if self.quitting {
+            self.crash_recovery.clear();
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .crash_recovery
+            .iter()
+            .filter(|(_, recovery)| recovery.retry_due(now))
+            .map(|(account_id, _)| account_id.clone())
+            .collect();
+        for account_id in due {
+            let Some(recovery) = self.crash_recovery.get_mut(&account_id) else {
+                continue;
+            };
+            if !recovery.take_due_retry(now) {
+                continue;
+            }
+            if !self.account_windows.contains_key(&account_id) {
+                self.crash_recovery.remove(&account_id);
+                continue;
+            }
+            info!(account_id = %account_id, "reloading WhatsApp Web after a crash");
+            self.gtk.reload(&account_id);
+        }
+    }
+
+    pub fn account_crash_failed(&self, account_id: &str) -> bool {
+        self.crash_recovery
+            .get(account_id)
+            .is_some_and(|recovery| recovery.failed)
+    }
+
+    pub fn retry_account(&mut self, account_id: &str, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
+        info!(account_id = %account_id, "manual WhatsApp Web reload requested");
+        self.crash_recovery
+            .entry(account_id.to_string())
+            .or_default()
+            .reset();
+        self.gtk.show(account_id);
+        self.gtk.reload(account_id);
+        self.refresh_account_window(account_id, cx);
+    }
+
+    fn refresh_account_window(&self, account_id: &str, cx: &mut Context<Self>) {
+        if let Some(handle) = self.account_windows.get(account_id).copied() {
+            let _ = handle.update(cx, |_, _, cx| cx.notify());
+        }
+    }
+
     fn handle_gtk_event(&mut self, event: GtkEvent, cx: &mut Context<Self>) {
         match event {
             GtkEvent::Ready { account_id, xid } => {
@@ -275,7 +398,15 @@ impl AppModel {
             }
             GtkEvent::LoadState { account_id, state } => {
                 if state == LoadState::Finished {
+                    let recovered = self
+                        .crash_recovery
+                        .remove(&account_id)
+                        .is_some_and(|recovery| recovery.failed);
                     self.gtk.set_zoom(&account_id, self.settings.zoom);
+                    if recovered {
+                        self.gtk.show(&account_id);
+                        self.refresh_account_window(&account_id, cx);
+                    }
                     if let Some(smoke) = &mut self.smoke {
                         if smoke.account_id == account_id && smoke.loaded_at.is_none() {
                             smoke.loaded_at = Some(Instant::now());
@@ -349,12 +480,31 @@ impl AppModel {
             }
             GtkEvent::Crashed { account_id } => {
                 warn!(account_id = %account_id, "the WebKit web process crashed");
-                notify::notify(
-                    "WhatsApp Web crashed",
-                    "Reloading the page…",
-                    Some(&self.paths.runtime_icon()),
-                );
-                self.gtk.reload(&account_id);
+                let quitting = self.quitting;
+                let now = Instant::now();
+                let recovery = self.crash_recovery.entry(account_id.clone()).or_default();
+                match crash_decision(quitting, recovery, now) {
+                    CrashDecision::RetryAfter(delay) => {
+                        info!(
+                            account_id = %account_id,
+                            retry_in_ms = delay.as_millis() as u64,
+                            "scheduling a WhatsApp Web reload after a crash"
+                        );
+                    }
+                    CrashDecision::Exhausted => {
+                        error!(account_id = %account_id, "WebKit crash recovery exhausted");
+                        self.gtk.hide(&account_id);
+                        notify::notify(
+                            "WhatsApp Web crashed",
+                            &format!(
+                                "Automatic recovery failed after {MAX_CRASH_ATTEMPTS} attempts. Use \"Retry now\" in the account window."
+                            ),
+                            Some(&self.paths.runtime_icon()),
+                        );
+                        self.refresh_account_window(&account_id, cx);
+                    }
+                    CrashDecision::Ignored => {}
+                }
             }
             GtkEvent::Error {
                 account_id,
@@ -625,7 +775,9 @@ impl AppModel {
             let _ = self.x11.map(xid);
             let _ = self.x11.activate(xid);
         }
-        self.gtk.show(account_id);
+        if !self.account_crash_failed(account_id) {
+            self.gtk.show(account_id);
+        }
         if let Some(handle) = self.account_windows.get(account_id).copied() {
             let _ = handle.update(cx, |_, window, _| window.activate_window());
         }
@@ -686,6 +838,7 @@ impl AppModel {
 
         self.account_windows.remove(account_id);
         self.account_xids.remove(account_id);
+        self.crash_recovery.remove(account_id);
         self.scales.remove(account_id);
         self.hidden_accounts.remove(account_id);
         self.gtk.close(account_id);
@@ -720,6 +873,7 @@ impl AppModel {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
         self.account_xids.remove(account_id);
+        self.crash_recovery.remove(account_id);
         self.scales.remove(account_id);
         self.hidden_accounts.remove(account_id);
         self.gtk.close(account_id);
@@ -958,6 +1112,7 @@ impl AppModel {
             return;
         }
         self.quitting = true;
+        self.crash_recovery.clear();
 
         let windows: Vec<(String, WindowHandle<AccountWindow>)> = self
             .account_windows
@@ -1309,5 +1464,115 @@ mod tests {
     #[test]
     fn account_window_title_is_the_discovery_identity() {
         assert_eq!(account_window_title("Work"), "OxideZap — Work");
+    }
+
+    #[test]
+    fn crash_retries_back_off_then_stop() {
+        let mut now = Instant::now();
+        let mut recovery = CrashRecovery::default();
+
+        assert_eq!(
+            recovery.on_crash(now),
+            CrashDecision::RetryAfter(Duration::from_secs(1))
+        );
+        assert_eq!(recovery.next_retry, Some(now + Duration::from_secs(1)));
+        now += Duration::from_secs(1);
+        assert!(recovery.take_due_retry(now));
+
+        assert_eq!(
+            recovery.on_crash(now),
+            CrashDecision::RetryAfter(Duration::from_secs(3))
+        );
+        assert_eq!(recovery.next_retry, Some(now + Duration::from_secs(3)));
+        now += Duration::from_secs(3);
+        assert!(recovery.take_due_retry(now));
+
+        assert_eq!(
+            recovery.on_crash(now),
+            CrashDecision::RetryAfter(Duration::from_secs(10))
+        );
+        assert_eq!(recovery.next_retry, Some(now + Duration::from_secs(10)));
+        now += Duration::from_secs(10);
+        assert!(recovery.take_due_retry(now));
+
+        assert_eq!(recovery.on_crash(now), CrashDecision::Exhausted);
+        assert!(recovery.failed);
+        assert_eq!(recovery.attempts, MAX_CRASH_ATTEMPTS);
+        assert_eq!(recovery.next_retry, None);
+        assert_eq!(recovery.on_crash(now), CrashDecision::Ignored);
+    }
+
+    #[test]
+    fn crash_while_a_retry_is_pending_is_ignored() {
+        let now = Instant::now();
+        let mut recovery = CrashRecovery::default();
+
+        assert_eq!(
+            recovery.on_crash(now),
+            CrashDecision::RetryAfter(Duration::from_secs(1))
+        );
+        assert_eq!(recovery.on_crash(now), CrashDecision::Ignored);
+        assert_eq!(recovery.attempts, 1);
+    }
+
+    #[test]
+    fn scheduled_retry_fires_only_when_due_and_only_once() {
+        let now = Instant::now();
+        let mut recovery = CrashRecovery::default();
+        recovery.on_crash(now);
+
+        assert!(!recovery.take_due_retry(now));
+        assert!(recovery.take_due_retry(now + Duration::from_secs(1)));
+        assert!(!recovery.take_due_retry(now + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn successful_load_resets_the_recovery_budget() {
+        let now = Instant::now();
+        let mut recovery = CrashRecovery::default();
+        recovery.on_crash(now);
+        recovery.take_due_retry(now + Duration::from_secs(1));
+        recovery.on_crash(now);
+
+        recovery.reset();
+
+        assert_eq!(recovery, CrashRecovery::default());
+        assert_eq!(
+            recovery.on_crash(now),
+            CrashDecision::RetryAfter(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn manual_retry_restarts_the_budget_after_exhaustion() {
+        let now = Instant::now();
+        let mut recovery = CrashRecovery::default();
+        for _ in 0..MAX_CRASH_ATTEMPTS {
+            let expected = CRASH_BACKOFF[recovery.attempts as usize];
+            assert_eq!(recovery.on_crash(now), CrashDecision::RetryAfter(expected));
+            recovery.take_due_retry(now + Duration::from_secs(10));
+        }
+        assert_eq!(recovery.on_crash(now), CrashDecision::Exhausted);
+
+        recovery.reset();
+
+        assert!(!recovery.failed);
+        assert_eq!(recovery.attempts, 0);
+        assert_eq!(
+            recovery.on_crash(now),
+            CrashDecision::RetryAfter(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn crashes_are_ignored_while_quitting() {
+        let now = Instant::now();
+        let mut recovery = CrashRecovery::default();
+
+        assert_eq!(
+            crash_decision(true, &mut recovery, now),
+            CrashDecision::Ignored
+        );
+        assert_eq!(recovery, CrashRecovery::default());
     }
 }

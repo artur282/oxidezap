@@ -1,11 +1,11 @@
 use gpui::{
-    App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render,
-    ResizeEdge, SharedString, Subscription, Window, div, prelude::*, px,
+    div, prelude::*, px, App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement,
+    MouseButton, Render, ResizeEdge, SharedString, Subscription, Window,
 };
 
 use crate::app::AppModel;
 use crate::assets::{ICON_GEAR, ICON_LOCK, ICON_MINUS, ICON_SQUARE, ICON_X};
-use crate::ui::components::{app_icon, titlebar_button, unread_badge};
+use crate::ui::components::{app_icon, button, titlebar_button, unread_badge};
 use crate::webview::TITLEBAR_HEIGHT;
 
 pub struct AccountWindow {
@@ -42,6 +42,12 @@ impl AccountWindow {
     fn lock(&mut self, cx: &mut Context<Self>) {
         self.model.update(cx, |model, cx| model.lock(cx));
     }
+
+    fn retry(&mut self, cx: &mut Context<Self>) {
+        let account_id = self.account_id.clone();
+        self.model
+            .update(cx, |model, cx| model.retry_account(&account_id, cx));
+    }
 }
 
 impl Focusable for AccountWindow {
@@ -60,12 +66,13 @@ impl Render for AccountWindow {
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
         }
 
-        let (theme, name, unread) = {
+        let (theme, name, unread, crash_failed) = {
             let model = self.model.read(cx);
             (
                 model.theme(window),
                 model.account_name(&self.account_id),
                 model.account_unread(&self.account_id),
+                model.account_crash_failed(&self.account_id),
             )
         };
 
@@ -187,12 +194,43 @@ impl Render for AccountWindow {
                             .items_center()
                             .gap(px(14.))
                             .child(app_icon(64.0))
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(theme.text_muted)
-                                    .child("Loading WhatsApp Web…"),
-                            ),
+                            .when(!crash_failed, |element| {
+                                element.child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(theme.text_muted)
+                                        .child("Loading WhatsApp Web…"),
+                                )
+                            })
+                            .when(crash_failed, |element| {
+                                element
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(theme.text)
+                                            .child("Could not recover WhatsApp Web"),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(420.))
+                                            .text_center()
+                                            .text_size(px(13.))
+                                            .text_color(theme.text_muted)
+                                            .child(
+                                                "The page kept crashing. Your session and messages are safe. Retry when you are ready.",
+                                            ),
+                                    )
+                                    .child(button(
+                                        "account-crash-retry",
+                                        "Retry now",
+                                        theme,
+                                        true,
+                                        cx.listener(|this, _event, _window, cx| {
+                                            this.retry(cx);
+                                        }),
+                                    ))
+                            }),
                     ),
             )
             .child(resize_handle(

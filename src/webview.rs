@@ -13,7 +13,7 @@ use webkit2gtk::{
     DownloadExt, NavigationPolicyDecision, NavigationPolicyDecisionExt, NotificationExt,
     NotificationPermissionRequest, PermissionRequest, PermissionRequestExt, PolicyDecisionExt,
     PolicyDecisionType, SettingsExt, URIRequestExt, UserMediaPermissionRequest,
-    UserMediaPermissionRequestExt, WebContextExt, WebViewExt,
+    UserMediaPermissionRequestExt, WebContextExt, WebProcessTerminationReason, WebViewExt,
 };
 
 use crate::links::{self, LinkAction};
@@ -673,7 +673,12 @@ fn connect_webview_signals(
 
     let crash_account = account_id.to_string();
     let crash_events = events;
-    webview.connect_web_process_terminated(move |_webview, _reason| {
+    webview.connect_web_process_terminated(move |_webview, reason| {
+        // Destroying the view (normal close and app quit) also terminates the
+        // web process. Only crashes and memory-limit kills need recovery.
+        if reason == WebProcessTerminationReason::TerminatedByApi {
+            return;
+        }
         let _ = crash_events.send(GtkEvent::Crashed {
             account_id: crash_account.clone(),
         });
