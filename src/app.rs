@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::{
     App, Bounds, Context, Entity, SharedString, Timer, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
@@ -1028,6 +1028,57 @@ impl AppModel {
         update(&mut self.settings);
         self.settings.normalize();
         self.apply_settings(cx);
+    }
+
+    /// Replaces the settings with a validated import. Accounts that disappear
+    /// keep their local WebKit profiles on disk; only their windows are closed.
+    pub fn apply_imported_settings(&mut self, mut settings: Settings, cx: &mut Context<Self>) {
+        settings.normalize();
+        let removed: Vec<String> = self
+            .settings
+            .accounts
+            .iter()
+            .filter(|account| settings.account(&account.id).is_none())
+            .map(|account| account.id.clone())
+            .collect();
+        for account_id in removed {
+            if let Some(handle) = self.account_windows.remove(&account_id) {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            }
+            self.account_xids.remove(&account_id);
+            self.crash_recovery.remove(&account_id);
+            self.hidden_accounts.remove(&account_id);
+            self.scales.remove(&account_id);
+            self.gtk.close(&account_id);
+        }
+        self.settings = settings;
+        self.release_lock_without_password(cx);
+        self.apply_settings(cx);
+    }
+
+    /// Restores preference defaults while keeping the configured accounts (and
+    /// therefore their WhatsApp sessions).
+    pub fn reset_settings(&mut self, cx: &mut Context<Self>) {
+        let mut settings = Settings::default();
+        settings.accounts = self.settings.accounts.clone();
+        settings.active_account = self.settings.active_account.clone();
+        settings.normalize();
+        self.settings = settings;
+        self.release_lock_without_password(cx);
+        self.apply_settings(cx);
+    }
+
+    /// Importing or resetting may remove the lock password while the app is
+    /// locked. Without a hash the lock window could never accept a password,
+    /// so the lock is released instead of trapping the user.
+    fn release_lock_without_password(&mut self, cx: &mut Context<Self>) {
+        if self.locked && self.settings.lock.hash.is_none() {
+            self.locked = false;
+            if let Some(handle) = self.lock_window.take() {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            }
+            self.show_all(cx);
+        }
     }
 
     fn apply_settings(&mut self, cx: &mut Context<Self>) {

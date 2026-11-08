@@ -282,6 +282,10 @@ impl Paths {
         self.account_dir(account_id).join("cache")
     }
 
+    pub fn settings_backup_dir(&self) -> PathBuf {
+        self.config_dir.join("backups")
+    }
+
     pub fn runtime_icon(&self) -> PathBuf {
         self.cache_dir.join("oxidezap-128.png")
     }

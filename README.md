@@ -57,6 +57,9 @@ That split matters:
 - **Notification toggle** in Settings.
 - **Close to tray**, **launch at login**, **remember bounds**, and a **configurable global shortcut**.
 - **App lock** with an Argon2id password. Lock on launch, on hide, or after an idle timeout; lock now from the tray or Settings; reset the password from Settings. The lock window hides every account window until the password is verified.
+- **Settings backup and restore.** Export the configuration to a readable JSON file, import it on another installation with a change summary and confirmation, or reset preferences to their defaults. Exports never contain account sessions, cookies, chat history, or the app-lock password hash; every import and reset writes a dated backup under `~/.config/oxidezap/backups/` first.
+- **Bounded crash recovery.** If WebKit terminates, OxideZap retries with a 1 s, 3 s, and 10 s backoff, then shows a native error state with a manual **Retry now** button instead of reloading forever.
+- **Responsive foreground.** Window tagging, settings persistence, notifications, external launchers, and clipboard file reads run away from the GPUI frame loop; GTK calls stay on the GTK thread.
 
 ### Desktop integration
 
@@ -170,6 +173,7 @@ update-desktop-database ~/.local/share/applications
 | Switch accounts | Open the account from the tray or from Settings -> Accounts |
 | Open settings | Titlebar gear, or tray -> **Settings** |
 | Lock the app | Tray -> **Lock now**, or Settings -> Security -> **Lock now** |
+| Back up or restore settings | Settings -> General -> **Export settings**, **Import settings**, or **Reset settings** |
 | Change WhatsApp zoom | Settings -> Appearance -> Display size |
 | Quit | Tray -> **Quit**, or `oxidezap --quit` |
 | Open a chat link | `oxidezap "whatsapp://send?phone=..."` |
@@ -198,6 +202,7 @@ URLs: whatsapp://send?phone=..., https://wa.me/..., https://chat.whatsapp.com/..
 | Path | Purpose |
 | --- | --- |
 | `~/.config/oxidezap/settings.json` | Accounts, appearance, notifications, general, and security settings |
+| `~/.config/oxidezap/backups/` | Dated settings backups written before an import or reset (`0600` files in a `0700` directory) |
 | `~/.local/share/oxidezap/accounts/<uuid>/` | Per-account WebKit data (`data/`) and cache (`cache/`) |
 | `~/.cache/oxidezap/` | Runtime assets such as the tray icon |
 | `~/.config/autostart/oxidezap.desktop` | Autostart entry, created when launch at login is enabled |
@@ -205,6 +210,18 @@ URLs: whatsapp://send?phone=..., https://wa.me/..., https://chat.whatsapp.com/..
 | `~/Downloads` | Default download directory |
 
 OxideZap follows `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_RUNTIME_DIR` when they are set. Removing an account from Settings also removes its WebKit profile directory.
+
+### Backup and restore
+
+Settings -> General includes **Export settings**, **Import settings**, and **Reset settings**. The export is a readable JSON document with a `version`, an `exported_at` UTC timestamp, and a `settings` object. An import validates the version and size, ignores unknown fields, normalizes out-of-range values such as zoom, shows a summary of the changes, and applies nothing until you confirm. Invalid or oversized files leave the current configuration untouched.
+
+Exports contain preferences only:
+
+- account names and per-account notification preferences, but **not** WhatsApp sessions, cookies, WebKit storage, chats, or message history;
+- no unread counts or remembered window positions (runtime state);
+- **no app-lock password hash**. The lock is disabled in an export, so after importing or resetting you must set the password again in Settings -> Security.
+
+Every import and reset writes a dated backup of the current `settings.json` to `~/.config/oxidezap/backups/` **before** changing anything, with `0600` permissions. If the backup cannot be written, the operation is cancelled. A reset restores preference defaults but keeps the configured accounts and their local sessions.
 
 ## Architecture
 
@@ -241,6 +258,9 @@ The two threads communicate over channels. The GPUI side sends commands such as 
 - OxideZap is an **unofficial client**. It is not affiliated with WhatsApp or Meta.
 - The application loads the official `https://web.whatsapp.com` page. Your session, messages, and encryption keys are handled by WhatsApp Web inside WebKitGTK.
 - Account data stays on your machine under `~/.local/share/oxidezap/`. OxideZap does not run a server and does not include telemetry or analytics.
+- **Files and directories are private by default.** Settings are written atomically to a `0600` temporary file and renamed into place; the settings directory, account directories, and WebKit data/cache roots are `0700`. Startup applies `umask(0o077)` before WebKit creates its cookies, local storage, IndexedDB, and caches. Existing installations are migrated without following symlinks, and the app never changes permissions on the download directory.
+- **Settings exports contain no secrets.** Exported files omit the app-lock password hash and every piece of WebKit session data. Automatic backups do contain the full settings, including the hash, so they are written to a `0700` directory as `0600` files.
+- **WebKit permissions are scoped to WhatsApp.** Only `whatsapp.com`, `wa.me`, `chat.whatsapp.com`, and WhatsApp's `whatsapp.net` utility pages may request permissions. Camera and microphone access always shows a native confirmation dialog; notifications are allowed only when the Settings notification toggle is on; every other permission type and origin is denied.
 - The optional app lock hashes the password with **Argon2id** and verifies it locally. The lock protects access to the running UI; it does not encrypt the WebKit profile on disk.
 - Notifications show the sender and message preview. You can disable them in Settings.
 

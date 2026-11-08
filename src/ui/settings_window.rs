@@ -1,12 +1,19 @@
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, Render, SharedString, StatefulInteractiveElement, Subscription, Window,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render,
+    SharedString, StatefulInteractiveElement, Subscription, Timer, Window, div, prelude::*, px,
 };
 
 use crate::app::{AppModel, AppModelEntityExt};
 use crate::assets::{ICON_BELL, ICON_GEAR, ICON_INFO, ICON_PALETTE, ICON_SHIELD, ICON_USER};
 use crate::lock::MIN_PASSWORD_LENGTH;
-use crate::settings::{Settings, ThemeMode, MAX_ZOOM, MIN_ZOOM};
+use crate::settings::{
+    ImportPreview, MAX_ZOOM, MIN_ZOOM, Settings, SettingsExport, ThemeMode, export_file_name,
+    json_path, write_settings_backup,
+};
 use crate::shortcut::Shortcut;
 use crate::theme::Theme;
 use crate::ui::components::{
@@ -15,6 +22,36 @@ use crate::ui::components::{
 };
 use crate::ui::text_input::TextField;
 use crate::updates::UpdateState;
+
+use gtk::prelude::{FileChooserExt, NativeDialogExt};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileChooserMode {
+    Open,
+    Save,
+}
+
+#[derive(Clone, Debug)]
+struct Notice {
+    error: bool,
+    text: String,
+}
+
+impl Notice {
+    fn success(text: impl Into<String>) -> Self {
+        Self {
+            error: false,
+            text: text.into(),
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            error: true,
+            text: text.into(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSection {
@@ -62,6 +99,11 @@ pub struct SettingsWindow {
     security_error: Option<String>,
     shortcut_error: Option<String>,
     remove_password_confirm: bool,
+    pending_import: Option<ImportPreview>,
+    reset_confirm: bool,
+    feedback: Option<Notice>,
+    file_dialog_open: bool,
+    operation_running: bool,
     appearance_subscription: Option<Subscription>,
 }
 
@@ -87,6 +129,11 @@ impl SettingsWindow {
             security_error: None,
             shortcut_error: None,
             remove_password_confirm: false,
+            pending_import: None,
+            reset_confirm: false,
+            feedback: None,
+            file_dialog_open: false,
+            operation_running: false,
             appearance_subscription: None,
         }
     }
@@ -113,13 +160,17 @@ impl SettingsWindow {
     fn cancel_pending_dialog(&mut self, cx: &mut Context<Self>) -> bool {
         let pending = self.renaming.is_some()
             || self.remove_confirm.is_some()
-            || self.remove_password_confirm;
+            || self.remove_password_confirm
+            || self.pending_import.is_some()
+            || self.reset_confirm;
         if !pending {
             return false;
         }
         self.renaming = None;
         self.remove_confirm = None;
         self.remove_password_confirm = false;
+        self.pending_import = None;
+        self.reset_confirm = false;
         cx.notify();
         true
     }
@@ -637,6 +688,366 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    fn start_export(&mut self, cx: &mut Context<Self>) {
+        if self.file_dialog_open || self.operation_running {
+            return;
+        }
+        self.file_dialog_open = true;
+        self.feedback = None;
+        self.pending_import = None;
+        self.reset_confirm = false;
+        let settings = self.model.read(cx).settings.clone();
+        let (sender, receiver) = bounded(1);
+        request_file_chooser(
+            FileChooserMode::Save,
+            export_file_name(SystemTime::now()),
+            sender,
+        );
+        cx.spawn(async move |this, cx| {
+            let Some(path) = wait_for_file_choice(receiver).await else {
+                this.update(cx, |this, cx| {
+                    this.file_dialog_open = false;
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
+            let path = json_path(path);
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let json = SettingsExport::new(&settings, SystemTime::now()).to_json()?;
+                    std::fs::write(&path, json).map_err(|error| {
+                        anyhow::anyhow!("could not write {}: {error}", path.display())
+                    })?;
+                    Ok::<PathBuf, anyhow::Error>(path)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.file_dialog_open = false;
+                this.feedback = Some(match result {
+                    Ok(path) => {
+                        Notice::success(format!("Settings exported to {}.", path.display()))
+                    }
+                    Err(error) => Notice::error(format!("Could not export settings: {error}")),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_import(&mut self, cx: &mut Context<Self>) {
+        if self.file_dialog_open || self.operation_running {
+            return;
+        }
+        self.file_dialog_open = true;
+        self.feedback = None;
+        self.pending_import = None;
+        self.reset_confirm = false;
+        let current = self.model.read(cx).settings.clone();
+        let (sender, receiver) = bounded(1);
+        request_file_chooser(FileChooserMode::Open, String::new(), sender);
+        cx.spawn(async move |this, cx| {
+            let Some(path) = wait_for_file_choice(receiver).await else {
+                this.update(cx, |this, cx| {
+                    this.file_dialog_open = false;
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { ImportPreview::from_path(&path, &current) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.file_dialog_open = false;
+                match result {
+                    Ok(preview) => {
+                        this.pending_import = Some(preview);
+                        this.reset_confirm = false;
+                    }
+                    Err(error) => {
+                        this.feedback =
+                            Some(Notice::error(format!("Could not import settings: {error}")));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_pending_import(&mut self, cx: &mut Context<Self>) {
+        if self.operation_running {
+            return;
+        }
+        let Some(preview) = self.pending_import.take() else {
+            return;
+        };
+        self.operation_running = true;
+        let current = self.model.read(cx).settings.clone();
+        let backup_dir = self.model.read(cx).paths.settings_backup_dir();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { write_settings_backup(&backup_dir, &current, SystemTime::now()) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.operation_running = false;
+                match result {
+                    Ok(path) => {
+                        this.model.update(cx, |model, cx| {
+                            model.apply_imported_settings(preview.settings, cx);
+                        });
+                        this.feedback = Some(Notice::success(format!(
+                            "Settings imported. The previous settings were backed up to {}.",
+                            path.display()
+                        )));
+                    }
+                    Err(error) => {
+                        this.pending_import = Some(preview);
+                        this.feedback = Some(Notice::error(format!(
+                            "Could not back up the current settings, so nothing was imported: {error}"
+                        )));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn reset_settings(&mut self, cx: &mut Context<Self>) {
+        if self.operation_running {
+            return;
+        }
+        self.reset_confirm = false;
+        self.pending_import = None;
+        self.operation_running = true;
+        let current = self.model.read(cx).settings.clone();
+        let backup_dir = self.model.read(cx).paths.settings_backup_dir();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { write_settings_backup(&backup_dir, &current, SystemTime::now()) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.operation_running = false;
+                match result {
+                    Ok(path) => {
+                        this.model.update(cx, |model, cx| model.reset_settings(cx));
+                        this.feedback = Some(Notice::success(format!(
+                            "Preferences reset to their defaults. Your accounts were kept and a backup was written to {}.",
+                            path.display()
+                        )));
+                    }
+                    Err(error) => {
+                        this.feedback = Some(Notice::error(format!(
+                            "Could not back up the current settings, so nothing was reset: {error}"
+                        )));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn backup_card(&mut self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let feedback = self.feedback.clone();
+        let pending_import = self.pending_import.clone();
+        let reset_confirm = self.reset_confirm;
+        let busy = self.file_dialog_open || self.operation_running;
+
+        let actions = div()
+            .flex()
+            .gap(px(8.))
+            .when(!busy, |style| {
+                style
+                    .child(button(
+                        "export-settings",
+                        "Export settings\u{2026}",
+                        theme,
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.start_export(cx);
+                        }),
+                    ))
+                    .child(button(
+                        "import-settings",
+                        "Import settings\u{2026}",
+                        theme,
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.start_import(cx);
+                        }),
+                    ))
+                    .child(button(
+                        "reset-settings",
+                        "Reset settings",
+                        theme,
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.pending_import = None;
+                            this.reset_confirm = true;
+                            cx.notify();
+                        }),
+                    ))
+            })
+            .when(busy, |style| {
+                style.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.text_muted)
+                        .child("Waiting for the file dialog or the current operation\u{2026}"),
+                )
+            });
+
+        let mut card = card(theme)
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child("Backup and restore"),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.text_muted)
+                    .child(
+                        "Export the configuration to a readable JSON file, import it on another installation, or restore the defaults.",
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(
+                        "Exports never include account sessions, cookies, chats, or the app-lock password. Every import and reset writes a dated backup first.",
+                    ),
+            )
+            .child(actions);
+
+        if let Some(notice) = feedback {
+            card = card.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(if notice.error {
+                        theme.danger
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(notice.text),
+            );
+        }
+
+        if let Some(preview) = pending_import {
+            let mut summary = div().flex().flex_col().gap(px(4.));
+            for change in &preview.changes {
+                summary = summary.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.text)
+                        .child(change.clone()),
+                );
+            }
+            card = card
+                .child(divider(theme))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted)
+                        .child("Import summary"),
+                )
+                .child(summary)
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_faint)
+                        .child(
+                            "Accounts from the file replace the current account list; local session data is not deleted. The app-lock password is not imported, so set it again afterwards.",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(button(
+                            "import-apply",
+                            "Apply import",
+                            theme,
+                            true,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.apply_pending_import(cx);
+                            }),
+                        ))
+                        .child(button(
+                            "import-cancel",
+                            "Cancel",
+                            theme,
+                            false,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.pending_import = None;
+                                cx.notify();
+                            }),
+                        )),
+                );
+        }
+
+        if reset_confirm {
+            card = card
+                .child(divider(theme))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.text)
+                        .child("Reset preferences to their defaults?"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_faint)
+                        .child(
+                            "Theme, zoom, notifications, startup, the global shortcut, and the app-lock password are reset. Accounts and their WhatsApp sessions are kept. A dated backup is written first.",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(button(
+                            "reset-apply",
+                            "Reset settings",
+                            theme,
+                            true,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.reset_settings(cx);
+                            }),
+                        ))
+                        .child(button(
+                            "reset-cancel",
+                            "Cancel",
+                            theme,
+                            false,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.reset_confirm = false;
+                                cx.notify();
+                            }),
+                        )),
+                );
+        }
+
+        card.into_any_element()
+    }
+
     fn render_general(
         &mut self,
         settings: &Settings,
@@ -645,6 +1056,7 @@ impl SettingsWindow {
     ) -> AnyElement {
         let shortcut_field = self.shortcut_field.clone();
         let error = self.shortcut_error.clone();
+        let backup_card = self.backup_card(theme, cx);
 
         div()
             .flex()
@@ -749,6 +1161,7 @@ impl SettingsWindow {
                             .child("Global shortcuts require an X11 or XWayland session."),
                     ),
             )
+            .child(backup_card)
             .into_any_element()
     }
 
@@ -1376,4 +1789,65 @@ fn idle_button(
             });
         }),
     )
+}
+
+/// Schedules a native GTK file chooser on the GTK/WebKit thread. This function
+/// is called from the GPUI thread and never blocks it: the dialog runs on the
+/// GTK main context, and the caller polls `result` from a GPUI task.
+fn request_file_chooser(
+    mode: FileChooserMode,
+    suggested_name: String,
+    result: Sender<Option<PathBuf>>,
+) {
+    glib::MainContext::default().invoke(move || {
+        let save = mode == FileChooserMode::Save;
+        let (title, action, accept) = if save {
+            (
+                "Export OxideZap settings",
+                gtk::FileChooserAction::Save,
+                "Export",
+            )
+        } else {
+            (
+                "Import OxideZap settings",
+                gtk::FileChooserAction::Open,
+                "Import",
+            )
+        };
+        let dialog = gtk::FileChooserNative::new(
+            Some(title),
+            None::<&gtk::Window>,
+            action,
+            Some(accept),
+            Some("Cancel"),
+        );
+        dialog.set_modal(true);
+        if save {
+            dialog.set_current_name(&suggested_name);
+        }
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("OxideZap settings (*.json)"));
+        filter.add_pattern("*.json");
+        dialog.add_filter(filter);
+
+        let response = dialog.run();
+        let chosen = (response == gtk::ResponseType::Accept)
+            .then(|| dialog.filename())
+            .flatten();
+        dialog.destroy();
+        let _ = result.send(chosen);
+    });
+}
+
+/// Waits for the native chooser without blocking the GPUI thread.
+async fn wait_for_file_choice(receiver: Receiver<Option<PathBuf>>) -> Option<PathBuf> {
+    loop {
+        match receiver.try_recv() {
+            Ok(path) => return path,
+            Err(TryRecvError::Empty) => {
+                let _ = Timer::after(Duration::from_millis(50)).await;
+            }
+            Err(TryRecvError::Disconnected) => return None,
+        }
+    }
 }

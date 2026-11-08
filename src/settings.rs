@@ -1,14 +1,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crossbeam_channel::{bounded, unbounded, Sender};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 pub const SETTINGS_VERSION: u32 = 1;
+/// Version of the portable `SettingsExport` file format. It is independent
+/// from `SETTINGS_VERSION`, so the on-disk settings schema can keep evolving
+/// without silently reinterpreted exports.
+pub const SETTINGS_EXPORT_VERSION: u32 = 1;
+/// Upper bound for an imported settings file. A real export is a few KiB;
+/// anything beyond this is rejected before it is parsed.
+pub const MAX_IMPORT_BYTES: u64 = 1024 * 1024;
 pub const MIN_ZOOM: f64 = 0.8;
 pub const MAX_ZOOM: f64 = 1.5;
 pub const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+W";
@@ -375,6 +382,294 @@ pub fn clamp_zoom(zoom: f64) -> f64 {
         return 1.0;
     }
     zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// Portable settings document written by "Export settings" and read by
+/// "Import settings". It contains only preferences: account sessions, cookies,
+/// chat data, runtime state, and the app-lock password hash are never written.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SettingsExport {
+    pub version: u32,
+    pub exported_at: String,
+    pub settings: Settings,
+}
+
+impl SettingsExport {
+    /// Builds an export from live settings. The lock password hash is removed,
+    /// the app lock is disabled, and per-account runtime state (unread counts
+    /// and window bounds) is reset so the result is portable and free of
+    /// secrets.
+    pub fn new(settings: &Settings, now: SystemTime) -> Self {
+        Self {
+            version: SETTINGS_EXPORT_VERSION,
+            exported_at: format_timestamp(now),
+            settings: exportable_settings(settings),
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(self).context("could not serialize the settings export")
+    }
+
+    /// Parses and validates an export. Unknown fields are tolerated, the
+    /// version must match exactly, oversized input is rejected before parsing,
+    /// and any lock password hash in the file is discarded.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Settings> {
+        if bytes.len() as u64 > MAX_IMPORT_BYTES {
+            bail!(
+                "settings export is too large ({} bytes; the limit is {} bytes)",
+                bytes.len(),
+                MAX_IMPORT_BYTES
+            );
+        }
+        let export: Self = serde_json::from_slice(bytes)
+            .context("the file is not a valid OxideZap settings export")?;
+        export.into_settings()
+    }
+
+    fn into_settings(self) -> Result<Settings> {
+        if self.version != SETTINGS_EXPORT_VERSION {
+            bail!(
+                "unsupported settings export version {}; this build supports version {}",
+                self.version,
+                SETTINGS_EXPORT_VERSION
+            );
+        }
+        let mut settings = self.settings;
+        scrub_lock_password(&mut settings);
+        settings.normalize();
+        Ok(settings)
+    }
+}
+
+/// Removes every trace of the app-lock password. Exports never carry it and
+/// imports never accept one from a file.
+fn scrub_lock_password(settings: &mut Settings) {
+    settings.lock.hash = None;
+    settings.lock.enabled = false;
+    settings.lock.lock_on_launch = false;
+    settings.lock.lock_on_hide = false;
+    settings.lock.idle_minutes = 0;
+}
+
+fn exportable_settings(settings: &Settings) -> Settings {
+    let mut settings = settings.clone();
+    scrub_lock_password(&mut settings);
+    for account in &mut settings.accounts {
+        account.unread = 0;
+        account.bounds = None;
+        account.maximized = false;
+    }
+    settings.normalize();
+    settings
+}
+
+/// A validated, normalized settings file ready to be applied, together with a
+/// human-readable list of the preferences that would change.
+#[derive(Clone, Debug)]
+pub struct ImportPreview {
+    pub settings: Settings,
+    pub changes: Vec<String>,
+}
+
+impl ImportPreview {
+    pub fn from_bytes(bytes: &[u8], current: &Settings) -> Result<Self> {
+        let settings = SettingsExport::from_bytes(bytes)?;
+        let changes = describe_changes(current, &settings);
+        Ok(Self { settings, changes })
+    }
+
+    /// Reads an export from disk, rejecting files larger than
+    /// `MAX_IMPORT_BYTES` before they are allocated or parsed.
+    pub fn from_path(path: &Path, current: &Settings) -> Result<Self> {
+        let metadata =
+            fs::metadata(path).with_context(|| format!("could not inspect {}", path.display()))?;
+        if metadata.len() > MAX_IMPORT_BYTES {
+            bail!(
+                "settings export is too large ({} bytes; the limit is {} bytes)",
+                metadata.len(),
+                MAX_IMPORT_BYTES
+            );
+        }
+        let data = fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
+        Self::from_bytes(&data, current)
+    }
+}
+
+fn describe_changes(current: &Settings, imported: &Settings) -> Vec<String> {
+    let mut changes = Vec::new();
+    if current.theme != imported.theme {
+        changes.push(format!(
+            "Theme: {} -> {}",
+            current.theme.label(),
+            imported.theme.label()
+        ));
+    }
+    if (current.zoom - imported.zoom).abs() >= 0.001 {
+        changes.push(format!(
+            "Zoom: {}% -> {}%",
+            percent(current.zoom),
+            percent(imported.zoom)
+        ));
+    }
+    if current.notifications != imported.notifications {
+        changes.push(format!(
+            "Desktop notifications: {}",
+            on_off(imported.notifications)
+        ));
+    }
+    if current.do_not_disturb != imported.do_not_disturb {
+        changes.push(format!(
+            "Do not disturb: {}",
+            on_off(imported.do_not_disturb)
+        ));
+    }
+    if current.close_to_tray != imported.close_to_tray {
+        changes.push(format!("Close to tray: {}", on_off(imported.close_to_tray)));
+    }
+    if current.start_at_login != imported.start_at_login {
+        changes.push(format!(
+            "Launch at login: {}",
+            on_off(imported.start_at_login)
+        ));
+    }
+    if current.remember_bounds != imported.remember_bounds {
+        changes.push(format!(
+            "Remember window bounds: {}",
+            on_off(imported.remember_bounds)
+        ));
+    }
+    if current.shortcut != imported.shortcut {
+        changes.push(format!(
+            "Global shortcut: {} -> {}",
+            current.shortcut, imported.shortcut
+        ));
+    }
+    let current_accounts = account_names(current);
+    let imported_accounts = account_names(imported);
+    if current_accounts != imported_accounts {
+        changes.push(format!(
+            "Accounts: {} -> {}",
+            account_list(&current_accounts),
+            account_list(&imported_accounts)
+        ));
+    }
+    if changes.is_empty() {
+        changes.push("No preference changes.".to_string());
+    }
+    changes
+}
+
+fn percent(zoom: f64) -> u32 {
+    (zoom * 100.0).round() as u32
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn account_names(settings: &Settings) -> Vec<String> {
+    settings
+        .accounts
+        .iter()
+        .map(|account| account.name.clone())
+        .collect()
+}
+
+fn account_list(names: &[String]) -> String {
+    if names.is_empty() {
+        return "(none)".to_string();
+    }
+    names.join(", ")
+}
+
+/// Writes the full current settings (including the lock password hash) to a
+/// dated, private backup file. Backups exist so a destructive import or reset
+/// can be undone by restoring the file. The parent directory is created as
+/// `0700` and the file is written as `0600` on Unix.
+pub fn write_settings_backup(dir: &Path, settings: &Settings, now: SystemTime) -> Result<PathBuf> {
+    crate::paths::create_private_dir(dir)
+        .with_context(|| format!("could not create {}", dir.display()))?;
+    let stamp = format_timestamp(now).replace(':', "-");
+    let data =
+        serde_json::to_vec_pretty(settings).context("could not serialize the settings backup")?;
+    for attempt in 0..100 {
+        let name = if attempt == 0 {
+            format!("settings-{stamp}.json")
+        } else {
+            format!("settings-{stamp}-{attempt}.json")
+        };
+        let path = dir.join(name);
+        if path.exists() {
+            continue;
+        }
+        crate::paths::write_private_file(&path, &data)
+            .with_context(|| format!("could not write {}", path.display()))?;
+        return Ok(path);
+    }
+    bail!("could not choose a unique name for the settings backup")
+}
+
+/// Filename offered by the export file chooser, for example
+/// `oxidezap-settings-2026-11-07T12-34-56Z.json`.
+pub fn export_file_name(now: SystemTime) -> String {
+    format!(
+        "oxidezap-settings-{}.json",
+        format_timestamp(now).replace(':', "-")
+    )
+}
+
+/// Adds the `.json` extension when the user typed a name without one.
+pub fn json_path(path: PathBuf) -> PathBuf {
+    let is_json = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+    if is_json {
+        path
+    } else {
+        path.with_extension("json")
+    }
+}
+
+/// Formats a `SystemTime` as an RFC 3339 UTC timestamp with second precision.
+/// The conversion is pure so it can be tested without a clock.
+pub fn format_timestamp(now: SystemTime) -> String {
+    let seconds = now
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let days = (seconds / 86_400) as i64;
+    let second_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Converts days since the Unix epoch to a proleptic Gregorian date.
+/// Howard Hinnant's `civil_from_days` algorithm.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month as u32, day as u32)
 }
 
 /// Coalesces many settings changes into one debounced write.
@@ -817,5 +1112,271 @@ mod tests {
         writer.save_and_wait(expected.clone(), path.clone());
 
         assert_eq!(Settings::load(&path).unwrap(), expected);
+    }
+
+    fn exported_fixture() -> Settings {
+        let mut account = Account::with_id("acc-1", "Work");
+        account.unread = 7;
+        account.bounds = Some(SavedBounds {
+            x: 10.0,
+            y: 20.0,
+            width: 1280.0,
+            height: 800.0,
+        });
+        account.maximized = true;
+        Settings {
+            accounts: vec![account],
+            active_account: Some("acc-1".to_string()),
+            theme: ThemeMode::Dark,
+            zoom: 1.25,
+            notifications: false,
+            do_not_disturb: true,
+            close_to_tray: false,
+            start_at_login: true,
+            remember_bounds: false,
+            shortcut: "Ctrl+Alt+O".to_string(),
+            lock: LockSettings {
+                enabled: true,
+                hash: Some("$argon2id$v=19$m=19456,t=2,p=1$secret$hash".to_string()),
+                lock_on_launch: true,
+                lock_on_hide: true,
+                idle_minutes: 15,
+            },
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn timestamps_are_formatted_as_utc_rfc3339() {
+        assert_eq!(
+            format_timestamp(UNIX_EPOCH),
+            "1970-01-01T00:00:00Z".to_string()
+        );
+        assert_eq!(
+            format_timestamp(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "2023-11-14T22:13:20Z".to_string()
+        );
+    }
+
+    #[test]
+    fn export_round_trips_preferences() {
+        let settings = exported_fixture();
+        let export =
+            SettingsExport::new(&settings, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let json = export.to_json().unwrap();
+
+        assert_eq!(export.exported_at, "2023-11-14T22:13:20Z");
+        assert_eq!(export.version, SETTINGS_EXPORT_VERSION);
+        assert!(json.contains("\"version\": 1"));
+        assert!(json.contains("\"exported_at\": \"2023-11-14T22:13:20Z\""));
+        assert!(json.contains("\"settings\""));
+
+        let restored = SettingsExport::from_bytes(json.as_bytes()).unwrap();
+        assert_eq!(restored.theme, ThemeMode::Dark);
+        assert_eq!(restored.zoom, 1.25);
+        assert!(!restored.notifications);
+        assert!(restored.do_not_disturb);
+        assert!(!restored.close_to_tray);
+        assert!(restored.start_at_login);
+        assert!(!restored.remember_bounds);
+        assert_eq!(restored.shortcut, "Ctrl+Alt+O");
+        assert_eq!(restored.accounts.len(), 1);
+        assert_eq!(restored.accounts[0].name, "Work");
+    }
+
+    #[test]
+    fn export_excludes_the_lock_password_and_runtime_state() {
+        let settings = exported_fixture();
+        let hash = settings.lock.hash.clone().unwrap();
+        let export = SettingsExport::new(&settings, UNIX_EPOCH);
+        let json = export.to_json().unwrap();
+
+        assert!(
+            !json.contains(&hash),
+            "the export must not contain the hash"
+        );
+        assert!(
+            !json.contains("argon2"),
+            "the export must not contain hash data"
+        );
+        assert!(
+            !json.contains("unread\": 7"),
+            "unread counts are runtime state"
+        );
+        assert!(!json.contains("1280.0"), "window bounds are runtime state");
+
+        let restored = SettingsExport::from_bytes(json.as_bytes()).unwrap();
+        assert!(restored.lock.hash.is_none());
+        assert!(!restored.lock.enabled);
+        assert_eq!(restored.accounts[0].unread, 0);
+        assert!(restored.accounts[0].bounds.is_none());
+        assert!(!restored.accounts[0].maximized);
+    }
+
+    #[test]
+    fn import_discards_a_lock_password_found_in_a_file() {
+        let mut settings = exported_fixture();
+        settings.lock.hash = None;
+        let mut export = SettingsExport::new(&settings, UNIX_EPOCH);
+        export.settings.lock.hash = Some("$argon2id$smuggled".to_string());
+        export.settings.lock.enabled = true;
+        export.settings.lock.lock_on_launch = true;
+        let json = serde_json::to_vec(&export).unwrap();
+
+        let restored = SettingsExport::from_bytes(&json).unwrap();
+        assert!(restored.lock.hash.is_none());
+        assert!(!restored.lock.enabled);
+        assert!(!restored.lock.lock_on_launch);
+        assert_eq!(restored.lock.idle_minutes, 0);
+    }
+
+    #[test]
+    fn import_tolerates_unknown_fields() {
+        let json = br#"{
+            "version": 1,
+            "exported_at": "2026-01-01T00:00:00Z",
+            "future_top_level": {"anything": true},
+            "settings": {
+                "version": 1,
+                "theme": "light",
+                "languages": ["en"],
+                "accounts": [{"id": "a", "name": "A", "unknown_account": 3}]
+            }
+        }"#;
+
+        let settings = SettingsExport::from_bytes(json).unwrap();
+        assert_eq!(settings.theme, ThemeMode::Light);
+        assert_eq!(settings.accounts[0].name, "A");
+        assert_eq!(settings.accounts[0].id, "a");
+    }
+
+    #[test]
+    fn import_rejects_invalid_json() {
+        let error = SettingsExport::from_bytes(b"{not json").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not a valid OxideZap settings export"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_an_unknown_version() {
+        let json = br#"{"version": 2, "exported_at": "2026-01-01T00:00:00Z", "settings": {}}"#;
+        let error = SettingsExport::from_bytes(json).unwrap_err();
+        assert!(error.to_string().contains("version 2"), "{error}");
+        assert!(error.to_string().contains("supports version 1"), "{error}");
+    }
+
+    #[test]
+    fn import_rejects_a_file_that_is_too_large() {
+        let bytes = vec![b' '; MAX_IMPORT_BYTES as usize + 1];
+        let error = SettingsExport::from_bytes(&bytes).unwrap_err();
+        assert!(error.to_string().contains("too large"), "{error}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        fs::write(&path, &bytes).unwrap();
+        let error = ImportPreview::from_path(&path, &Settings::default()).unwrap_err();
+        assert!(error.to_string().contains("too large"), "{error}");
+    }
+
+    #[test]
+    fn import_normalizes_out_of_range_values() {
+        let json = br#"{
+            "version": 1,
+            "exported_at": "2026-01-01T00:00:00Z",
+            "settings": {
+                "version": 1,
+                "zoom": 9.0,
+                "shortcut": "   ",
+                "lock": {"enabled": true, "hash": "$argon2id$smuggled"},
+                "accounts": [{"id": "a", "name": "A"}],
+                "active_account": "missing"
+            }
+        }"#;
+
+        let settings = SettingsExport::from_bytes(json).unwrap();
+        assert_eq!(settings.zoom, MAX_ZOOM);
+        assert_eq!(settings.shortcut, DEFAULT_SHORTCUT);
+        assert!(settings.lock.hash.is_none());
+        assert_eq!(settings.active_account.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn import_preview_summarizes_the_changes() {
+        let current = Settings::default();
+        let import = exported_fixture();
+        let json = SettingsExport::new(&import, UNIX_EPOCH).to_json().unwrap();
+
+        let preview = ImportPreview::from_bytes(json.as_bytes(), &current).unwrap();
+        assert!(preview
+            .changes
+            .contains(&"Theme: System -> Dark".to_string()));
+        assert!(preview.changes.contains(&"Zoom: 100% -> 125%".to_string()));
+        assert!(preview
+            .changes
+            .iter()
+            .any(|change| change.starts_with("Accounts:")));
+    }
+
+    #[test]
+    fn import_preview_reports_an_identical_file() {
+        let current = Settings::default();
+        let json = SettingsExport::new(&current, UNIX_EPOCH).to_json().unwrap();
+
+        let preview = ImportPreview::from_bytes(json.as_bytes(), &current).unwrap();
+        assert_eq!(preview.changes, vec!["No preference changes."]);
+    }
+
+    #[test]
+    fn export_file_names_are_dated_and_safe() {
+        let name = export_file_name(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        assert_eq!(name, "oxidezap-settings-2023-11-14T22-13-20Z.json");
+    }
+
+    #[test]
+    fn json_extension_is_added_only_when_missing() {
+        assert_eq!(
+            json_path(PathBuf::from("/tmp/settings")),
+            PathBuf::from("/tmp/settings.json")
+        );
+        assert_eq!(
+            json_path(PathBuf::from("/tmp/settings.JSON")),
+            PathBuf::from("/tmp/settings.JSON")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backups_are_dated_private_and_never_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("backups");
+        let settings = exported_fixture();
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        let first = write_settings_backup(&dir, &settings, now).unwrap();
+        let second = write_settings_backup(&dir, &settings, now).unwrap();
+
+        assert_ne!(first, second);
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("settings-2023-11-14T22-13-20Z"));
+        assert_eq!(
+            fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let restored = Settings::load(&first).unwrap();
+        assert_eq!(restored, settings);
     }
 }
