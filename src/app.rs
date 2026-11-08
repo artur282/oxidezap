@@ -432,9 +432,17 @@ impl AppModel {
                 body,
             } => {
                 debug!(%account_id, %title, "webview notification");
-                if self.settings.notifications && !self.locked && self.should_notify(&title, &body)
+                if self.settings.message_notifications_enabled(&account_id)
+                    && !self.locked
+                    && self.should_notify(&title, &body)
                 {
-                    notify::notify(&title, &body, Some(&self.paths.runtime_icon()));
+                    let sound = self.settings.notification_sound_enabled(&account_id);
+                    notify::notify_with_sound(
+                        &title,
+                        &body,
+                        Some(&self.paths.runtime_icon()),
+                        sound,
+                    );
                 }
             }
             GtkEvent::DownloadStarted {
@@ -1012,7 +1020,12 @@ impl AppModel {
         let unread = self.settings.total_unread();
         let visible = self.any_account_visible();
         if let Some(tray) = &self.tray {
-            tray.update(&self.settings.accounts, unread, visible);
+            tray.update(
+                &self.settings.accounts,
+                unread,
+                visible,
+                self.settings.do_not_disturb,
+            );
         }
         self.badge.set(unread);
     }

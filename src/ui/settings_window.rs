@@ -502,6 +502,78 @@ impl SettingsWindow {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let mut per_account = div().flex().flex_col().gap(px(2.));
+        for (index, account) in settings.accounts.iter().enumerate() {
+            if index > 0 {
+                per_account = per_account.child(divider(theme));
+            }
+            let account_id = account.id.clone();
+            let name = account.name.clone();
+            let muted = account.muted;
+            let sound = account.notification_sound;
+            let state = if muted {
+                "Muted"
+            } else if sound {
+                "Notifications and sound"
+            } else {
+                "Notifications, silent"
+            };
+            let mute_target = account_id.clone();
+            let sound_target = account_id.clone();
+            per_account = per_account
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.))
+                        .py(px(8.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.text_faint)
+                                .child(state),
+                        ),
+                )
+                .child(toggle_row(
+                    SharedString::from(format!("mute-{account_id}")),
+                    "Mute notifications",
+                    "Suppress native message notifications from this account.",
+                    muted,
+                    theme,
+                    cx.listener(move |this, _event, _window, cx| {
+                        let account_id = mute_target.clone();
+                        this.model.update(cx, |model, cx| {
+                            model.update_settings(cx, |settings| {
+                                settings.set_muted(&account_id, !muted);
+                            });
+                        });
+                    }),
+                ))
+                .child(toggle_row(
+                    SharedString::from(format!("sound-{account_id}")),
+                    "Notification sound",
+                    "Ask the desktop notification service to play a message sound.",
+                    sound,
+                    theme,
+                    cx.listener(move |this, _event, _window, cx| {
+                        let account_id = sound_target.clone();
+                        this.model.update(cx, |model, cx| {
+                            model.update_settings(cx, |settings| {
+                                settings.set_notification_sound(&account_id, !sound);
+                            });
+                        });
+                    }),
+                ));
+        }
+
         div()
             .flex()
             .flex_col()
@@ -512,24 +584,54 @@ impl SettingsWindow {
                 theme,
             ))
             .child(
-                card(theme).child(toggle_row(
-                    "notifications-enabled",
-                    "Desktop notifications",
-                    "Show a native notification when a message arrives while OxideZap is in the background.",
-                    settings.notifications,
-                    theme,
-                    cx.listener(|this, _event, _window, cx| {
-                        this.model.update_settings(cx, |settings| {
-                            settings.notifications = !settings.notifications;
-                        });
-                    }),
-                )),
+                card(theme)
+                    .child(toggle_row(
+                        "notifications-enabled",
+                        "Desktop notifications",
+                        "Show a native notification when a message arrives while OxideZap is in the background.",
+                        settings.notifications,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.notifications = !settings.notifications;
+                            });
+                        }),
+                    ))
+                    .child(divider(theme))
+                    .child(toggle_row(
+                        "do-not-disturb",
+                        "Do not disturb",
+                        "Pause message notifications and sounds from every account. Unread counts keep updating.",
+                        settings.do_not_disturb,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.set_do_not_disturb(!settings.do_not_disturb);
+                            });
+                        }),
+                    )),
+            )
+            .child(
+                card(theme)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child("Per-account"),
+                    )
+                    .child(per_account),
             )
             .child(
                 div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child("Notifications are suppressed while the app is locked."),
+                    .child("Muted accounts and Do not disturb have priority over per-account sounds.")
+                    .child("Notifications are also suppressed while the app is locked.")
+                    .child("Sound playback depends on the notification service and its sound theme; some servers ignore the requested sound or always use their own."),
             )
             .into_any_element()
     }

@@ -1,22 +1,29 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{unbounded, Sender};
+use notify_rust::Hint;
 use tracing::warn;
+
+/// A themeable named sound from the freedesktop.org sound naming specification.
+/// The notification server decides whether it exists and whether to play it.
+pub const SYSTEM_SOUND: &str = "message-new-instant";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DesktopNotification {
     summary: String,
     body: String,
     icon: Option<PathBuf>,
+    sound: Option<bool>,
 }
 
 impl DesktopNotification {
-    fn new(summary: &str, body: &str, icon: Option<&Path>) -> Self {
+    fn new(summary: &str, body: &str, icon: Option<&Path>, sound: Option<bool>) -> Self {
         Self {
             summary: summary.to_string(),
             body: body.to_string(),
             icon: icon.map(Path::to_path_buf),
+            sound,
         }
     }
 }
@@ -61,13 +68,55 @@ fn queue() -> Option<&'static NotificationQueue> {
 }
 
 pub fn notify(summary: &str, body: &str, icon: Option<&Path>) {
-    let notification = DesktopNotification::new(summary, body, icon);
+    enqueue(DesktopNotification::new(summary, body, icon, None));
+}
+
+pub fn notify_with_sound(summary: &str, body: &str, icon: Option<&Path>, sound: bool) {
+    enqueue(DesktopNotification::new(summary, body, icon, Some(sound)));
+}
+
+fn enqueue(notification: DesktopNotification) {
     let Some(queue) = queue() else {
         show(notification);
         return;
     };
     if let Err(notification) = queue.send(notification) {
         show(notification);
+    }
+}
+
+fn show(notification: DesktopNotification) {
+    let mut desktop = build(
+        &notification.summary,
+        &notification.body,
+        notification.icon.as_deref(),
+    );
+    if let Some(sound) = notification.sound {
+        apply_sound_preference(&mut desktop, sound);
+    }
+    if let Err(error) = desktop.show() {
+        warn!(%error, "could not show a desktop notification");
+    }
+}
+
+fn build(summary: &str, body: &str, icon: Option<&Path>) -> notify_rust::Notification {
+    let mut notification = notify_rust::Notification::new();
+    notification
+        .appname("OxideZap")
+        .summary(summary)
+        .body(body)
+        .timeout(notify_rust::Timeout::Milliseconds(6000));
+    if let Some(icon) = icon {
+        notification.icon(&icon.to_string_lossy());
+    }
+    notification
+}
+
+fn apply_sound_preference(notification: &mut notify_rust::Notification, sound: bool) {
+    if sound {
+        notification.sound_name(SYSTEM_SOUND);
+    } else {
+        notification.hint(Hint::SuppressSound(true));
     }
 }
 
@@ -79,21 +128,6 @@ pub fn notify_download(filename: &str, destination: &Path, icon: Option<&Path>) 
     );
 }
 
-fn show(notification: DesktopNotification) {
-    let mut desktop = notify_rust::Notification::new();
-    desktop
-        .appname("OxideZap")
-        .summary(&notification.summary)
-        .body(&notification.body)
-        .timeout(notify_rust::Timeout::Milliseconds(6000));
-    if let Some(icon) = &notification.icon {
-        desktop.icon(&icon.to_string_lossy());
-    }
-    if let Err(error) = desktop.show() {
-        warn!(%error, "could not show a desktop notification");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -102,7 +136,38 @@ mod tests {
     use super::*;
 
     fn notification(summary: &str) -> DesktopNotification {
-        DesktopNotification::new(summary, "body", None)
+        DesktopNotification::new(summary, "body", None, None)
+    }
+
+    #[test]
+    fn plain_notifications_keep_their_default_sound_behavior() {
+        let notification = build("Download complete", "file", None);
+        assert!(!notification.hints.iter().any(|hint| matches!(
+            hint,
+            notify_rust::Hint::SoundName(_) | notify_rust::Hint::SuppressSound(_)
+        )));
+    }
+
+    #[test]
+    fn sound_preference_maps_to_notification_hints() {
+        let mut audible = notify_rust::Notification::new();
+        apply_sound_preference(&mut audible, true);
+        assert!(audible
+            .hints
+            .contains(&notify_rust::Hint::SoundName(SYSTEM_SOUND.to_string())));
+        assert!(!audible
+            .hints
+            .contains(&notify_rust::Hint::SuppressSound(true)));
+
+        let mut silent = notify_rust::Notification::new();
+        apply_sound_preference(&mut silent, false);
+        assert!(silent
+            .hints
+            .contains(&notify_rust::Hint::SuppressSound(true)));
+        assert!(!silent
+            .hints
+            .iter()
+            .any(|hint| matches!(hint, notify_rust::Hint::SoundName(_))));
     }
 
     #[test]

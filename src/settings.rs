@@ -59,6 +59,14 @@ pub struct Account {
     pub bounds: Option<SavedBounds>,
     #[serde(default)]
     pub maximized: bool,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default = "notification_sound_default")]
+    pub notification_sound: bool,
+}
+
+fn notification_sound_default() -> bool {
+    true
 }
 
 impl Account {
@@ -69,6 +77,8 @@ impl Account {
             unread: 0,
             bounds: None,
             maximized: false,
+            muted: false,
+            notification_sound: true,
         }
     }
 
@@ -79,6 +89,8 @@ impl Account {
             unread: 0,
             bounds: None,
             maximized: false,
+            muted: false,
+            notification_sound: true,
         }
     }
 
@@ -110,6 +122,7 @@ pub struct Settings {
     pub theme: ThemeMode,
     pub zoom: f64,
     pub notifications: bool,
+    pub do_not_disturb: bool,
     pub close_to_tray: bool,
     pub start_at_login: bool,
     pub remember_bounds: bool,
@@ -126,6 +139,7 @@ impl Default for Settings {
             theme: ThemeMode::System,
             zoom: 1.0,
             notifications: true,
+            do_not_disturb: false,
             close_to_tray: true,
             start_at_login: false,
             remember_bounds: true,
@@ -275,6 +289,53 @@ impl Settings {
 
     pub fn total_unread(&self) -> u32 {
         self.accounts.iter().map(|account| account.unread).sum()
+    }
+
+    pub fn set_muted(&mut self, id: &str, muted: bool) -> bool {
+        let Some(account) = self.account_mut(id) else {
+            return false;
+        };
+        if account.muted == muted {
+            return false;
+        }
+        account.muted = muted;
+        true
+    }
+
+    pub fn set_notification_sound(&mut self, id: &str, enabled: bool) -> bool {
+        let Some(account) = self.account_mut(id) else {
+            return false;
+        };
+        if account.notification_sound == enabled {
+            return false;
+        }
+        account.notification_sound = enabled;
+        true
+    }
+
+    pub fn set_do_not_disturb(&mut self, enabled: bool) -> bool {
+        if self.do_not_disturb == enabled {
+            return false;
+        }
+        self.do_not_disturb = enabled;
+        true
+    }
+
+    /// A muted account or the global do-not-disturb mode suppresses message
+    /// notifications. Download, crash, and error notifications are unaffected.
+    pub fn message_notifications_enabled(&self, account_id: &str) -> bool {
+        self.notifications
+            && !self.do_not_disturb
+            && self
+                .account(account_id)
+                .is_some_and(|account| !account.muted)
+    }
+
+    pub fn notification_sound_enabled(&self, account_id: &str) -> bool {
+        self.message_notifications_enabled(account_id)
+            && self
+                .account(account_id)
+                .is_some_and(|account| account.notification_sound)
     }
 
     pub fn set_zoom(&mut self, zoom: f64) -> bool {
@@ -435,8 +496,67 @@ mod tests {
         assert_eq!(settings.version, SETTINGS_VERSION);
         assert_eq!(settings.zoom, 1.0);
         assert!(settings.notifications);
+        assert!(!settings.do_not_disturb);
         assert!(settings.close_to_tray);
         assert!(!settings.lock.enabled);
+    }
+
+    #[test]
+    fn notification_policy_respects_mute_sound_and_do_not_disturb() {
+        let mut settings = Settings::default();
+        settings.ensure_first_account();
+        let id = settings.accounts[0].id.clone();
+
+        assert!(settings.message_notifications_enabled(&id));
+        assert!(settings.notification_sound_enabled(&id));
+
+        assert!(settings.set_muted(&id, true));
+        assert!(!settings.message_notifications_enabled(&id));
+        assert!(!settings.notification_sound_enabled(&id));
+        assert!(!settings.set_muted(&id, true));
+
+        assert!(settings.set_muted(&id, false));
+        assert!(settings.set_notification_sound(&id, false));
+        assert!(settings.message_notifications_enabled(&id));
+        assert!(!settings.notification_sound_enabled(&id));
+
+        assert!(settings.set_notification_sound(&id, true));
+        assert!(settings.set_do_not_disturb(true));
+        assert!(!settings.message_notifications_enabled(&id));
+        assert!(!settings.notification_sound_enabled(&id));
+        assert!(!settings.set_do_not_disturb(true));
+        assert!(settings.set_do_not_disturb(false));
+
+        settings.notifications = false;
+        assert!(!settings.message_notifications_enabled(&id));
+        assert!(!settings.notification_sound_enabled(&id));
+
+        assert!(!settings.message_notifications_enabled("missing"));
+        assert!(!settings.notification_sound_enabled("missing"));
+    }
+
+    #[test]
+    fn muting_one_account_keeps_the_others_active() {
+        let mut settings = Settings {
+            accounts: vec![Account::with_id("a", "A"), Account::with_id("b", "B")],
+            ..Settings::default()
+        };
+
+        settings.set_muted("a", true);
+
+        assert!(!settings.message_notifications_enabled("a"));
+        assert!(settings.message_notifications_enabled("b"));
+        assert!(settings.notification_sound_enabled("b"));
+    }
+
+    #[test]
+    fn legacy_settings_default_to_audible_unmuted_accounts() {
+        let json = br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"active_account":"a"}"#;
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+
+        assert!(!settings.do_not_disturb);
+        assert!(!settings.accounts[0].muted);
+        assert!(settings.accounts[0].notification_sound);
     }
 
     #[test]
