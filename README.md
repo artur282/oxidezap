@@ -254,6 +254,7 @@ The two threads communicate over channels. The GPUI side sends commands such as 
 - **The first login requires a QR scan** from the WhatsApp mobile app.
 - **No auto-update.** Reinstall or replace the binary to update.
 - **The app lock does not encrypt data at rest.** It gates the UI, not the files on disk.
+- **Screen readers cannot inspect the native GPUI shell.** The native titlebar, settings window, and lock screen are keyboard-operable: `Tab` and `Shift+Tab` move focus, focused buttons activate with `Enter` or `Space`, and focus is drawn with a visible border. GPUI 0.2.2 has no AccessKit/AT-SPI bridge, so assistive technology has no semantic view of these native controls; the WhatsApp Web content inside WebKitGTK is unaffected.
 - **Linux only.** There are no macOS or Windows builds.
 
 ## Development

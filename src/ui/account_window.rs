@@ -5,7 +5,9 @@ use gpui::{
 
 use crate::app::AppModel;
 use crate::assets::{ICON_GEAR, ICON_LOCK, ICON_MINUS, ICON_SQUARE, ICON_X};
-use crate::ui::components::{app_icon, button, titlebar_button, unread_badge};
+use crate::ui::components::{
+    app_icon, button, handle_focus_traversal, titlebar_button, unread_badge,
+};
 use crate::webview::TITLEBAR_HEIGHT;
 
 pub struct AccountWindow {
@@ -65,6 +67,9 @@ impl Render for AccountWindow {
             self.appearance_subscription =
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
         }
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle);
+        }
 
         let (theme, name, unread, crash_failed) = {
             let model = self.model.read(cx);
@@ -117,6 +122,8 @@ impl Render for AccountWindow {
             .flex()
             .flex_col()
             .bg(theme.bg)
+            .track_focus(&self.focus_handle)
+            .on_key_down(handle_focus_traversal)
             .child(
                 div()
                     .flex()
@@ -135,6 +142,7 @@ impl Render for AccountWindow {
                             .child(titlebar_button(
                                 "account-settings",
                                 ICON_GEAR,
+                                "Settings",
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -144,6 +152,7 @@ impl Render for AccountWindow {
                             .child(titlebar_button(
                                 "account-lock",
                                 ICON_LOCK,
+                                "Lock",
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -153,6 +162,7 @@ impl Render for AccountWindow {
                             .child(titlebar_button(
                                 "account-minimize",
                                 ICON_MINUS,
+                                "Minimize",
                                 theme,
                                 false,
                                 cx.listener(|_this, _event, window, _cx| {
@@ -162,6 +172,7 @@ impl Render for AccountWindow {
                             .child(titlebar_button(
                                 "account-maximize",
                                 ICON_SQUARE,
+                                "Maximize",
                                 theme,
                                 false,
                                 cx.listener(|_this, _event, window, _cx| {
@@ -171,6 +182,7 @@ impl Render for AccountWindow {
                             .child(titlebar_button(
                                 "account-close",
                                 ICON_X,
+                                "Close",
                                 theme,
                                 true,
                                 cx.listener(|this, _event, window, cx| {

@@ -1,9 +1,99 @@
 use gpui::{
-    App, ClickEvent, Div, ElementId, FontWeight, IntoElement, SharedString, Window, div,
-    prelude::*, px, rgb, svg,
+    AnyView, App, ClickEvent, Div, ElementId, Entity, FontWeight, IntoElement, KeyDownEvent,
+    Keystroke, Render, SharedString, StyleRefinement, Window, div, prelude::*, px, rgb, svg,
+    transparent_black,
 };
 
 use crate::theme::Theme;
+use crate::ui::text_input::TextField;
+
+// GPUI 0.2.2 has no AccessKit/AT-SPI bridge, so screen readers cannot inspect
+// the native shell, and it provides no `focus_ring` API. Keyboard access is
+// implemented with focus handles, tab stops and a theme-colored focus border.
+// GPUI activates a focused element's click listener with Enter/Space itself and
+// does not bind Tab, so every native window handles Tab and Shift+Tab at its
+// root.
+//
+// All interactive elements use index 0 so Tab order follows paint (visual)
+// order through the tab-stop insertion history.
+pub const TAB_INDEX: isize = 0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusDirection {
+    Next,
+    Previous,
+}
+
+pub fn focus_direction(keystroke: &Keystroke) -> Option<FocusDirection> {
+    let modifiers = keystroke.modifiers;
+    if keystroke.key != "tab" || modifiers.control || modifiers.platform || modifiers.alt {
+        return None;
+    }
+    Some(if modifiers.shift {
+        FocusDirection::Previous
+    } else {
+        FocusDirection::Next
+    })
+}
+
+pub fn handle_focus_traversal(event: &KeyDownEvent, window: &mut Window, _cx: &mut App) {
+    match focus_direction(&event.keystroke) {
+        Some(FocusDirection::Next) => window.focus_next(),
+        Some(FocusDirection::Previous) => window.focus_prev(),
+        None => {}
+    }
+}
+
+fn focus_ring(color: gpui::Rgba) -> impl FnOnce(StyleRefinement) -> StyleRefinement {
+    move |style| style.border_2().border_color(color)
+}
+
+// GPUI 0.2.2 only renders tooltips while the pointer hovers the element and
+// exposes no accessible-name API, so icon-only controls get a hover tooltip as
+// the only label the framework allows.
+struct TextTooltip {
+    label: SharedString,
+    theme: Theme,
+}
+
+impl Render for TextTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.))
+            .py(px(4.))
+            .rounded_md()
+            .bg(self.theme.surface_alt)
+            .border_1()
+            .border_color(self.theme.border)
+            .text_color(self.theme.text)
+            .text_size(px(11.))
+            .child(self.label.clone())
+    }
+}
+
+fn text_tooltip(
+    label: SharedString,
+    theme: Theme,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |_window, cx| {
+        cx.new(|_| TextTooltip {
+            label: label.clone(),
+            theme,
+        })
+        .into()
+    }
+}
+
+/// GPUI 0.2.2's `TextField` keeps its focus handle private but exposes it
+/// through `focus_handle`; marking that handle as a tab stop adds the field to
+/// the window tab order without changing the widget.
+pub fn register_field_tab_stop(field: &Entity<TextField>, cx: &App) {
+    field
+        .read(cx)
+        .focus_handle(cx)
+        .tab_stop(true)
+        .tab_index(TAB_INDEX);
+}
 
 pub fn app_icon(size: f32) -> impl IntoElement {
     svg()
@@ -27,12 +117,13 @@ pub fn button(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let label = label.into();
-    let (background, hover, text, border) = if primary {
+    let (background, hover, text, border, focus_color) = if primary {
         (
             theme.accent,
             theme.accent_hover,
             theme.accent_text,
             theme.accent,
+            theme.accent_text,
         )
     } else {
         (
@@ -40,10 +131,12 @@ pub fn button(
             theme.surface_hover,
             theme.text,
             theme.border,
+            theme.accent,
         )
     };
     div()
         .id(id)
+        .tab_index(TAB_INDEX)
         .flex()
         .items_center()
         .justify_center()
@@ -57,6 +150,7 @@ pub fn button(
         .text_size(px(13.))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
+        .focus(focus_ring(focus_color))
         .hover(move |style| style.bg(hover))
         .on_click(on_click)
         .child(label)
@@ -65,10 +159,12 @@ pub fn button(
 pub fn titlebar_button(
     id: impl Into<ElementId>,
     icon_path: &'static str,
+    label: impl Into<SharedString>,
     theme: Theme,
     danger: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let label = label.into();
     let color = if danger {
         theme.danger
     } else {
@@ -76,12 +172,21 @@ pub fn titlebar_button(
     };
     div()
         .id(id)
+        .tab_index(TAB_INDEX)
         .flex()
         .items_center()
         .justify_center()
         .w(px(42.))
         .h_full()
+        .border_1()
+        .border_color(transparent_black())
         .cursor_pointer()
+        .focus(move |style| {
+            style
+                .border_2()
+                .bg(theme.surface_hover)
+                .border_color(theme.accent)
+        })
         .hover(move |style| {
             style.bg(if danger {
                 theme.danger
@@ -89,6 +194,7 @@ pub fn titlebar_button(
                 theme.surface_hover
             })
         })
+        .tooltip(text_tooltip(label, theme))
         .on_click(on_click)
         .child(icon(icon_path, 14.0, color))
 }
@@ -147,12 +253,22 @@ pub fn toggle_row(
     let description = description.into();
     div()
         .id(id)
+        .tab_index(TAB_INDEX)
         .flex()
         .items_center()
         .justify_between()
         .gap(px(16.))
         .py(px(10.))
+        .rounded_md()
+        .border_1()
+        .border_color(transparent_black())
         .cursor_pointer()
+        .focus(move |style| {
+            style
+                .border_2()
+                .bg(theme.surface_hover)
+                .border_color(theme.accent)
+        })
         .on_click(on_click)
         .child(
             div()
@@ -204,14 +320,22 @@ pub fn sidebar_item(
     } else {
         theme.text_muted
     };
+    let marker_color: gpui::Hsla = if active {
+        theme.accent.into()
+    } else {
+        transparent_black()
+    };
     div()
         .id(id)
+        .tab_index(TAB_INDEX)
         .flex()
         .items_center()
         .gap(px(10.))
         .h(px(38.))
         .px(px(12.))
         .rounded_md()
+        .border_1()
+        .border_color(transparent_black())
         .cursor_pointer()
         .bg(if active {
             theme.surface_hover
@@ -220,8 +344,15 @@ pub fn sidebar_item(
         })
         .text_color(if active { theme.text } else { theme.text_muted })
         .text_size(px(13.))
+        .focus(move |style| {
+            style
+                .border_2()
+                .bg(theme.surface_hover)
+                .border_color(theme.accent)
+        })
         .hover(move |style| style.bg(theme.surface_hover))
         .on_click(on_click)
+        .child(div().w(px(2.)).h(px(16.)).rounded_full().bg(marker_color))
         .child(icon(icon_path, 16.0, color))
         .child(label)
 }
@@ -273,4 +404,37 @@ pub fn labeled_field(
             )
         })
         .child(field)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn direction(keystroke: &str) -> Option<FocusDirection> {
+        focus_direction(&Keystroke::parse(keystroke).unwrap())
+    }
+
+    #[test]
+    fn tab_moves_focus_forward() {
+        assert_eq!(direction("tab"), Some(FocusDirection::Next));
+    }
+
+    #[test]
+    fn shift_tab_moves_focus_backward() {
+        assert_eq!(direction("shift-tab"), Some(FocusDirection::Previous));
+    }
+
+    #[test]
+    fn modified_tab_does_not_move_focus() {
+        assert_eq!(direction("ctrl-tab"), None);
+        assert_eq!(direction("alt-tab"), None);
+        assert_eq!(direction("cmd-tab"), None);
+    }
+
+    #[test]
+    fn other_keys_do_not_move_focus() {
+        assert_eq!(direction("enter"), None);
+        assert_eq!(direction("space"), None);
+        assert_eq!(direction("escape"), None);
+    }
 }

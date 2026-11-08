@@ -1,16 +1,17 @@
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    StatefulInteractiveElement, Subscription, Window, div, prelude::*, px,
+    div, prelude::*, px, AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, Render, SharedString, StatefulInteractiveElement, Subscription, Window,
 };
 
 use crate::app::{AppModel, AppModelEntityExt};
 use crate::assets::{ICON_BELL, ICON_GEAR, ICON_INFO, ICON_PALETTE, ICON_SHIELD, ICON_USER};
 use crate::lock::MIN_PASSWORD_LENGTH;
-use crate::settings::{MAX_ZOOM, MIN_ZOOM, Settings, ThemeMode};
+use crate::settings::{Settings, ThemeMode, MAX_ZOOM, MIN_ZOOM};
 use crate::shortcut::Shortcut;
 use crate::theme::Theme;
 use crate::ui::components::{
-    app_icon, button, card, divider, labeled_field, section_header, sidebar_item, toggle_row,
+    app_icon, button, card, divider, handle_focus_traversal, labeled_field,
+    register_field_tab_stop, section_header, sidebar_item, toggle_row, TAB_INDEX,
 };
 use crate::ui::text_input::TextField;
 
@@ -70,6 +71,9 @@ impl SettingsWindow {
         let confirm_field = cx.new(|cx| TextField::new("Confirm password", cx).masked(true));
         let shortcut = model.read(cx).settings.shortcut.clone();
         let shortcut_field = cx.new(|cx| TextField::new("Ctrl+Shift+W", cx).with_content(shortcut));
+        register_field_tab_stop(&password_field, cx);
+        register_field_tab_stop(&confirm_field, cx);
+        register_field_tab_stop(&shortcut_field, cx);
         Self {
             model,
             section: SettingsSection::Accounts,
@@ -89,6 +93,34 @@ impl SettingsWindow {
     fn set_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.section = section;
         cx.notify();
+    }
+
+    fn handle_escape(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key != "escape" {
+            return;
+        }
+        let closed_rename = self.renaming.is_some();
+        if self.cancel_pending_dialog(cx) {
+            if closed_rename {
+                window.defer(cx, |window, _cx| window.focus_next());
+            }
+            return;
+        }
+        window.remove_window();
+    }
+
+    fn cancel_pending_dialog(&mut self, cx: &mut Context<Self>) -> bool {
+        let pending = self.renaming.is_some()
+            || self.remove_confirm.is_some()
+            || self.remove_password_confirm;
+        if !pending {
+            return false;
+        }
+        self.renaming = None;
+        self.remove_confirm = None;
+        self.remove_password_confirm = false;
+        cx.notify();
+        true
     }
 
     fn render_accounts(
@@ -270,6 +302,7 @@ impl SettingsWindow {
                                             TextField::new("Account name", cx)
                                                 .with_content(rename_name.clone())
                                         });
+                                        register_field_tab_stop(&field, cx);
                                         this.renaming = Some((rename_id.clone(), field));
                                         cx.notify();
                                     }),
@@ -331,9 +364,20 @@ impl SettingsWindow {
         for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
             let selected = settings.theme == mode;
             let id = SharedString::from(format!("theme-{}", mode.label().to_lowercase()));
+            let description = match mode {
+                ThemeMode::System => "Follow the desktop",
+                ThemeMode::Light => "Bright surfaces",
+                ThemeMode::Dark => "Low-light surfaces",
+            };
+            let description = if selected {
+                format!("Selected · {description}")
+            } else {
+                description.to_string()
+            };
             theme_cards = theme_cards.child(
                 div()
                     .id(id)
+                    .tab_index(TAB_INDEX)
                     .flex()
                     .flex_col()
                     .gap(px(4.))
@@ -348,6 +392,12 @@ impl SettingsWindow {
                     .border_1()
                     .border_color(if selected { theme.accent } else { theme.border })
                     .cursor_pointer()
+                    .focus(move |style| {
+                        style
+                            .border_2()
+                            .border_color(theme.text)
+                            .bg(theme.surface_hover)
+                    })
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.model.update(cx, |model, cx| model.set_theme(mode, cx));
                     }))
@@ -358,13 +408,12 @@ impl SettingsWindow {
                             .text_color(theme.text)
                             .child(mode.label()),
                     )
-                    .child(div().text_size(px(11.)).text_color(theme.text_muted).child(
-                        match mode {
-                            ThemeMode::System => "Follow the desktop",
-                            ThemeMode::Light => "Bright surfaces",
-                            ThemeMode::Dark => "Low-light surfaces",
-                        },
-                    )),
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_muted)
+                            .child(description),
+                    ),
             );
         }
 
@@ -379,9 +428,14 @@ impl SettingsWindow {
         let mut zoom_row = div().flex().flex_wrap().gap(px(8.));
         for (zoom, label) in zooms {
             let selected = (settings.zoom - zoom).abs() < 0.001;
+            let text = if selected {
+                format!("✓ {label}")
+            } else {
+                label.to_string()
+            };
             zoom_row = zoom_row.child(button(
                 SharedString::from(format!("zoom-{label}")),
-                label,
+                text,
                 theme,
                 selected,
                 cx.listener(move |this, _event, _window, cx| {
@@ -949,6 +1003,9 @@ impl Render for SettingsWindow {
             self.appearance_subscription =
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
         }
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle);
+        }
 
         let (theme, settings) = {
             let model = self.model.read(cx);
@@ -1033,27 +1090,35 @@ impl Render for SettingsWindow {
                 .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
         );
 
-        div().flex().size_full().bg(theme.bg).child(sidebar).child(
-            div()
-                .id("settings-content")
-                .flex()
-                .flex_col()
-                .flex_1()
-                .h_full()
-                .overflow_y_scroll()
-                .p(px(28.))
-                .gap(px(18.))
-                .child(div().flex().justify_end().child(button(
-                    "close-settings",
-                    "Close",
-                    theme,
-                    false,
-                    cx.listener(|_this, _event, window, _cx| {
-                        window.remove_window();
-                    }),
-                )))
-                .child(content),
-        )
+        div()
+            .flex()
+            .size_full()
+            .bg(theme.bg)
+            .track_focus(&self.focus_handle)
+            .on_key_down(handle_focus_traversal)
+            .on_key_down(cx.listener(Self::handle_escape))
+            .child(sidebar)
+            .child(
+                div()
+                    .id("settings-content")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .p(px(28.))
+                    .gap(px(18.))
+                    .child(div().flex().justify_end().child(button(
+                        "close-settings",
+                        "Close",
+                        theme,
+                        false,
+                        cx.listener(|_this, _event, window, _cx| {
+                            window.remove_window();
+                        }),
+                    )))
+                    .child(content),
+            )
     }
 }
 
@@ -1083,9 +1148,14 @@ fn idle_button(
     } else {
         format!("{minutes} min")
     };
+    let text = if selected {
+        format!("✓ {label}")
+    } else {
+        label
+    };
     button(
         SharedString::from(format!("idle-{minutes}")),
-        label,
+        text,
         theme,
         selected,
         cx.listener(move |this, _event, _window, cx| {

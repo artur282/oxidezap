@@ -1,10 +1,12 @@
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, Render, Subscription, Window, div, prelude::*, px,
+    div, prelude::*, px, App, Context, Entity, FocusHandle, Focusable, Render, Subscription, Window,
 };
 
 use crate::app::AppModel;
 use crate::assets::ICON_SHIELD;
-use crate::ui::components::{app_icon, button, icon};
+use crate::ui::components::{
+    app_icon, button, handle_focus_traversal, icon, register_field_tab_stop,
+};
 use crate::ui::text_input::TextField;
 
 pub struct LockWindow {
@@ -25,6 +27,7 @@ impl LockWindow {
                     let _ = weak.update(cx, |view, cx| view.submit(window, cx));
                 })
         });
+        register_field_tab_stop(&password_field, cx);
         Self {
             model,
             password_field,
@@ -79,6 +82,9 @@ impl Render for LockWindow {
             self.appearance_subscription =
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
         }
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle);
+        }
 
         let theme = self.model.read(cx).theme(window);
         let password_field = self.password_field.clone();
@@ -90,6 +96,8 @@ impl Render for LockWindow {
             .items_center()
             .justify_center()
             .bg(theme.bg)
+            .track_focus(&self.focus_handle)
+            .on_key_down(handle_focus_traversal)
             .child(
                 div()
                     .flex()
