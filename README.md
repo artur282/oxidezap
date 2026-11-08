@@ -64,14 +64,14 @@ That split matters:
 ### Desktop integration
 
 - **System tray** through StatusNotifierItem, with show/hide, account list, add account, settings, lock, and quit.
-- **Unread badge** in the tray tooltip and, on supported desktops, on the launcher icon through the Unity LauncherEntry D-Bus interface.
-- **Native notifications** for new messages, with sender and message preview.
-- **Single instance** through a Unix socket. Launching OxideZap again forwards the request to the running instance.
+- **Unread badge** in the tray icon (`1`-`9`, `9+`, and a dimmed DND state), in the per-account tooltip breakdown, and, on supported desktops, on the launcher icon through the Unity LauncherEntry D-Bus interface.
+- **Native notifications** for new messages, with sender and message preview, a global Do Not Disturb switch, and per-account mute/sound controls.
+- **Single instance** through a Unix socket. Launching OxideZap again forwards the request to the running instance. The socket is created with `0600` permissions and never listens on the network; CLI actions only pass validated account ids, chat targets, and built-in action names.
 - **Global show/hide shortcut** through X11 `XGrabKey`, default `Ctrl+Shift+W`, configurable in Settings. This is X11/XWayland-only.
 - **Launch at login** through an XDG autostart entry at `~/.config/autostart/oxidezap.desktop`.
 - **Link handling.** External `http(s)`, `mailto:`, and `tel:` links open in the system browser or application. `wa.me`, `chat.whatsapp.com`, and `web.whatsapp.com` links stay inside OxideZap. WhatsApp's internal `whatsapp.net` utility pages (such as the Flows cache manager) stay in the webview and never open a system browser tab. `whatsapp://` URLs are translated to their WhatsApp Web equivalents.
-- **Downloads** go to `~/Downloads` and produce a native notification with the destination.
-- **CLI control** with `--toggle`, `--lock`, and `--quit`, plus URL forwarding to a running instance.
+- **Downloads** go to `~/Downloads` and produce a native notification with the destination. `oxidezap --downloads` opens that folder until the download center lands.
+- **CLI control** with `--toggle`, `--hide`, `--lock`, `--quit`, `--account`, `--chat`, `--dnd`, `--downloads`, `--status`, and `--list-accounts`, plus URL forwarding to a running instance.
 
 ## Requirements
 
@@ -176,6 +176,13 @@ update-desktop-database ~/.local/share/applications
 | Back up or restore settings | Settings -> General -> **Export settings**, **Import settings**, or **Reset settings** |
 | Change WhatsApp zoom | Settings -> Appearance -> Display size |
 | Quit | Tray -> **Quit**, or `oxidezap --quit` |
+| Open an account | `oxidezap --account <id\|name>` |
+| Open a chat | `oxidezap --chat <phone\|chat-id>` |
+| Toggle Do Not Disturb | `oxidezap --dnd [on\|off\|1h\|tomorrow]` |
+| Open the downloads folder | `oxidezap --downloads` |
+| Hide all account windows | `oxidezap --hide` |
+| Print status | `oxidezap --status` |
+| List accounts | `oxidezap --list-accounts` |
 | Open a chat link | `oxidezap "whatsapp://send?phone=..."` |
 
 ### Command line
@@ -183,17 +190,46 @@ update-desktop-database ~/.local/share/applications
 ```text
 Usage: oxidezap [OPTIONS] [URL]
 
-Options:
-  --toggle        Show or hide the running instance
-  --lock          Lock the running instance
-  --quit          Quit the running instance
-  --autostart     Start hidden when launched at login
-  --smoke-test    Run the X11/WebKit overlay smoke test and exit
-  -h, --help      Print help
-  -V, --version   Print the version
+Actions:
+  (no option)             Show the running instance, or start it
+  --toggle                Show or hide the running instance
+  --hide                  Hide all account windows without closing them
+  --lock                  Lock the running instance
+  --quit                  Quit the running instance
+  --account <id|name>     Open or focus an account
+  --chat <phone|id>       Open a chat in the active account (never sends)
+  --dnd [MODE]            Set Do Not Disturb: on, off, 1h, or tomorrow
+  --downloads             Open the downloads folder
+  --status                Print version, accounts, DND, and window count
+  --list-accounts         List accounts as id, name, and active state
+
+Other options:
+  --autostart             Start hidden when launched at login
+  --smoke-test            Run the X11/WebKit overlay smoke test and exit
+  -h, --help              Print this help
+  -V, --version           Print the version
 
 URLs: whatsapp://send?phone=..., https://wa.me/..., https://chat.whatsapp.com/...
 ```
+
+Every action is forwarded to the running instance over the local single-instance socket and exits with status 0 on success or non-zero with a clear message when the account or chat is invalid. When no instance is running, action commands start OxideZap and apply the action to the new instance. `--status` and `--list-accounts` are the exception: they read the settings file when the app is closed, so scripts can query them without a display.
+
+`--status` prints stable `key: value` lines:
+
+```text
+version: 0.1.0
+running: true
+accounts: 2
+active_account: 8a4e...
+dnd: off
+windows: 1
+```
+
+`--list-accounts` prints one tab-separated line per account: id, name, and `active` or `inactive`. Names are flattened to one line so a stray newline cannot forge an extra row.
+
+`--chat` accepts a phone number (with optional `+`, spaces, dashes, dots, and parentheses) or a phone-based chat id such as `5491100000000@c.us` or `5491100000000@s.whatsapp.net`. It opens the conversation in the active account and never sends a message because it never adds WhatsApp's `text` parameter. Group ids cannot be deep-linked by WhatsApp Web and are rejected with a clear error.
+
+`--dnd 1h` and `--dnd tomorrow` currently enable Do Not Disturb until it is turned off; the scheduling model from the Do Not Disturb feature is not duplicated here. `--downloads` opens the downloads folder until the download center exists.
 
 `--smoke-test` starts the application under X11 with a local HTML page, verifies that the GPUI window and the WebKit transient overlay have the expected geometry, prints `SMOKE OK`, and exits with status 0.
 

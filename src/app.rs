@@ -21,7 +21,9 @@ use crate::settings::{
     Account, SETTINGS_SAVE_DEBOUNCE, SaveDebounce, SavedBounds, Settings, SettingsWriter,
 };
 use crate::shortcut::Shortcut;
-use crate::single_instance::{InstanceListener, InstanceMessage};
+use crate::single_instance::{
+    ChatTarget, DndMode, InstanceListener, InstanceMessage, InstanceReply, InstanceRequest,
+};
 use crate::theme::Theme;
 use crate::tray::{TrayAction, TrayHandle};
 use crate::ui::account_window::AccountWindow;
@@ -134,7 +136,7 @@ pub struct AppModel {
     pub locked: bool,
     pub quitting: bool,
     gtk_events: Receiver<GtkEvent>,
-    instance_messages: Receiver<InstanceMessage>,
+    instance_messages: Receiver<InstanceRequest>,
     hotkey_actions: Receiver<HotkeyAction>,
     tray_actions: Receiver<TrayAction>,
     tray: Option<TrayHandle>,
@@ -150,6 +152,8 @@ pub struct AppModel {
     smoke: Option<SmokeState>,
     startup_html: Option<String>,
     startup_url: Option<String>,
+    initial_action: Option<InstanceMessage>,
+    pending_urls: HashMap<String, String>,
     start_hidden: bool,
     pending_accounts: HashSet<String>,
     pending_settings: bool,
@@ -180,11 +184,12 @@ impl AppModel {
         hotkey: HotkeyHandle,
         hotkey_actions: Receiver<HotkeyAction>,
         instance_listener: Option<InstanceListener>,
-        instance_messages: Receiver<InstanceMessage>,
+        instance_messages: Receiver<InstanceRequest>,
         badge: Badge,
         smoke: Option<SmokeState>,
         startup_html: Option<String>,
         startup_url: Option<String>,
+        initial_action: Option<InstanceMessage>,
         start_hidden: bool,
     ) -> Self {
         let _ = cx;
@@ -220,6 +225,8 @@ impl AppModel {
             smoke,
             startup_html,
             startup_url,
+            initial_action,
+            pending_urls: HashMap::new(),
             start_hidden,
             pending_accounts: HashSet::new(),
             pending_settings: false,
@@ -257,6 +264,33 @@ impl AppModel {
             return;
         }
 
+        let initial_action = self.initial_action.take();
+
+        if let Some(InstanceMessage::OpenAccount(query)) = &initial_action {
+            if let Ok(account_id) = resolve_account(&self.settings, query) {
+                self.settings.active_account = Some(account_id);
+            }
+        }
+        if let Some(InstanceMessage::OpenChat { account, chat }) = &initial_action {
+            let account_id = match account {
+                Some(query) => resolve_account(&self.settings, query).ok(),
+                None => self.settings.active_account_id(),
+            };
+            if let Some(account_id) = account_id {
+                self.settings.active_account = Some(account_id.clone());
+                self.pending_urls.insert(account_id, chat.web_url());
+            }
+        }
+        if let Some(InstanceMessage::OpenUrl(url)) = &initial_action {
+            self.startup_url = Some(url.clone());
+        }
+        if let Some(InstanceMessage::SetDoNotDisturb(mode)) = &initial_action {
+            self.apply_do_not_disturb(*mode, cx);
+        }
+        if matches!(initial_action.as_ref(), Some(InstanceMessage::Hide)) {
+            self.start_hidden = true;
+        }
+
         if let Some(account_id) = self.settings.active_account_id() {
             self.open_account_window(&account_id, cx);
         }
@@ -268,6 +302,11 @@ impl AppModel {
         }
         if self.start_hidden {
             self.hide_all(cx);
+        }
+        match initial_action {
+            Some(InstanceMessage::Lock) => self.lock(cx),
+            Some(InstanceMessage::OpenDownloads) => self.open_downloads(cx),
+            _ => {}
         }
         cx.activate(true);
         self.start_update_check();
@@ -330,8 +369,8 @@ impl AppModel {
             self.handle_gtk_event(event, cx);
         }
         self.poll_crash_recovery();
-        while let Ok(message) = self.instance_messages.try_recv() {
-            self.handle_instance_message(message, cx);
+        while let Ok(request) = self.instance_messages.try_recv() {
+            self.handle_instance_request(request, cx);
         }
         while let Ok(action) = self.hotkey_actions.try_recv() {
             if action == HotkeyAction::Toggle {
@@ -580,13 +619,127 @@ impl AppModel {
         }
     }
 
-    fn handle_instance_message(&mut self, message: InstanceMessage, cx: &mut Context<Self>) {
+    fn handle_instance_request(&mut self, request: InstanceRequest, cx: &mut Context<Self>) {
+        let InstanceRequest { message, reply } = request;
+        let result = self.apply_instance_message(message, cx);
+        let Some(sender) = reply else {
+            return;
+        };
+        let answer = match result {
+            Ok(Some(output)) => InstanceReply::Output(output),
+            Ok(None) => InstanceReply::Ok,
+            Err(error) => InstanceReply::Error(error),
+        };
+        let _ = sender.send(answer);
+    }
+
+    fn apply_instance_message(
+        &mut self,
+        message: InstanceMessage,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<String>, String> {
         match message {
-            InstanceMessage::Show => self.show_all(cx),
-            InstanceMessage::Toggle => self.toggle_visibility(cx),
-            InstanceMessage::Lock => self.lock(cx),
-            InstanceMessage::Quit => self.quit(cx),
-            InstanceMessage::OpenUrl(url) => self.handle_url(&url, cx),
+            InstanceMessage::Show => {
+                self.show_all(cx);
+                Ok(None)
+            }
+            InstanceMessage::Toggle => {
+                self.toggle_visibility(cx);
+                Ok(None)
+            }
+            InstanceMessage::Lock => self.request_lock(cx).map(|_| None),
+            InstanceMessage::Hide => {
+                self.hide_all(cx);
+                Ok(None)
+            }
+            InstanceMessage::Quit => {
+                self.quit(cx);
+                Ok(None)
+            }
+            InstanceMessage::OpenUrl(url) => {
+                self.handle_url(&url, cx);
+                Ok(None)
+            }
+            InstanceMessage::OpenAccount(query) => {
+                let account_id = resolve_account(&self.settings, &query)?;
+                self.open_account_window(&account_id, cx);
+                Ok(None)
+            }
+            InstanceMessage::OpenChat { account, chat } => {
+                self.open_chat(account, chat, cx).map(|_| None)
+            }
+            InstanceMessage::SetDoNotDisturb(mode) => {
+                self.apply_do_not_disturb(mode, cx);
+                Ok(None)
+            }
+            InstanceMessage::OpenDownloads => {
+                self.open_downloads(cx);
+                Ok(None)
+            }
+            InstanceMessage::Status => Ok(Some(status_text(
+                &self.settings,
+                true,
+                self.account_windows.len(),
+            ))),
+            InstanceMessage::ListAccounts => Ok(Some(account_list_text(&self.settings))),
+        }
+    }
+
+    fn request_lock(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        if !self.settings.lock.enabled || self.settings.lock.hash.is_none() {
+            return Err("the application lock is not configured".to_string());
+        }
+        self.lock(cx);
+        Ok(())
+    }
+
+    fn open_chat(
+        &mut self,
+        account: Option<String>,
+        chat: ChatTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.locked {
+            return Err("the application is locked; unlock it first".to_string());
+        }
+        let account_id = match account {
+            Some(query) => resolve_account(&self.settings, &query)?,
+            None => self
+                .settings
+                .active_account_id()
+                .ok_or_else(|| "no active account; pass --account".to_string())?,
+        };
+        let url = chat.web_url();
+        if self.account_windows.contains_key(&account_id) {
+            self.show_account_window(&account_id, cx);
+            self.gtk.load_url(&account_id, &url);
+        } else {
+            self.pending_urls.insert(account_id.clone(), url);
+            self.open_account_window(&account_id, cx);
+        }
+        Ok(())
+    }
+
+    fn open_downloads(&mut self, cx: &mut Context<Self>) {
+        let path = self.paths.downloads_dir.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) = open::that_detached(&path) {
+                    warn!(
+                        path = %path.display(),
+                        %error,
+                        "could not open the downloads folder"
+                    );
+                }
+            })
+            .detach();
+    }
+
+    fn apply_do_not_disturb(&mut self, mode: DndMode, cx: &mut Context<Self>) {
+        if self.settings.set_do_not_disturb(mode.is_enabled()) {
+            self.save_settings(cx);
+            self.update_tray();
+            cx.refresh_windows();
         }
     }
 
@@ -679,7 +832,10 @@ impl AppModel {
         };
 
         self.startup_html = None;
-        let startup_url = self.startup_url.take();
+        let startup_url = self
+            .pending_urls
+            .remove(&account.id)
+            .or_else(|| self.startup_url.take());
         let url = match startup_url.as_deref().map(links::classify) {
             Some(links::LinkAction::WhatsApp(web)) => web,
             Some(links::LinkAction::Allow) => startup_url.clone().unwrap_or_default(),
@@ -696,7 +852,7 @@ impl AppModel {
             cache_dir: self.paths.account_cache_dir(&account.id),
             url,
             html,
-            show: !self.start_hidden,
+            show: !(self.start_hidden || self.locked),
             scale,
             zoom: self.settings.zoom,
         });
@@ -706,7 +862,7 @@ impl AppModel {
         self.update_tray();
 
         let _ = handle.update(cx, |_, window, _| window.activate_window());
-        if self.start_hidden {
+        if self.start_hidden || self.locked {
             self.hide_account_window(&account.id, cx);
         }
     }
@@ -1610,6 +1766,117 @@ fn open_lock_window_deferred(model: Entity<AppModel>, cx: &mut App) {
     }
 }
 
+/// Resolve `--account` by exact id first, then by exact name, then by a
+/// case-insensitive name. Ambiguous names fail instead of picking one.
+pub fn resolve_account(settings: &Settings, query: &str) -> Result<String, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("an account id or name is required".to_string());
+    }
+    if let Some(account) = settings.accounts.iter().find(|account| account.id == query) {
+        return Ok(account.id.clone());
+    }
+
+    let exact: Vec<&Account> = settings
+        .accounts
+        .iter()
+        .filter(|account| account.name == query)
+        .collect();
+    match exact.as_slice() {
+        [account] => return Ok(account.id.clone()),
+        [] => {}
+        _ => return Err(ambiguous_account_message(query, &exact)),
+    }
+
+    let folded: Vec<&Account> = settings
+        .accounts
+        .iter()
+        .filter(|account| account.name.eq_ignore_ascii_case(query))
+        .collect();
+    match folded.as_slice() {
+        [account] => Ok(account.id.clone()),
+        [] => {
+            let available = if settings.accounts.is_empty() {
+                "no accounts are configured".to_string()
+            } else {
+                format!(
+                    "available accounts: {}",
+                    settings
+                        .accounts
+                        .iter()
+                        .map(|account| format!("{} ({})", single_line(&account.name), account.id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            Err(format!("account '{query}' was not found; {available}"))
+        }
+        _ => Err(ambiguous_account_message(query, &folded)),
+    }
+}
+
+fn ambiguous_account_message(query: &str, accounts: &[&Account]) -> String {
+    let ids = accounts
+        .iter()
+        .map(|account| format!("{} ({})", single_line(&account.name), account.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("account name '{query}' is ambiguous; use an id: {ids}")
+}
+
+/// Stable `key: value` output for `--status`. Every line has the same order so
+/// scripts can read it with `sed`, `grep`, or `cut`.
+pub fn status_text(settings: &Settings, running: bool, windows: usize) -> String {
+    let active = settings
+        .active_account_id()
+        .map(|id| single_line(&id))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "version: {}\nrunning: {}\naccounts: {}\nactive_account: {}\ndnd: {}\nwindows: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        if running { "true" } else { "false" },
+        settings.accounts.len(),
+        active,
+        if settings.do_not_disturb { "on" } else { "off" },
+        windows
+    )
+}
+
+/// One tab-separated line per account for `--list-accounts`: id, name, and
+/// whether the account is active. Names are flattened to one line so a stray
+/// newline cannot forge an extra row.
+pub fn account_list_text(settings: &Settings) -> String {
+    let active = settings.active_account_id();
+    let mut output = String::new();
+    for account in &settings.accounts {
+        let state = if active.as_deref() == Some(account.id.as_str()) {
+            "active"
+        } else {
+            "inactive"
+        };
+        output.push_str(&format!(
+            "{}\t{}\t{}\n",
+            single_line(&account.id),
+            single_line(&account.name),
+            state
+        ));
+    }
+    output
+}
+
+fn single_line(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1727,5 +1994,81 @@ mod tests {
             CrashDecision::Ignored
         );
         assert_eq!(recovery, CrashRecovery::default());
+    }
+    fn settings_with_accounts() -> Settings {
+        Settings {
+            accounts: vec![
+                Account::with_id("a", "Work"),
+                Account::with_id("b", "work"),
+                Account::with_id("c", "Home"),
+            ],
+            active_account: Some("a".to_string()),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn resolves_accounts_by_id_name_and_case() {
+        let settings = settings_with_accounts();
+        assert_eq!(resolve_account(&settings, "a").unwrap(), "a");
+        assert_eq!(resolve_account(&settings, "Work").unwrap(), "a");
+        assert_eq!(resolve_account(&settings, "Home").unwrap(), "c");
+        assert_eq!(resolve_account(&settings, "home").unwrap(), "c");
+        assert!(
+            resolve_account(&settings, "missing")
+                .unwrap_err()
+                .contains("was not found")
+        );
+        assert!(resolve_account(&settings, "  ").is_err());
+    }
+
+    #[test]
+    fn ambiguous_account_names_are_rejected() {
+        let settings = settings_with_accounts();
+        let error = resolve_account(&settings, "WORK").unwrap_err();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(error.contains("Work (a)"), "{error}");
+        assert!(error.contains("work (b)"), "{error}");
+    }
+
+    #[test]
+    fn status_output_is_stable_and_script_friendly() {
+        let settings = Settings {
+            accounts: vec![Account::with_id("a", "Work"), Account::with_id("b", "Home")],
+            active_account: Some("a".to_string()),
+            do_not_disturb: true,
+            ..Settings::default()
+        };
+        assert_eq!(
+            status_text(&settings, true, 2),
+            format!(
+                "version: {}\nrunning: true\naccounts: 2\nactive_account: a\ndnd: on\nwindows: 2\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(
+            status_text(&settings, false, 0),
+            format!(
+                "version: {}\nrunning: false\naccounts: 2\nactive_account: a\ndnd: on\nwindows: 0\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    #[test]
+    fn account_list_output_is_tab_separated() {
+        let settings = Settings {
+            accounts: vec![
+                Account::with_id("a", "Work"),
+                Account::with_id("b", "Bad\nName"),
+            ],
+            active_account: Some("b".to_string()),
+            ..Settings::default()
+        };
+        assert_eq!(
+            account_list_text(&settings),
+            "a\tWork\tinactive\nb\tBad Name\tactive\n"
+        );
+        assert_eq!(account_list_text(&Settings::default()), "");
     }
 }
