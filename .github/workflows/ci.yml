@@ -50,3 +50,45 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release
+
+  packaging:
+    name: Validate packaging
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            appstream desktop-file-utils python3-yaml
+
+      - name: Check shell syntax
+        run: |
+          bash -n install.sh
+          bash -n packaging/appimage/AppRun
+          bash -n packaging/appimage/build-appimage.sh
+          bash -n packaging/flatpak/build-flatpak.sh
+
+      - name: Validate desktop entries
+        run: |
+          desktop-file-validate packaging/oxidezap.desktop
+          desktop-file-validate packaging/io.github.artur282.OxideZap.desktop
+
+      - name: Validate AppStream metadata
+        run: appstreamcli validate --no-net packaging/oxidezap.metainfo.xml
+
+      - name: Validate YAML
+        run: |
+          python3 - <<'PY'
+          import glob
+          import yaml
+
+          paths = glob.glob(".github/workflows/*.yml")
+          paths.append("packaging/flatpak/io.github.artur282.OxideZap.yml")
+          for path in paths:
+              with open(path, encoding="utf-8") as handle:
+                  yaml.safe_load(handle)
+              print(f"parsed {path}")
+          PY

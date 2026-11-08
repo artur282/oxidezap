@@ -85,6 +85,8 @@ That split matters:
 
 The tray requires a StatusNotifier host. Native notifications require a notification daemon. Voice and video calls, as well as voice-note recording, depend on WebKitGTK's WebRTC and portal support and may not work on every distribution.
 
+The Flatpak and AppImage artifacts do not change these requirements. The Flatpak runtime supplies WebKitGTK 2.54.1 and GTK 3; the AppImage uses the host's WebKitGTK and GTK 3 and does not bundle them.
+
 ### Debian, Ubuntu, and Linux Mint
 
 On Ubuntu 24.04 or a compatible distribution:
@@ -118,7 +120,7 @@ cargo run
 
 ## Install
 
-The installer is user-local and does not require root:
+The installer is user-local and does not require root. Release tags also publish [Flatpak](#flatpak) and [AppImage](#appimage) bundles; `install.sh` remains the recommended path for development and for a native, un-sandboxed install.
 
 ```bash
 ./install.sh
@@ -162,6 +164,59 @@ The packaged desktop entry uses `Exec=oxidezap %u`, so `~/.local/bin` must be in
 xdg-mime default oxidezap.desktop x-scheme-handler/whatsapp
 update-desktop-database ~/.local/share/applications
 ```
+
+### Flatpak
+
+Each release publishes `oxidezap-vVERSION-x86_64.flatpak`. The bundle targets the GNOME 51 runtime and exports the desktop entry, icon, AppStream metadata, and the `whatsapp://` handler.
+
+```bash
+flatpak install --user ./oxidezap-v0.1.0-x86_64.flatpak
+# If the desktop did not register the handler automatically:
+xdg-mime default io.github.artur282.OxideZap.desktop x-scheme-handler/whatsapp
+flatpak run io.github.artur282.OxideZap
+```
+
+The bundle tells Flatpak to fetch `org.gnome.Platform//51` from Flathub when the runtime is not installed. To remove the application while keeping its data:
+
+```bash
+flatpak uninstall --user io.github.artur282.OxideZap
+```
+
+`flatpak uninstall` keeps user data. To remove the sandboxed settings and accounts as well:
+
+```bash
+rm -rf ~/.var/app/io.github.artur282.OxideZap
+```
+
+Inside the sandbox those files live in `~/.var/app/io.github.artur282.OxideZap/config/oxidezap/` and `~/.var/app/io.github.artur282.OxideZap/data/oxidezap/`, not in the native paths listed in [Configuration](#configuration).
+
+The manifest is [`packaging/flatpak/io.github.artur282.OxideZap.yml`](packaging/flatpak/io.github.artur282.OxideZap.yml). It grants the network, X11/XWayland and shared IPC, the GPU device, the real `~/Downloads` directory, native notifications, and StatusNotifier. File pickers use the XDG file chooser portal. See [Packaging artifacts](#packaging-artifacts) to build it locally.
+
+#### Flatpak sandbox limitations
+
+- The tray needs a StatusNotifier host on the host desktop. The manifest grants the narrow `org.kde.StatusNotifierItem-2-1` name because Flatpak puts the application in a private PID namespace where OxideZap is PID 2.
+- Notifications travel through `org.freedesktop.Notifications`. Notification sounds and custom hints depend on the notification daemon and portal.
+- `whatsapp://` links work after Flatpak exports the desktop entry; browsers start the installed application with the URL as an argument.
+- The global shortcut still uses X11 `XGrabKey` through XWayland.
+- The Unity LauncherEntry badge is not available inside the sandbox: OxideZap publishes `application://oxidezap.desktop`, which does not match the Flatpak desktop id. The tray badge still works.
+- **Launch at login is not supported inside the sandbox.** OxideZap writes its autostart entry inside the application's private config directory, which the host session does not read. Add `flatpak run io.github.artur282.OxideZap --autostart` to the desktop's own autostart settings instead.
+- The manifest does not grant audio. Voice-note playback and calls have no audio output; a custom manifest can add `--socket=pulseaudio` if needed.
+- Downloads are written to the real `~/Downloads`; no other host filesystem path is exposed.
+
+### AppImage
+
+Each release publishes `oxidezap-vVERSION-x86_64.AppImage`. It bundles the OxideZap binary, desktop entry, icons, AppStream metadata, and license. It **does not bundle GTK 3 or WebKitGTK**: WebKitGTK ships helper processes and an injected bundle that must match the host engine, so bundling it inside an AppImage is not reliable. The AppImage is a portable application payload, not a self-contained runtime.
+
+On top of the [system requirements](#requirements), the AppImage needs glibc 2.39 or newer (it is built on Ubuntu 24.04) and FUSE support to mount it: a `/dev/fuse` device and a setuid `fusermount`/`fusermount3` helper (`fuse3` on Ubuntu 24.04). The pinned static runtime does not need `libfuse2`. Without FUSE, use the runtime's extract-and-run flag:
+
+```bash
+chmod +x oxidezap-v0.1.0-x86_64.AppImage
+./oxidezap-v0.1.0-x86_64.AppImage
+# or, without FUSE:
+./oxidezap-v0.1.0-x86_64.AppImage --appimage-extract-and-run
+```
+
+`AppRun` checks the dynamic linker before starting and prints the package names to install when WebKitGTK, GTK 3, or another required library is missing. To integrate the AppImage with the desktop and the `whatsapp://` handler, use AppImageLauncher or extract the desktop entry and icon with `--appimage-extract` and install them manually. There is no uninstall step: remove the AppImage file. Settings and accounts remain in the native paths under `~/.config/oxidezap/` and `~/.local/share/oxidezap/`.
 
 ## Usage
 
@@ -310,6 +365,8 @@ The two threads communicate over channels. The GPUI side sends commands such as 
 - **The first login requires a QR scan** from the WhatsApp mobile app.
 - **No auto-update.** Reinstall or replace the binary to update.
 - **The app lock does not encrypt data at rest.** It gates the UI, not the files on disk.
+- **The AppImage is not self-contained.** It bundles OxideZap but requires the host's GTK 3 and WebKitGTK 4.1 >= 2.46.1; see [AppImage](#appimage).
+- **Flatpak sandboxing changes desktop integration.** Tray, notifications, autostart, and audio are subject to the limitations documented under [Flatpak](#flatpak).
 - **Screen readers cannot inspect the native GPUI shell.** The native titlebar, settings window, and lock screen are keyboard-operable: `Tab` and `Shift+Tab` move focus, focused buttons activate with `Enter` or `Space`, and focus is drawn with a visible border. GPUI 0.2.2 has no AccessKit/AT-SPI bridge, so assistive technology has no semantic view of these native controls; the WhatsApp Web content inside WebKitGTK is unaffected.
 - **Linux only.** There are no macOS or Windows builds.
 
@@ -331,11 +388,34 @@ DISPLAY=:0 cargo run -- --smoke-test
 
 The smoke test prints `SMOKE OK` and exits with status 0 when the GPUI window and the WebKit transient overlay are positioned correctly. It needs a Vulkan-capable display; Xvfb does not provide the DRI3 support GPUI needs for presentation. CI runs formatting, Clippy, unit tests, and a release build on Ubuntu 24.04; the smoke test is a local check.
 
+### Packaging artifacts
+
+Both package scripts write into `dist/`:
+
+```bash
+# Flatpak: needs flatpak-builder and the GNOME 51 SDK from Flathub.
+flatpak remote-add --user --if-not-exists flathub \
+  https://flathub.org/repo/flathub.flatpakrepo
+flatpak install --user flathub org.gnome.Sdk//51 org.gnome.Platform//51
+packaging/flatpak/build-flatpak.sh
+# Or let flatpak-builder install the runtime and Rust SDK extension:
+INSTALL_DEPS_FROM_FLATHUB=1 packaging/flatpak/build-flatpak.sh
+
+# AppImage: builds the release binary and downloads pinned appimagetool 1.9.1.
+packaging/appimage/build-appimage.sh
+```
+
+The Flatpak manifest builds with Cargo network access inside the build sandbox, and `Cargo.lock` pins every crate. That keeps the repository small, but a Flathub submission should instead vendor the crates with [`flatpak-cargo-generator`](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo) and remove the `--share=network` build argument. The AppImage script verifies the appimagetool SHA-256 before using it and sets `SOURCE_DATE_EPOCH` from the last commit when it is not already set.
+
+CI validates the Flatpak manifest, desktop entries, AppStream metadata, and shell scripts on every push. The release workflow builds the tarball, Flatpak, and AppImage on `v*` tags and publishes all three assets on clean Ubuntu 24.04 runners. A release should still be smoke-tested on a clean desktop before it is announced, because the Flatpak sandbox changes tray, notification, and audio behavior.
+
 ## Roadmap
 
 - [x] v0.1.0: GPUI shell, WebKitGTK overlay, multi-account support, tray, notifications, app lock, settings, CLI, installer, and CI
+- [x] Distribution packaging: Flatpak and AppImage artifacts
 - [ ] Native Wayland support without XWayland
-- [ ] Distribution packaging and broader desktop integration
+- [ ] Flathub publication and aarch64 packaging artifacts
+- [ ] Broader desktop integration
 
 ## Contributing
 

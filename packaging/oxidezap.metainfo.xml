@@ -17,6 +17,7 @@
     </p>
   </description>
   <launchable type="desktop-id">oxidezap.desktop</launchable>
+  <launchable type="desktop-id">io.github.artur282.OxideZap.desktop</launchable>
   <url type="homepage">https://github.com/artur282/oxidezap</url>
   <url type="bugtracker">https://github.com/artur282/oxidezap/issues</url>
   <developer id="io.github.artur282">

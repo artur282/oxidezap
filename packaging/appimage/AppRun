@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+# OxideZap bundles only its own binary, desktop entry, icons, and AppStream
+# metadata. GTK 3 and WebKitGTK are loaded from the host, because WebKit ships
+# helper processes and an injected bundle that must match the host WebKitGTK.
+
+HERE="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+APP_BINARY="$HERE/usr/bin/oxidezap"
+
+if [ ! -x "$APP_BINARY" ]; then
+    echo "error: OxideZap binary not found at $APP_BINARY" >&2
+    exit 1
+fi
+
+if command -v ldd >/dev/null 2>&1; then
+    missing_libraries=$(ldd "$APP_BINARY" 2>/dev/null |
+        awk '/not found/ { print $1 }' | sort -u)
+    if [ -n "$missing_libraries" ]; then
+        cat >&2 <<EOF
+OxideZap cannot start because required system libraries are missing:
+$missing_libraries
+
+The AppImage bundles OxideZap but not GTK 3 or WebKitGTK. Install the
+runtime first (WebKitGTK 4.1 version 2.46.1 or newer is required):
+
+  Ubuntu/Debian: sudo apt install libgtk-3-0t64 libwebkit2gtk-4.1-0
+  Fedora:        sudo dnf install gtk3 webkit2gtk4.1
+  Arch:          sudo pacman -S gtk3 webkit2gtk-4.1
+EOF
+        exit 1
+    fi
+fi
+
+exec "$APP_BINARY" "$@"
