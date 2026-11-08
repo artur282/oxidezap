@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -793,12 +794,13 @@ fn connect_downloads(
         let downloads_dir = downloads_dir.clone();
         download.connect_decide_destination(move |download, suggested| {
             let filename = sanitize_filename(suggested);
-            let path = unique_download_path(&downloads_dir, &filename);
-            download.set_destination(path.to_string_lossy().as_ref());
-            let _ = events.send(GtkEvent::DownloadStarted {
-                account_id: account_id.clone(),
-                filename: filename.clone(),
-            });
+            let path = match reserve_download_path(&downloads_dir, &filename) {
+                Ok(path) => path,
+                Err(error) => {
+                    warn!(%error, %filename, "could not reserve a download destination");
+                    return false;
+                }
+            };
 
             let finished_path = path.clone();
             let finished_filename = filename.clone();
@@ -819,12 +821,22 @@ fn connect_downloads(
             let failed_events = events.clone();
             download.connect_failed(move |_download, error| {
                 warn!(%error, "download failed");
+                discard_empty_reservation(&failed_path);
                 let _ = failed_events.send(GtkEvent::DownloadFinished {
                     account_id: failed_account.clone(),
                     filename: failed_filename.clone(),
                     path: failed_path.clone(),
                     success: false,
                 });
+            });
+
+            // The destination already exists as our empty reservation, so
+            // WebKit has to be allowed to truncate it instead of refusing it.
+            download.set_allow_overwrite(true);
+            download.set_destination(path.to_string_lossy().as_ref());
+            let _ = events.send(GtkEvent::DownloadStarted {
+                account_id: account_id.clone(),
+                filename: filename.clone(),
             });
             true
         });
@@ -961,26 +973,62 @@ fn sanitize_filename(filename: &str) -> String {
     }
 }
 
-fn unique_download_path(dir: &Path, filename: &str) -> PathBuf {
-    let path = dir.join(filename);
-    if !path.exists() {
-        return path;
+/// How many `name (n).ext` variants are tried before giving up on a download.
+const MAX_DOWNLOAD_PATH_ATTEMPTS: u32 = 10_000;
+
+/// Claims `dir/filename`, or the first free `name (n).ext` variant, by creating
+/// the file with `create_new`. Two downloads racing for the same name can never
+/// both win the same path, and an existing file is never overwritten: the
+/// returned path is an existing, empty file that belongs to this download.
+fn reserve_download_path(dir: &Path, filename: &str) -> io::Result<PathBuf> {
+    let (stem, extension) = split_download_name(filename);
+    for index in 0..MAX_DOWNLOAD_PATH_ATTEMPTS {
+        let candidate = if index == 0 {
+            dir.join(filename)
+        } else {
+            dir.join(format!("{stem} ({index}){extension}"))
+        };
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_reservation) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
-    let stem = Path::new(filename)
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no free download name for {filename}"),
+    ))
+}
+
+fn split_download_name(filename: &str) -> (String, String) {
+    let path = Path::new(filename);
+    let stem = path
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| filename.to_string());
-    let extension = Path::new(filename)
+    let extension = path
         .extension()
         .map(|extension| format!(".{}", extension.to_string_lossy()))
         .unwrap_or_default();
-    for index in 1..10_000 {
-        let candidate = dir.join(format!("{stem} ({index}){extension}"));
-        if !candidate.exists() {
-            return candidate;
-        }
+    (stem, extension)
+}
+
+/// Drops the empty reservation of a download WebKit could not write to.
+/// Partial files stay on disk because they may still be worth recovering.
+fn discard_empty_reservation(path: &Path) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if !metadata.is_file() || metadata.len() > 0 {
+        return;
     }
-    path
+    if let Err(error) = std::fs::remove_file(path) {
+        warn!(%error, path = %path.display(), "could not remove an empty download reservation");
+    }
 }
 
 const PASTE_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -1570,13 +1618,76 @@ mod tests {
     }
 
     #[test]
-    fn download_paths_do_not_overwrite() {
+    fn reserves_an_empty_download_file() {
         let dir = tempfile::tempdir().unwrap();
-        let first = unique_download_path(dir.path(), "file.txt");
-        assert_eq!(first, dir.path().join("file.txt"));
-        std::fs::write(&first, b"x").unwrap();
-        let second = unique_download_path(dir.path(), "file.txt");
-        assert_eq!(second, dir.path().join("file (1).txt"));
+
+        let path = reserve_download_path(dir.path(), "file.txt").unwrap();
+
+        assert_eq!(path, dir.path().join("file.txt"));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn download_reservations_do_not_overwrite_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), b"keep").unwrap();
+
+        let first = reserve_download_path(dir.path(), "file.txt").unwrap();
+        let second = reserve_download_path(dir.path(), "file.txt").unwrap();
+
+        assert_eq!(first, dir.path().join("file (1).txt"));
+        assert_eq!(second, dir.path().join("file (2).txt"));
+        assert_eq!(std::fs::read(dir.path().join("file.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn concurrent_download_reservations_get_distinct_paths() {
+        const DOWNLOADS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(DOWNLOADS));
+        let handles: Vec<_> = (0..DOWNLOADS)
+            .map(|_| {
+                let dir = dir.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reserve_download_path(&dir, "file.txt").unwrap()
+                })
+            })
+            .collect();
+        let mut paths: Vec<PathBuf> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        paths.sort();
+        paths.dedup();
+
+        assert_eq!(paths.len(), DOWNLOADS);
+        for path in paths {
+            assert!(path.exists(), "{} was not reserved", path.display());
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn failed_download_removes_the_empty_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = reserve_download_path(dir.path(), "file.txt").unwrap();
+
+        discard_empty_reservation(&path);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn failed_download_keeps_partially_written_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = reserve_download_path(dir.path(), "file.txt").unwrap();
+        std::fs::write(&path, b"partial").unwrap();
+
+        discard_empty_reservation(&path);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"partial");
     }
 
     #[test]
