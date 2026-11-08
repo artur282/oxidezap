@@ -14,6 +14,7 @@ use crate::ui::components::{
     register_field_tab_stop, section_header, sidebar_item, toggle_row, TAB_INDEX,
 };
 use crate::ui::text_input::TextField;
+use crate::updates::UpdateState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSection {
@@ -983,7 +984,32 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn render_about(&mut self, theme: Theme) -> AnyElement {
+    fn render_about(
+        &mut self,
+        settings: &Settings,
+        update: &UpdateState,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let status = if update.development {
+            Some("Development builds do not check for updates.".to_string())
+        } else if !settings.automatic_update_checks {
+            Some("Automatic update checks are off.".to_string())
+        } else if update.available.is_none() {
+            match update.skipped_version.as_ref() {
+                Some(skipped) if update.latest_version.as_deref() == Some(skipped.as_str()) => {
+                    Some(format!("Version {skipped} is skipped."))
+                }
+                Some(_) => None,
+                None if update.latest_version.is_some() => {
+                    Some("You are running the latest release.".to_string())
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         div()
             .flex()
             .flex_col()
@@ -1017,8 +1043,16 @@ impl SettingsWindow {
                                         div()
                                             .text_size(px(12.))
                                             .text_color(theme.text_muted)
-                                            .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                                            .child(format!("Version {}", update.current_version)),
                                     )
+                                    .when(update.development, |style| {
+                                        style.child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(theme.text_faint)
+                                                .child("Development build"),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .text_size(px(11.))
@@ -1063,6 +1097,78 @@ impl SettingsWindow {
                                 },
                             )),
                     ),
+            )
+            .when_some(update.available.clone(), |style, info| {
+                style.child(
+                    card(theme)
+                        .border_color(theme.accent)
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.text)
+                                .child(format!("Version {} is available", info.version)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.text_muted)
+                                .child(
+                                    "A newer release is published on GitHub. OxideZap does not download or install it automatically.",
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(8.))
+                                .child(button(
+                                    "update-view-release",
+                                    "View release",
+                                    theme,
+                                    true,
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.model.update(cx, |model, cx| {
+                                            model.open_update_release(cx);
+                                        });
+                                    }),
+                                ))
+                                .child(button(
+                                    "update-skip-version",
+                                    "Skip this version",
+                                    theme,
+                                    false,
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.model.update(cx, |model, cx| {
+                                            model.skip_update(cx);
+                                        });
+                                    }),
+                                )),
+                        ),
+                )
+            })
+            .child(
+                card(theme)
+                    .child(toggle_row(
+                        "automatic-update-checks",
+                        "Check for updates automatically",
+                        "Ask GitHub for the latest release at most once every 24 hours. The request contains no personal data.",
+                        settings.automatic_update_checks,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update(cx, |model, cx| {
+                                let enabled = !model.settings.automatic_update_checks;
+                                model.set_automatic_update_checks(enabled, cx);
+                            });
+                        }),
+                    ))
+                    .when_some(status, |style, status| {
+                        style.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.text_faint)
+                                .child(status),
+                        )
+                    }),
             )
             .child(
                 card(theme)
@@ -1109,9 +1215,13 @@ impl Render for SettingsWindow {
             window.focus(&self.focus_handle);
         }
 
-        let (theme, settings) = {
+        let (theme, settings, update) = {
             let model = self.model.read(cx);
-            (model.theme(window), model.settings.clone())
+            (
+                model.theme(window),
+                model.settings.clone(),
+                model.update_state.clone(),
+            )
         };
 
         let content = match self.section {
@@ -1120,7 +1230,7 @@ impl Render for SettingsWindow {
             SettingsSection::Notifications => self.render_notifications(&settings, theme, cx),
             SettingsSection::General => self.render_general(&settings, theme, cx),
             SettingsSection::Security => self.render_security(&settings, theme, cx),
-            SettingsSection::About => self.render_about(theme),
+            SettingsSection::About => self.render_about(&settings, &update, theme, cx),
         };
 
         let mut sidebar = div()

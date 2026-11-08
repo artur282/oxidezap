@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use gpui::{
     App, Bounds, Context, Entity, SharedString, Timer, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
@@ -27,6 +27,7 @@ use crate::tray::{TrayAction, TrayHandle};
 use crate::ui::account_window::AccountWindow;
 use crate::ui::lock_window::LockWindow;
 use crate::ui::settings_window::SettingsWindow;
+use crate::updates::{self, UpdateState};
 use crate::webview::{
     GtkCommand, GtkEvent, GtkHandle, LoadState, OVERLAY_MARGIN, TITLEBAR_HEIGHT, WHATSAPP_URL,
 };
@@ -156,6 +157,10 @@ pub struct AppModel {
     hidden_accounts: HashSet<String>,
     settings_writer: SettingsWriter,
     save_debounce: SaveDebounce,
+    pub update_state: UpdateState,
+    update_tx: Sender<UpdateState>,
+    update_rx: Receiver<UpdateState>,
+    update_check_running: bool,
     last_idle_check: Instant,
     last_scale_check: Instant,
     last_notifications: Vec<(String, Instant)>,
@@ -183,6 +188,14 @@ impl AppModel {
         start_hidden: bool,
     ) -> Self {
         let _ = cx;
+        let (update_tx, update_rx) = unbounded();
+        let update_config = updates::CheckConfig::new(
+            env!("CARGO_PKG_VERSION"),
+            settings.automatic_update_checks,
+            settings.skipped_update_version.clone(),
+            paths.update_cache_file(),
+        );
+        let update_state = updates::cached_state(&update_config);
         Self {
             paths,
             settings,
@@ -214,6 +227,10 @@ impl AppModel {
             hidden_accounts: HashSet::new(),
             settings_writer: SettingsWriter::start(),
             save_debounce: SaveDebounce::default(),
+            update_state,
+            update_tx,
+            update_rx,
+            update_check_running: false,
             last_idle_check: Instant::now(),
             last_scale_check: Instant::now(),
             last_notifications: Vec::new(),
@@ -253,6 +270,33 @@ impl AppModel {
             self.hide_all(cx);
         }
         cx.activate(true);
+        self.start_update_check();
+    }
+
+    /// Starts one throttled GitHub release check on a worker thread. The GPUI
+    /// thread only receives the result through a channel in `poll`.
+    fn start_update_check(&mut self) {
+        if self.update_check_running || !self.settings.automatic_update_checks {
+            return;
+        }
+        let config = updates::CheckConfig::new(
+            env!("CARGO_PKG_VERSION"),
+            self.settings.automatic_update_checks,
+            self.settings.skipped_update_version.clone(),
+            self.paths.update_cache_file(),
+        );
+        self.update_check_running = true;
+        let tx = self.update_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("oxidezap-updates".to_string())
+            .spawn(move || {
+                let state = updates::run_check(&config);
+                let _ = tx.send(state);
+            });
+        if let Err(error) = spawned {
+            warn!(%error, "could not start the update checker");
+            self.update_check_running = false;
+        }
     }
 
     pub fn theme(&self, window: &Window) -> Theme {
@@ -274,6 +318,14 @@ impl AppModel {
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
+        while let Ok(state) = self.update_rx.try_recv() {
+            self.update_check_running = false;
+            self.update_state = updates::apply_skipped(
+                state,
+                self.settings.skipped_update_version.as_deref(),
+            );
+            cx.refresh_windows();
+        }
         while let Ok(event) = self.gtk_events.try_recv() {
             self.handle_gtk_event(event, cx);
         }
@@ -933,6 +985,43 @@ impl AppModel {
         self.settings.lock.lock_on_hide = false;
         self.settings.lock.idle_minutes = 0;
         self.apply_settings(cx);
+    }
+
+    pub fn set_automatic_update_checks(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.update_settings(cx, |settings| {
+            settings.automatic_update_checks = enabled;
+        });
+        if enabled {
+            self.start_update_check();
+        }
+    }
+
+    pub fn skip_update(&mut self, cx: &mut Context<Self>) {
+        let Some(version) = self
+            .update_state
+            .available
+            .as_ref()
+            .map(|info| info.version.clone())
+        else {
+            return;
+        };
+        self.update_state.available = None;
+        self.update_state.skipped_version = Some(version.clone());
+        self.update_settings(cx, |settings| {
+            settings.skipped_update_version = Some(version);
+        });
+    }
+
+    pub fn open_update_release(&mut self, cx: &mut Context<Self>) {
+        let Some(url) = self
+            .update_state
+            .available
+            .as_ref()
+            .map(|info| info.url.clone())
+        else {
+            return;
+        };
+        Self::open_external(cx, &url);
     }
 
     pub fn update_settings(&mut self, cx: &mut Context<Self>, update: impl FnOnce(&mut Settings)) {

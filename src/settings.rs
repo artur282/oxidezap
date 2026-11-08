@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Sender, bounded, unbounded};
+use crossbeam_channel::{bounded, unbounded, Sender};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -125,6 +125,8 @@ pub struct Settings {
     pub do_not_disturb: bool,
     pub close_to_tray: bool,
     pub start_at_login: bool,
+    pub automatic_update_checks: bool,
+    pub skipped_update_version: Option<String>,
     pub remember_bounds: bool,
     pub shortcut: String,
     pub lock: LockSettings,
@@ -142,6 +144,8 @@ impl Default for Settings {
             do_not_disturb: false,
             close_to_tray: true,
             start_at_login: false,
+            automatic_update_checks: true,
+            skipped_update_version: None,
             remember_bounds: true,
             shortcut: DEFAULT_SHORTCUT.to_string(),
             lock: LockSettings::default(),
@@ -560,6 +564,39 @@ mod tests {
     }
 
     #[test]
+    fn update_checks_are_enabled_by_default() {
+        let settings = Settings::default();
+        assert!(settings.automatic_update_checks);
+        assert!(settings.skipped_update_version.is_none());
+    }
+
+    #[test]
+    fn legacy_settings_enable_update_checks() {
+        let json = br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"active_account":"a"}"#;
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+
+        assert!(settings.automatic_update_checks);
+        assert!(settings.skipped_update_version.is_none());
+    }
+
+    #[test]
+    fn update_preferences_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.ensure_first_account();
+        settings.automatic_update_checks = false;
+        settings.skipped_update_version = Some("0.2.0".to_string());
+
+        settings.save(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+
+        assert_eq!(loaded, settings);
+        assert!(!loaded.automatic_update_checks);
+        assert_eq!(loaded.skipped_update_version.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
     fn first_account_is_created_and_active() {
         let mut settings = Settings::default();
         assert!(settings.ensure_first_account());
@@ -693,12 +730,10 @@ mod tests {
             Settings::default().save(&path).unwrap();
 
             assert_eq!(mode(&path), 0o600);
-            assert!(
-                !fs::symlink_metadata(&path)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
+            assert!(!fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
             assert_eq!(mode(&victim), 0o644);
             assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
         }

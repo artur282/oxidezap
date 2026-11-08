@@ -286,6 +286,10 @@ impl Paths {
         self.cache_dir.join("oxidezap-128.png")
     }
 
+    pub fn update_cache_file(&self) -> PathBuf {
+        self.cache_dir.join("update-check.json")
+    }
+
     pub fn write_runtime_assets(&self) -> Result<()> {
         let icon = self.runtime_icon();
         if !icon.exists() {
@@ -333,6 +337,24 @@ mod tests {
             PathBuf::from("/tmp/data/accounts/b/cache")
         );
         assert_ne!(paths.account_data_dir("a"), paths.account_data_dir("b"));
+    }
+
+    #[test]
+    fn update_cache_lives_in_the_cache_directory() {
+        let paths = Paths {
+            config_dir: PathBuf::from("/tmp/config"),
+            data_dir: PathBuf::from("/tmp/data"),
+            cache_dir: PathBuf::from("/tmp/cache"),
+            downloads_dir: PathBuf::from("/tmp/downloads"),
+            settings_file: PathBuf::from("/tmp/config/settings.json"),
+            accounts_dir: PathBuf::from("/tmp/data/accounts"),
+            socket_file: PathBuf::from("/tmp/run/oxidezap.sock"),
+            lock_file: PathBuf::from("/tmp/run/oxidezap.lock"),
+        };
+        assert_eq!(
+            paths.update_cache_file(),
+            PathBuf::from("/tmp/cache/update-check.json")
+        );
     }
 
     #[cfg(unix)]
@@ -438,18 +460,14 @@ mod tests {
 
             assert_eq!(mode(&victim), 0o755);
             assert_eq!(mode(&victim_settings), 0o644);
-            assert!(
-                fs::symlink_metadata(&config_link)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-            assert!(
-                fs::symlink_metadata(&account_link)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
+            assert!(fs::symlink_metadata(&config_link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(fs::symlink_metadata(&account_link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
         }
     }
 }

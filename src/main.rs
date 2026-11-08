@@ -14,6 +14,7 @@ mod theme;
 mod tray;
 mod ui;
 mod unread;
+mod updates;
 mod webview;
 mod x11;
 
