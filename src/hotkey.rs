@@ -12,10 +12,35 @@ use crate::shortcut::Shortcut;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyAction {
     Toggle,
+    BossKey,
+}
+
+/// The global shortcuts the hotkey thread grabs. A boss key equal to the
+/// show/hide shortcut would never be distinguishable, so it is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HotkeyBindings {
+    pub toggle: Shortcut,
+    pub boss_key: Option<Shortcut>,
+}
+
+impl HotkeyBindings {
+    pub fn new(toggle: Shortcut, boss_key: Option<Shortcut>) -> Self {
+        Self {
+            toggle,
+            boss_key: boss_key.filter(|boss_key| *boss_key != toggle),
+        }
+    }
+
+    fn entries(self) -> impl Iterator<Item = (Shortcut, HotkeyAction)> {
+        std::iter::once((self.toggle, HotkeyAction::Toggle)).chain(
+            self.boss_key
+                .map(|shortcut| (shortcut, HotkeyAction::BossKey)),
+        )
+    }
 }
 
 enum Command {
-    Set(Shortcut),
+    Set(HotkeyBindings),
     Stop,
 }
 
@@ -23,6 +48,7 @@ enum Command {
 struct Grab {
     keycode: Keycode,
     mask: u16,
+    action: HotkeyAction,
 }
 
 impl Grab {
@@ -44,8 +70,8 @@ pub struct HotkeyHandle {
 }
 
 impl HotkeyHandle {
-    pub fn set(&self, shortcut: Shortcut) {
-        let _ = self.tx.try_send(Command::Set(shortcut));
+    pub fn set(&self, bindings: HotkeyBindings) {
+        let _ = self.tx.try_send(Command::Set(bindings));
     }
 
     pub fn stop(&self) {
@@ -63,7 +89,7 @@ pub fn start(shortcut: Shortcut, actions: Sender<HotkeyAction>) -> HotkeyHandle 
         tx,
         _thread: thread,
     };
-    handle.set(shortcut);
+    handle.set(HotkeyBindings::new(shortcut, None));
     handle
 }
 
@@ -78,23 +104,19 @@ fn run(rx: Receiver<Command>, actions: Sender<HotkeyAction>) {
     let root = conn.setup().roots[screen_num].root;
     let min_keycode = conn.setup().min_keycode;
     let max_keycode = conn.setup().max_keycode;
-    let mut grab: Option<Grab> = None;
-    let mut current: Option<Shortcut> = None;
+    let mut grabs: Vec<Grab> = Vec::new();
+    let mut current = HotkeyBindings::new(Shortcut::default(), None);
 
     loop {
         while let Ok(command) = rx.try_recv() {
             match command {
-                Command::Set(shortcut) => {
-                    if let Some(old) = grab.take() {
-                        ungrab(&conn, root, old);
-                    }
-                    current = Some(shortcut);
-                    grab = register(&conn, root, min_keycode, max_keycode, shortcut);
+                Command::Set(bindings) => {
+                    ungrab_all(&conn, root, &grabs);
+                    current = bindings;
+                    grabs = register_all(&conn, root, min_keycode, max_keycode, current);
                 }
                 Command::Stop => {
-                    if let Some(old) = grab.take() {
-                        ungrab(&conn, root, old);
-                    }
+                    ungrab_all(&conn, root, &grabs);
                     return;
                 }
             }
@@ -103,22 +125,16 @@ fn run(rx: Receiver<Command>, actions: Sender<HotkeyAction>) {
         loop {
             match conn.poll_for_event() {
                 Ok(Some(Event::KeyPress(event))) => {
-                    if let Some(grab) = grab {
-                        if event.detail == grab.keycode
-                            && u16::from(event.state) & grab.mask == grab.mask
-                        {
-                            debug!(keycode = event.detail, "global shortcut pressed");
-                            let _ = actions.try_send(HotkeyAction::Toggle);
-                        }
+                    if let Some(action) =
+                        action_for_event(&grabs, event.detail, u16::from(event.state))
+                    {
+                        debug!(keycode = event.detail, ?action, "global shortcut pressed");
+                        let _ = actions.try_send(action);
                     }
                 }
                 Ok(Some(Event::MappingNotify(_))) => {
-                    if let Some(shortcut) = current {
-                        if let Some(old) = grab.take() {
-                            ungrab(&conn, root, old);
-                        }
-                        grab = register(&conn, root, min_keycode, max_keycode, shortcut);
-                    }
+                    ungrab_all(&conn, root, &grabs);
+                    grabs = register_all(&conn, root, min_keycode, max_keycode, current);
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
@@ -133,12 +149,49 @@ fn run(rx: Receiver<Command>, actions: Sender<HotkeyAction>) {
     }
 }
 
+/// Selects the action for a KeyPress. Only the four shortcuts modifiers are
+/// compared, so CapsLock and NumLock variants do not change the action, and an
+/// extra modifier never falls back to a less specific binding.
+fn action_for_event(grabs: &[Grab], keycode: Keycode, state: u16) -> Option<HotkeyAction> {
+    let relevant = state
+        & (u16::from(ModMask::CONTROL)
+            | u16::from(ModMask::M1)
+            | u16::from(ModMask::SHIFT)
+            | u16::from(ModMask::M4));
+    grabs
+        .iter()
+        .find(|grab| grab.keycode == keycode && relevant == grab.mask)
+        .map(|grab| grab.action)
+}
+
+fn register_all(
+    conn: &x11rb::rust_connection::RustConnection,
+    root: Window,
+    min_keycode: Keycode,
+    max_keycode: Keycode,
+    bindings: HotkeyBindings,
+) -> Vec<Grab> {
+    bindings
+        .entries()
+        .filter_map(|(shortcut, action)| {
+            register(conn, root, min_keycode, max_keycode, shortcut, action)
+        })
+        .collect()
+}
+
+fn ungrab_all(conn: &x11rb::rust_connection::RustConnection, root: Window, grabs: &[Grab]) {
+    for grab in grabs {
+        ungrab(conn, root, *grab);
+    }
+}
+
 fn register(
     conn: &x11rb::rust_connection::RustConnection,
     root: Window,
     min_keycode: Keycode,
     max_keycode: Keycode,
     shortcut: Shortcut,
+    action: HotkeyAction,
 ) -> Option<Grab> {
     let Some(keysym) = shortcut.keysym() else {
         warn!(%shortcut, "global shortcut has no X11 keysym");
@@ -170,7 +223,11 @@ fn register(
     };
 
     let mask = modifier_mask(shortcut);
-    let grab = Grab { keycode, mask };
+    let grab = Grab {
+        keycode,
+        mask,
+        action,
+    };
     let mut successes = 0;
     for variant in grab.variants() {
         let cookie = conn.grab_key(
@@ -221,4 +278,93 @@ fn modifier_mask(shortcut: Shortcut) -> u16 {
         mask |= u16::from(ModMask::M4);
     }
     mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shortcut(input: &str) -> Shortcut {
+        Shortcut::parse(input).unwrap()
+    }
+
+    fn grab(keycode: Keycode, mask: u16, action: HotkeyAction) -> Grab {
+        Grab {
+            keycode,
+            mask,
+            action,
+        }
+    }
+
+    #[test]
+    fn bindings_map_each_shortcut_to_its_action() {
+        let bindings =
+            HotkeyBindings::new(shortcut("Ctrl+Shift+W"), Some(shortcut("Ctrl+Shift+H")));
+        let entries: Vec<(Shortcut, HotkeyAction)> = bindings.entries().collect();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (shortcut("Ctrl+Shift+W"), HotkeyAction::Toggle));
+        assert_eq!(
+            entries[1],
+            (shortcut("Ctrl+Shift+H"), HotkeyAction::BossKey)
+        );
+    }
+
+    #[test]
+    fn a_boss_key_equal_to_the_show_hide_shortcut_is_ignored() {
+        let toggle = shortcut("Ctrl+Shift+W");
+        let bindings = HotkeyBindings::new(toggle, Some(toggle));
+
+        assert_eq!(bindings.boss_key, None);
+        assert_eq!(bindings.entries().count(), 1);
+    }
+
+    #[test]
+    fn keycode_and_mask_select_the_matching_action() {
+        let control = u16::from(ModMask::CONTROL);
+        let shift = u16::from(ModMask::SHIFT);
+        let grabs = vec![
+            grab(10, control | shift, HotkeyAction::Toggle),
+            grab(20, control | shift, HotkeyAction::BossKey),
+        ];
+
+        assert_eq!(
+            action_for_event(&grabs, 10, control | shift),
+            Some(HotkeyAction::Toggle)
+        );
+        assert_eq!(
+            action_for_event(&grabs, 20, control | shift),
+            Some(HotkeyAction::BossKey)
+        );
+        assert_eq!(action_for_event(&grabs, 10, control), None);
+        assert_eq!(action_for_event(&grabs, 30, control | shift), None);
+    }
+
+    #[test]
+    fn extra_modifiers_do_not_trigger_a_binding() {
+        let control = u16::from(ModMask::CONTROL);
+        let shift = u16::from(ModMask::SHIFT);
+        let alt = u16::from(ModMask::M1);
+        let grabs = vec![grab(10, control | shift, HotkeyAction::Toggle)];
+
+        assert_eq!(action_for_event(&grabs, 10, control | shift | alt), None);
+        assert_eq!(
+            action_for_event(&grabs, 10, control | shift),
+            Some(HotkeyAction::Toggle)
+        );
+    }
+
+    #[test]
+    fn caps_lock_and_num_lock_are_ignored() {
+        let control = u16::from(ModMask::CONTROL);
+        let shift = u16::from(ModMask::SHIFT);
+        let lock = u16::from(ModMask::LOCK);
+        let num_lock = u16::from(ModMask::M2);
+        let grabs = vec![grab(10, control | shift, HotkeyAction::BossKey)];
+
+        assert_eq!(
+            action_for_event(&grabs, 10, control | shift | lock | num_lock),
+            Some(HotkeyAction::BossKey)
+        );
+    }
 }

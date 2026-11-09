@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 /// The download center belongs to the application model. It is declared here
@@ -15,18 +16,21 @@ use gpui::{
     WindowOptions, point, prelude::*, px, size,
 };
 use tracing::{debug, error, info, warn};
+use zbus::MatchRule;
+use zbus::blocking::MessageIterator;
+use zbus::message::Type as MessageType;
 
 use crate::autostart;
 use crate::badge::Badge;
-use crate::hotkey::{HotkeyAction, HotkeyHandle};
+use crate::hotkey::{HotkeyAction, HotkeyBindings, HotkeyHandle};
 use crate::links;
 use crate::lock;
 use crate::notify;
 use crate::paths::{APP_ID, Paths};
 use crate::settings::storage::{self, StorageOperation, StorageSnapshot};
 use crate::settings::{
-    Account, SETTINGS_SAVE_DEBOUNCE, SaveDebounce, SavedBounds, Settings, SettingsWriter,
-    WritingSettings,
+    Account, LockSettings, ProxySettings, SETTINGS_SAVE_DEBOUNCE, SaveDebounce, SavedBounds,
+    Settings, SettingsWriter, WritingSettings,
 };
 use crate::shortcut::Shortcut;
 use crate::single_instance::{
@@ -40,7 +44,8 @@ use crate::ui::lock_window::LockWindow;
 use crate::ui::settings_window::SettingsWindow;
 use crate::updates::{self, UpdateState};
 use crate::webview::{
-    GtkCommand, GtkEvent, GtkHandle, LoadState, OVERLAY_MARGIN, TITLEBAR_HEIGHT, WHATSAPP_URL,
+    ConnectionState as BrowserConnectionState, GtkCommand, GtkEvent, GtkHandle, LoadState,
+    OVERLAY_MARGIN, TITLEBAR_HEIGHT, WHATSAPP_URL,
 };
 use crate::x11::{WindowInfo, X11, select_account_window};
 
@@ -65,6 +70,204 @@ enum AccountTag {
     Tagged,
     Pending,
     Closed,
+}
+
+/// Why the application lock is being requested. Manual locks always act;
+/// automatic triggers respect their individual Security toggle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockTrigger {
+    Manual,
+    Idle,
+    Hide,
+    Suspend,
+    Resume,
+    ScreenLocked,
+}
+
+/// Session events received from logind and desktop ScreenSaver services.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemLockEvent {
+    Suspend,
+    Resume,
+    ScreenLocked,
+}
+
+impl SystemLockEvent {
+    fn label(self) -> &'static str {
+        match self {
+            SystemLockEvent::Suspend => "system suspend",
+            SystemLockEvent::Resume => "system resume",
+            SystemLockEvent::ScreenLocked => "desktop screen lock",
+        }
+    }
+
+    fn trigger(self) -> LockTrigger {
+        match self {
+            SystemLockEvent::Suspend => LockTrigger::Suspend,
+            SystemLockEvent::Resume => LockTrigger::Resume,
+            SystemLockEvent::ScreenLocked => LockTrigger::ScreenLocked,
+        }
+    }
+}
+
+fn lock_is_configured(lock: &LockSettings) -> bool {
+    lock.enabled && lock.hash.is_some()
+}
+
+fn lock_on_trigger(trigger: LockTrigger, lock: &LockSettings) -> bool {
+    if !lock_is_configured(lock) {
+        return false;
+    }
+    match trigger {
+        LockTrigger::Manual | LockTrigger::Idle => true,
+        LockTrigger::Hide => lock.lock_on_hide,
+        LockTrigger::Suspend | LockTrigger::Resume => lock.lock_on_suspend,
+        LockTrigger::ScreenLocked => lock.lock_on_screen_lock,
+    }
+}
+
+/// A lock is only started once. Repeated suspend or ScreenSaver signals while
+/// the lock window is already up are intentionally ignored.
+fn should_begin_lock(currently_locked: bool, trigger: LockTrigger, lock: &LockSettings) -> bool {
+    !currently_locked && lock_on_trigger(trigger, lock)
+}
+
+fn unlock_is_authorized(hash: Option<&str>, password: &str) -> bool {
+    hash.is_some_and(|hash| lock::verify_password(hash, password))
+}
+
+fn hotkey_bindings(toggle: Shortcut, boss_key: &str) -> HotkeyBindings {
+    HotkeyBindings::new(toggle, Shortcut::parse(boss_key).ok())
+}
+
+fn logind_event(sleeping: bool) -> SystemLockEvent {
+    if sleeping {
+        SystemLockEvent::Suspend
+    } else {
+        SystemLockEvent::Resume
+    }
+}
+
+/// ScreenSaver implementations use different bus names and object paths, but
+/// every known interface contains `ScreenSaver`.
+fn is_screen_saver_interface(interface: &str) -> bool {
+    interface.to_ascii_lowercase().contains("screensaver")
+}
+
+/// Signals are rare; a small queue keeps memory bounded if the UI thread is
+/// busy while the machine suspends.
+const LOCK_EVENT_QUEUE: usize = 8;
+
+/// Starts best-effort session watchers. Every failure is logged and ignored:
+/// locking still works manually, on hide, and on idle when those are enabled.
+fn start_system_lock_watchers(tx: Sender<SystemLockEvent>) {
+    spawn_lock_watcher("oxidezap-logind", tx.clone(), watch_logind);
+    spawn_lock_watcher("oxidezap-screensaver", tx, watch_screen_saver);
+}
+
+fn spawn_lock_watcher(name: &str, tx: Sender<SystemLockEvent>, watch: fn(Sender<SystemLockEvent>)) {
+    if let Err(error) = thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || watch(tx))
+    {
+        warn!(%error, watcher = name, "could not start the system lock watcher");
+    }
+}
+
+/// Watches `org.freedesktop.login1.Manager.PrepareForSleep` on the system bus.
+/// Both edges lock: the pre-sleep signal may arrive while the UI is already
+/// frozen, and the resume signal guarantees the lock is active after waking.
+fn watch_logind(tx: Sender<SystemLockEvent>) {
+    let connection = match zbus::blocking::Connection::system() {
+        Ok(connection) => connection,
+        Err(error) => {
+            debug!(%error, "lock on suspend unavailable: no system bus");
+            return;
+        }
+    };
+    let rule = match MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .interface("org.freedesktop.login1.Manager")
+        .and_then(|rule| rule.member("PrepareForSleep"))
+        .map(|rule| rule.build())
+    {
+        Ok(rule) => rule,
+        Err(error) => {
+            warn!(%error, "could not build the logind signal match rule");
+            return;
+        }
+    };
+    let messages = match MessageIterator::for_match_rule(rule, &connection, Some(LOCK_EVENT_QUEUE))
+    {
+        Ok(messages) => messages,
+        Err(error) => {
+            debug!(%error, "could not watch logind PrepareForSleep");
+            return;
+        }
+    };
+    for message in messages {
+        let Ok(message) = message else {
+            continue;
+        };
+        let Ok((sleeping,)) = message.body().deserialize::<(bool,)>() else {
+            continue;
+        };
+        if tx.send(logind_event(sleeping)).is_err() {
+            return;
+        }
+    }
+    debug!("the logind signal watcher stopped");
+}
+
+/// Watches `ActiveChanged` signals from any desktop ScreenSaver interface.
+/// GNOME, KDE, Cinnamon, MATE, and XFCE expose different names, so the
+/// interface name is matched by suffix instead of assuming one desktop.
+fn watch_screen_saver(tx: Sender<SystemLockEvent>) {
+    let connection = match zbus::blocking::Connection::session() {
+        Ok(connection) => connection,
+        Err(error) => {
+            debug!(%error, "lock on screen lock unavailable: no session bus");
+            return;
+        }
+    };
+    let rule = match MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .member("ActiveChanged")
+        .map(|rule| rule.build())
+    {
+        Ok(rule) => rule,
+        Err(error) => {
+            warn!(%error, "could not build the ScreenSaver signal match rule");
+            return;
+        }
+    };
+    let messages = match MessageIterator::for_match_rule(rule, &connection, Some(LOCK_EVENT_QUEUE))
+    {
+        Ok(messages) => messages,
+        Err(error) => {
+            debug!(%error, "could not watch the desktop ScreenSaver");
+            return;
+        }
+    };
+    for message in messages {
+        let Ok(message) = message else {
+            continue;
+        };
+        let header = message.header();
+        let Some(interface) = header.interface() else {
+            continue;
+        };
+        if !is_screen_saver_interface(interface.as_str()) {
+            continue;
+        }
+        let Ok((active,)) = message.body().deserialize::<(bool,)>() else {
+            continue;
+        };
+        if active && tx.send(SystemLockEvent::ScreenLocked).is_err() {
+            return;
+        }
+    }
+    debug!("the ScreenSaver signal watcher stopped");
 }
 
 pub struct SmokeState {
@@ -141,6 +344,317 @@ fn crash_decision(quitting: bool, recovery: &mut CrashRecovery, now: Instant) ->
     recovery.on_crash(now)
 }
 
+/// Maximum number of automatic connection reloads. The browser's own
+/// reconnect is preferred; OxideZap only reloads a page in an error state.
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+
+/// Delay before each automatic connection reload. One entry per attempt.
+const RECONNECT_BACKOFF: [Duration; MAX_RECONNECT_ATTEMPTS as usize] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
+/// Native fallback for a main-frame load that never finishes. WebKit usually
+/// reports `load-failed` first; this covers a network stack that hangs without
+/// producing an error.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What the account titlebar shows. The browser script is the primary source;
+/// `Connecting` is the short window before the first report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConnectionState {
+    #[default]
+    Connecting,
+    Connected,
+    Offline,
+    Reconnecting,
+}
+
+impl ConnectionState {
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnectionState::Connecting => "Connecting…",
+            ConnectionState::Connected => "Connected",
+            ConnectionState::Offline => "Offline",
+            ConnectionState::Reconnecting => "Reconnecting…",
+        }
+    }
+
+    pub fn retry_available(self) -> bool {
+        matches!(
+            self,
+            ConnectionState::Offline | ConnectionState::Reconnecting
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionDecision {
+    None,
+    Offline,
+    Reconnected,
+    LoginPageBlocked,
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryAction {
+    Idle,
+    Postponed,
+    Fire,
+    LoginPageBlocked,
+    Cancelled,
+}
+
+/// Pure per-account connection state machine. It owns the backoff clock so
+/// the policy can be tested without GTK, WebKit, or real timers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ConnectionTracker {
+    state: ConnectionState,
+    online: bool,
+    reported: bool,
+    login_page: bool,
+    page_error: bool,
+    loaded: bool,
+    attempts: u32,
+    next_retry: Option<Instant>,
+    exhausted: bool,
+    load_started: Option<Instant>,
+    offline_notified: bool,
+    recovery_notified: bool,
+    login_warned: bool,
+}
+
+impl ConnectionTracker {
+    fn state(&self) -> ConnectionState {
+        self.state
+    }
+
+    fn on_browser(&mut self, now: Instant, online: bool, login_page: bool) -> ConnectionDecision {
+        self.login_page = login_page;
+        self.online = online;
+        self.reported = true;
+        if !online {
+            self.next_retry = None;
+            self.recovery_notified = false;
+            let previous = self.state;
+            self.state = ConnectionState::Offline;
+            if previous != ConnectionState::Offline && !self.offline_notified {
+                self.offline_notified = true;
+                return ConnectionDecision::Offline;
+            }
+            return ConnectionDecision::None;
+        }
+        if self.page_error {
+            if login_page {
+                self.next_retry = None;
+                self.state = ConnectionState::Offline;
+                if self.login_warned {
+                    return ConnectionDecision::None;
+                }
+                self.login_warned = true;
+                return ConnectionDecision::LoginPageBlocked;
+            }
+            return self.schedule_retry(now);
+        }
+        if self.loaded {
+            return self.mark_connected();
+        }
+        if self.state == ConnectionState::Offline {
+            self.state = ConnectionState::Connecting;
+        }
+        ConnectionDecision::None
+    }
+
+    fn on_load_started(&mut self, now: Instant) {
+        if self.state == ConnectionState::Connected && !self.page_error {
+            // A normal in-app navigation is not an outage; the timeout
+            // fallback is only for startup and reconnect attempts.
+            self.load_started = None;
+            return;
+        }
+        self.load_started = Some(now);
+        self.loaded = false;
+    }
+
+    fn on_load_finished(&mut self, now: Instant) -> ConnectionDecision {
+        self.load_started = None;
+        if self.page_error {
+            self.loaded = false;
+            return self.schedule_retry(now);
+        }
+        self.loaded = true;
+        if !self.online {
+            if !self.reported {
+                // The first browser report has not arrived yet. A finished
+                // load is not evidence of an outage; wait for the report.
+                return self.mark_connected();
+            }
+            self.recovery_notified = false;
+            let previous = self.state;
+            self.state = ConnectionState::Offline;
+            if previous != ConnectionState::Offline && !self.offline_notified {
+                self.offline_notified = true;
+                return ConnectionDecision::Offline;
+            }
+            return ConnectionDecision::None;
+        }
+        self.mark_connected()
+    }
+
+    fn on_load_failed(&mut self, now: Instant) -> ConnectionDecision {
+        self.load_started = None;
+        self.loaded = false;
+        self.page_error = true;
+        self.next_retry = None;
+        if self.login_page {
+            self.state = ConnectionState::Offline;
+            if self.login_warned {
+                return ConnectionDecision::None;
+            }
+            self.login_warned = true;
+            return ConnectionDecision::LoginPageBlocked;
+        }
+        if !self.online {
+            self.recovery_notified = false;
+            let previous = self.state;
+            self.state = ConnectionState::Offline;
+            if previous != ConnectionState::Offline && !self.offline_notified {
+                self.offline_notified = true;
+                return ConnectionDecision::Offline;
+            }
+            return ConnectionDecision::None;
+        }
+        self.schedule_retry(now)
+    }
+
+    fn on_load_timeout(&mut self, now: Instant) -> ConnectionDecision {
+        let Some(started) = self.load_started else {
+            return ConnectionDecision::None;
+        };
+        if now.duration_since(started) < LOAD_TIMEOUT {
+            return ConnectionDecision::None;
+        }
+        self.on_load_failed(now)
+    }
+
+    fn schedule_retry(&mut self, now: Instant) -> ConnectionDecision {
+        if self.next_retry.is_some() || self.exhausted || !self.online || self.login_page {
+            return ConnectionDecision::None;
+        }
+        if self.attempts >= MAX_RECONNECT_ATTEMPTS {
+            self.exhausted = true;
+            self.state = ConnectionState::Offline;
+            return ConnectionDecision::Exhausted;
+        }
+        let delay = RECONNECT_BACKOFF[self.attempts as usize];
+        self.attempts += 1;
+        self.next_retry = Some(now + delay);
+        self.state = ConnectionState::Reconnecting;
+        ConnectionDecision::None
+    }
+
+    fn take_due_retry(&mut self, now: Instant, downloads_active: bool) -> RetryAction {
+        let Some(at) = self.next_retry else {
+            return RetryAction::Idle;
+        };
+        if now < at {
+            return RetryAction::Idle;
+        }
+        if downloads_active {
+            return RetryAction::Postponed;
+        }
+        if self.login_page {
+            self.next_retry = None;
+            self.state = ConnectionState::Offline;
+            if self.login_warned {
+                return RetryAction::Cancelled;
+            }
+            self.login_warned = true;
+            return RetryAction::LoginPageBlocked;
+        }
+        if !self.online {
+            self.next_retry = None;
+            self.state = ConnectionState::Offline;
+            return RetryAction::Cancelled;
+        }
+        self.next_retry = None;
+        self.page_error = false;
+        self.loaded = false;
+        self.load_started = Some(now);
+        self.state = ConnectionState::Reconnecting;
+        RetryAction::Fire
+    }
+
+    fn retry_now(&mut self, now: Instant) {
+        self.attempts = 0;
+        self.exhausted = false;
+        self.next_retry = None;
+        self.page_error = false;
+        self.loaded = false;
+        self.load_started = Some(now);
+        self.login_warned = false;
+        self.recovery_notified = false;
+        self.state = if self.online {
+            ConnectionState::Reconnecting
+        } else {
+            ConnectionState::Offline
+        };
+    }
+
+    fn on_reload_blocked(&mut self) {
+        self.load_started = None;
+        self.loaded = false;
+        self.next_retry = None;
+        self.state = ConnectionState::Offline;
+    }
+
+    fn on_process_terminated(&mut self) {
+        self.page_error = false;
+        self.loaded = false;
+        self.load_started = None;
+        self.next_retry = None;
+        self.state = if self.online {
+            ConnectionState::Reconnecting
+        } else {
+            ConnectionState::Offline
+        };
+    }
+
+    fn mark_connected(&mut self) -> ConnectionDecision {
+        let previous = self.state;
+        self.state = ConnectionState::Connected;
+        self.page_error = false;
+        self.loaded = true;
+        self.load_started = None;
+        self.attempts = 0;
+        self.exhausted = false;
+        self.next_retry = None;
+        self.login_warned = false;
+        self.offline_notified = false;
+        let was_recovering = matches!(
+            previous,
+            ConnectionState::Offline | ConnectionState::Reconnecting
+        );
+        if was_recovering && !self.recovery_notified {
+            self.recovery_notified = true;
+            ConnectionDecision::Reconnected
+        } else {
+            ConnectionDecision::None
+        }
+    }
+}
+
+fn is_whatsapp_web_uri(uri: &str) -> bool {
+    url::Url::parse(uri.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "web.whatsapp.com")
+}
+
 /// A storage operation currently running on the GTK/storage worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunningStorageOperation {
@@ -175,7 +689,6 @@ impl StorageNotice {
 #[derive(Clone, Debug, Default)]
 pub struct StorageState {
     pub scanning: bool,
-    pub refresh_pending: bool,
     pub snapshot: Option<StorageSnapshot>,
     pub running: Option<RunningStorageOperation>,
     pub notice: Option<StorageNotice>,
@@ -199,6 +712,8 @@ pub struct AppModel {
     account_windows: HashMap<String, WindowHandle<AccountWindow>>,
     account_xids: HashMap<String, u32>,
     crash_recovery: HashMap<String, CrashRecovery>,
+    connection: HashMap<String, ConnectionTracker>,
+    active_downloads: HashMap<String, u32>,
     scales: HashMap<String, f32>,
     settings_window: Option<WindowHandle<SettingsWindow>>,
     lock_window: Option<WindowHandle<LockWindow>>,
@@ -226,6 +741,9 @@ pub struct AppModel {
     last_idle_check: Instant,
     last_scale_check: Instant,
     last_notifications: Vec<(String, Instant)>,
+    lock_events: Receiver<SystemLockEvent>,
+    boss_hidden: Option<HashSet<String>>,
+    boss_settings_hidden: bool,
 }
 
 impl AppModel {
@@ -260,6 +778,10 @@ impl AppModel {
         );
         let update_state = updates::cached_state(&update_config);
         let downloads = DownloadManager::load(paths.downloads_index_file());
+        let (lock_event_tx, lock_event_rx) = unbounded();
+        if smoke.is_none() {
+            start_system_lock_watchers(lock_event_tx);
+        }
         Self {
             paths,
             settings,
@@ -278,6 +800,8 @@ impl AppModel {
             account_windows: HashMap::new(),
             account_xids: HashMap::new(),
             crash_recovery: HashMap::new(),
+            connection: HashMap::new(),
+            active_downloads: HashMap::new(),
             scales: HashMap::new(),
             settings_window: None,
             lock_window: None,
@@ -305,6 +829,9 @@ impl AppModel {
             last_idle_check: Instant::now(),
             last_scale_check: Instant::now(),
             last_notifications: Vec::new(),
+            lock_events: lock_event_rx,
+            boss_hidden: None,
+            boss_settings_hidden: false,
         }
     }
 
@@ -357,6 +884,7 @@ impl AppModel {
             self.start_hidden = true;
         }
 
+        self.apply_hotkeys();
         if let Some(account_id) = self.settings.active_account_id() {
             self.open_account_window(&account_id, cx);
         }
@@ -425,22 +953,32 @@ impl AppModel {
     fn poll(&mut self, cx: &mut Context<Self>) {
         while let Ok(state) = self.update_rx.try_recv() {
             self.update_check_running = false;
-            self.update_state = updates::apply_skipped(
-                state,
-                self.settings.skipped_update_version.as_deref(),
-            );
+            self.update_state =
+                updates::apply_skipped(state, self.settings.skipped_update_version.as_deref());
             cx.refresh_windows();
         }
         while let Ok(event) = self.gtk_events.try_recv() {
             self.handle_gtk_event(event, cx);
         }
+        self.poll_connection_recovery(cx);
         self.poll_crash_recovery();
         while let Ok(request) = self.instance_messages.try_recv() {
             self.handle_instance_request(request, cx);
         }
         while let Ok(action) = self.hotkey_actions.try_recv() {
-            if action == HotkeyAction::Toggle {
-                self.toggle_visibility(cx);
+            match action {
+                HotkeyAction::Toggle => self.toggle_visibility(cx),
+                HotkeyAction::BossKey => self.boss_toggle(cx),
+            }
+        }
+        while let Ok(event) = self.lock_events.try_recv() {
+            let trigger = event.trigger();
+            if should_begin_lock(self.locked, trigger, &self.settings.lock) {
+                debug!(
+                    event = event.label(),
+                    "locking after a system session event"
+                );
+                self.lock_for(trigger, cx);
             }
         }
         while let Ok(action) = self.tray_actions.try_recv() {
@@ -456,7 +994,7 @@ impl AppModel {
             if let Some(idle) = self.x11.idle_ms() {
                 let threshold = u64::from(self.settings.lock.idle_minutes) * 60 * 1000;
                 if u64::from(idle) >= threshold {
-                    self.lock(cx);
+                    self.lock_for(LockTrigger::Idle, cx);
                 }
             }
         }
@@ -503,6 +1041,10 @@ impl AppModel {
             .map(|(account_id, _)| account_id.clone())
             .collect();
         for account_id in due {
+            if self.downloads_active(&account_id) {
+                // Keep the retry pending; reloading would cancel the download.
+                continue;
+            }
             let Some(recovery) = self.crash_recovery.get_mut(&account_id) else {
                 continue;
             };
@@ -524,8 +1066,150 @@ impl AppModel {
             .is_some_and(|recovery| recovery.failed)
     }
 
+    pub fn account_connection(&self, account_id: &str) -> ConnectionState {
+        self.connection
+            .get(account_id)
+            .map(ConnectionTracker::state)
+            .unwrap_or_default()
+    }
+
+    fn downloads_active(&self, account_id: &str) -> bool {
+        self.active_downloads.get(account_id).copied().unwrap_or(0) > 0
+    }
+
+    fn poll_connection_recovery(&mut self, cx: &mut Context<Self>) {
+        if self.quitting {
+            self.connection.clear();
+            self.active_downloads.clear();
+            return;
+        }
+        let now = Instant::now();
+        let accounts: Vec<String> = self.connection.keys().cloned().collect();
+        for account_id in accounts {
+            if !self.account_windows.contains_key(&account_id) {
+                self.connection.remove(&account_id);
+                self.active_downloads.remove(&account_id);
+                continue;
+            }
+            // Crash recovery owns the retry schedule while it is active. An
+            // explicitly reset entry (failed = false, no pending retry) does
+            // not block connection recovery after a manual retry.
+            let crash_active = self
+                .crash_recovery
+                .get(&account_id)
+                .is_some_and(|recovery| recovery.failed || recovery.next_retry.is_some());
+            if crash_active {
+                continue;
+            }
+            let downloads_active = self.downloads_active(&account_id);
+            let timeout = self
+                .connection
+                .get_mut(&account_id)
+                .map(|tracker| tracker.on_load_timeout(now))
+                .unwrap_or(ConnectionDecision::None);
+            if timeout != ConnectionDecision::None {
+                self.announce_connection(&account_id, timeout);
+                self.refresh_account_window(&account_id, cx);
+            }
+            let action = self
+                .connection
+                .get_mut(&account_id)
+                .map(|tracker| tracker.take_due_retry(now, downloads_active))
+                .unwrap_or(RetryAction::Idle);
+            match action {
+                RetryAction::Idle => {}
+                RetryAction::Postponed => {
+                    debug!(
+                        account_id = %account_id,
+                        "postponing a WhatsApp Web reconnect while a download is active"
+                    );
+                }
+                RetryAction::Fire => {
+                    info!(account_id = %account_id, "reloading WhatsApp Web after a connection failure");
+                    self.gtk.reload(&account_id);
+                    self.refresh_account_window(&account_id, cx);
+                }
+                RetryAction::LoginPageBlocked => {
+                    self.announce_connection(&account_id, ConnectionDecision::LoginPageBlocked);
+                    self.refresh_account_window(&account_id, cx);
+                }
+                RetryAction::Cancelled => {
+                    self.refresh_account_window(&account_id, cx);
+                }
+            }
+        }
+    }
+
+    fn announce_connection(&mut self, account_id: &str, decision: ConnectionDecision) {
+        if decision == ConnectionDecision::None {
+            return;
+        }
+        let name = self.account_name(account_id);
+        let icon = self.paths.runtime_icon();
+        let notify_enabled =
+            !self.locked && self.settings.connection_notifications_enabled(account_id);
+        match decision {
+            ConnectionDecision::None => {}
+            ConnectionDecision::Offline => {
+                if notify_enabled {
+                    notify::notify(
+                        "WhatsApp Web is offline",
+                        &format!(
+                            "{name} lost its connection. OxideZap will reconnect when the network returns."
+                        ),
+                        Some(&icon),
+                    );
+                }
+            }
+            ConnectionDecision::Reconnected => {
+                if notify_enabled {
+                    notify::notify(
+                        "Connection restored",
+                        &format!("{name} is connected again."),
+                        Some(&icon),
+                    );
+                }
+            }
+            ConnectionDecision::LoginPageBlocked => {
+                if notify_enabled {
+                    notify::notify(
+                        "Connection restored",
+                        &format!(
+                            "{name} is on the WhatsApp login page. OxideZap did not reload it automatically; use Retry now if the page is stuck."
+                        ),
+                        Some(&icon),
+                    );
+                }
+            }
+            ConnectionDecision::Exhausted => {
+                notify::notify(
+                    "Could not reconnect WhatsApp Web",
+                    &format!(
+                        "OxideZap stopped automatic reconnects for {name} after {MAX_RECONNECT_ATTEMPTS} attempts. Use Retry now in the account window."
+                    ),
+                    Some(&icon),
+                );
+            }
+        }
+    }
+
     pub fn retry_account(&mut self, account_id: &str, cx: &mut Context<Self>) {
         if self.quitting {
+            return;
+        }
+        if self.downloads_active(account_id) {
+            warn!(
+                account_id = %account_id,
+                "manual WhatsApp Web reload skipped while a download is active"
+            );
+            if self.settings.notifications {
+                notify::notify(
+                    "Download in progress",
+                    "OxideZap did not reload WhatsApp Web while a download is active. Retry when the download finishes.",
+                    Some(&self.paths.runtime_icon()),
+                );
+            }
+            self.refresh_account_window(account_id, cx);
             return;
         }
         info!(account_id = %account_id, "manual WhatsApp Web reload requested");
@@ -533,6 +1217,10 @@ impl AppModel {
             .entry(account_id.to_string())
             .or_default()
             .reset();
+        self.connection
+            .entry(account_id.to_string())
+            .or_default()
+            .retry_now(Instant::now());
         self.gtk.show(account_id);
         self.gtk.reload(account_id);
         self.refresh_account_window(account_id, cx);
@@ -553,8 +1241,15 @@ impl AppModel {
                     }
                 }
             }
-            GtkEvent::LoadState { account_id, state } => {
-                if state == LoadState::Finished {
+            GtkEvent::LoadState { account_id, state } => match state {
+                LoadState::Started => {
+                    self.connection
+                        .entry(account_id.clone())
+                        .or_default()
+                        .on_load_started(Instant::now());
+                    self.refresh_account_window(&account_id, cx);
+                }
+                LoadState::Finished => {
                     let recovered = self
                         .crash_recovery
                         .remove(&account_id)
@@ -562,14 +1257,72 @@ impl AppModel {
                     self.gtk.set_zoom(&account_id, self.settings.zoom);
                     if recovered {
                         self.gtk.show(&account_id);
-                        self.refresh_account_window(&account_id, cx);
                     }
+                    let decision = self
+                        .connection
+                        .entry(account_id.clone())
+                        .or_default()
+                        .on_load_finished(Instant::now());
+                    self.announce_connection(&account_id, decision);
+                    self.refresh_account_window(&account_id, cx);
                     if let Some(smoke) = &mut self.smoke {
                         if smoke.account_id == account_id && smoke.loaded_at.is_none() {
                             smoke.loaded_at = Some(Instant::now());
                         }
                     }
                 }
+                LoadState::Redirected | LoadState::Committed => {}
+            },
+            GtkEvent::LoadFailed {
+                account_id,
+                uri,
+                message,
+            } => {
+                if !is_whatsapp_web_uri(&uri) {
+                    debug!(%account_id, %uri, %message, "ignored a load failure outside WhatsApp Web");
+                } else {
+                    warn!(%account_id, %uri, %message, "WhatsApp Web is in a load error state");
+                    let decision = self
+                        .connection
+                        .entry(account_id.clone())
+                        .or_default()
+                        .on_load_failed(Instant::now());
+                    self.announce_connection(&account_id, decision);
+                    self.refresh_account_window(&account_id, cx);
+                }
+            }
+            GtkEvent::ConnectionState { account_id, report } => {
+                let online = report.state == BrowserConnectionState::Online;
+                debug!(
+                    %account_id,
+                    online,
+                    login_page = report.login_page,
+                    "browser connection report"
+                );
+                let decision = self
+                    .connection
+                    .entry(account_id.clone())
+                    .or_default()
+                    .on_browser(Instant::now(), online, report.login_page);
+                self.announce_connection(&account_id, decision);
+                self.refresh_account_window(&account_id, cx);
+            }
+            GtkEvent::ReloadBlocked { account_id } => {
+                warn!(
+                    account_id = %account_id,
+                    "the GTK thread refused a reload during an active download"
+                );
+                if let Some(tracker) = self.connection.get_mut(&account_id) {
+                    tracker.on_reload_blocked();
+                }
+                if self.settings.notifications {
+                    notify::notify(
+                        "Download in progress",
+                        "OxideZap did not reload WhatsApp Web while a download is active.",
+                        Some(&self.paths.runtime_icon()),
+                    );
+                }
+                self.refresh_account_window(&account_id, cx);
             }
             GtkEvent::Title {
                 account_id,
@@ -707,6 +1460,9 @@ impl AppModel {
             }
             GtkEvent::Crashed { account_id } => {
                 warn!(account_id = %account_id, "the WebKit web process crashed");
+                if let Some(tracker) = self.connection.get_mut(&account_id) {
+                    tracker.on_process_terminated();
+                }
                 let quitting = self.quitting;
                 let now = Instant::now();
                 let recovery = self.crash_recovery.entry(account_id.clone()).or_default();
@@ -821,7 +1577,7 @@ impl AppModel {
     }
 
     fn request_lock(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
-        if !self.settings.lock.enabled || self.settings.lock.hash.is_none() {
+        if !lock_is_configured(&self.settings.lock) {
             return Err("the application lock is not configured".to_string());
         }
         self.lock(cx);
@@ -1069,15 +1825,6 @@ impl AppModel {
             self.open_lock_window(cx);
             return;
         }
-        if self
-            .storage
-            .running
-            .as_ref()
-            .is_some_and(|running| running.account_id == account_id)
-        {
-            // Recreating the webview now would race the profile worker.
-            return;
-        }
         if let Some(handle) = self.account_windows.get(account_id).copied() {
             if handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -1151,6 +1898,7 @@ impl AppModel {
             scale,
             zoom: self.settings.zoom,
             writing: self.settings.writing.clone(),
+            proxy: self.settings.network.proxy.clone(),
         });
 
         self.settings.active_account = Some(account.id.clone());
@@ -1164,6 +1912,10 @@ impl AppModel {
     }
 
     pub fn open_settings_window(&mut self, cx: &mut Context<Self>) {
+        if self.locked {
+            self.open_lock_window(cx);
+            return;
+        }
         if let Some(handle) = self.settings_window {
             if handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -1199,12 +1951,17 @@ impl AppModel {
         cx.defer(move |cx| open_lock_window_deferred(model, cx));
     }
 
-    pub fn lock(&mut self, cx: &mut Context<Self>) {
-        if !self.settings.lock.enabled || self.settings.lock.hash.is_none() || self.locked {
+    fn lock_for(&mut self, trigger: LockTrigger, cx: &mut Context<Self>) {
+        if !should_begin_lock(self.locked, trigger, &self.settings.lock) {
             return;
         }
         self.locked = true;
-        if let Some(handle) = self.downloads_window.take() {
+        self.boss_hidden = None;
+        self.boss_settings_hidden = false;
+        self.pending_settings = false;
+        // The privacy screen shows only the lock window. Closing the settings
+        // window does not discard preferences: every change is already saved.
+        if let Some(handle) = self.settings_window.take() {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
         let ids: Vec<String> = self.account_windows.keys().cloned().collect();
@@ -1215,11 +1972,12 @@ impl AppModel {
         self.update_tray();
     }
 
+    pub fn lock(&mut self, cx: &mut Context<Self>) {
+        self.lock_for(LockTrigger::Manual, cx);
+    }
+
     pub fn try_unlock(&mut self, password: &str, cx: &mut Context<Self>) -> bool {
-        let Some(hash) = &self.settings.lock.hash else {
-            return false;
-        };
-        if !lock::verify_password(hash, password) {
+        if !unlock_is_authorized(self.settings.lock.hash.as_deref(), password) {
             return false;
         }
         self.locked = false;
@@ -1243,7 +2001,52 @@ impl AppModel {
         }
     }
 
+    /// Boss key: hide every window immediately for privacy. A second press
+    /// restores only the windows that were visible when the key was pressed.
+    pub fn boss_toggle(&mut self, cx: &mut Context<Self>) {
+        if self.locked {
+            self.open_lock_window(cx);
+            return;
+        }
+        if let Some(visible_before) = self.boss_hidden.take() {
+            let ids: Vec<String> = self.account_windows.keys().cloned().collect();
+            for id in ids {
+                if visible_before.contains(&id) {
+                    self.show_account_window(&id, cx);
+                }
+            }
+            if std::mem::take(&mut self.boss_settings_hidden) {
+                self.open_settings_window(cx);
+            }
+            self.update_tray();
+            return;
+        }
+
+        let visible_before: HashSet<String> = self
+            .account_windows
+            .keys()
+            .filter(|account_id| !self.hidden_accounts.contains(*account_id))
+            .cloned()
+            .collect();
+        self.boss_hidden = Some(visible_before);
+        self.boss_settings_hidden = if let Some(handle) = self.settings_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+            true
+        } else {
+            let pending = self.pending_settings;
+            self.pending_settings = false;
+            pending
+        };
+        let ids: Vec<String> = self.account_windows.keys().cloned().collect();
+        for id in ids {
+            self.hide_account_window(&id, cx);
+        }
+        self.update_tray();
+    }
+
     pub fn hide_all(&mut self, cx: &mut Context<Self>) {
+        self.boss_hidden = None;
+        self.boss_settings_hidden = false;
         let ids: Vec<String> = self.account_windows.keys().cloned().collect();
         for id in ids {
             self.hide_account_window(&id, cx);
@@ -1252,6 +2055,8 @@ impl AppModel {
     }
 
     pub fn show_all(&mut self, cx: &mut Context<Self>) {
+        self.boss_hidden = None;
+        self.boss_settings_hidden = false;
         if self.locked {
             self.open_lock_window(cx);
             return;
@@ -1271,12 +2076,8 @@ impl AppModel {
             }
         }
         self.gtk.hide(account_id);
-        if self.settings.lock.enabled
-            && self.settings.lock.lock_on_hide
-            && self.settings.lock.hash.is_some()
-            && !self.locked
-        {
-            self.lock(cx);
+        if !self.locked {
+            self.lock_for(LockTrigger::Hide, cx);
         }
     }
 
@@ -1354,8 +2155,10 @@ impl AppModel {
         self.account_windows.remove(account_id);
         self.account_xids.remove(account_id);
         self.crash_recovery.remove(account_id);
-        self.scales.remove(account_id);
+        self.connection.remove(account_id);
+        self.active_downloads.remove(account_id);
         self.hidden_accounts.remove(account_id);
+        self.scales.remove(account_id);
         self.gtk.close(account_id);
         window.remove_window();
         if self.account_windows.is_empty() {
@@ -1386,14 +2189,6 @@ impl AppModel {
         if self.settings.accounts.len() <= 1 {
             return;
         }
-        if self
-            .storage
-            .running
-            .as_ref()
-            .is_some_and(|running| running.account_id == account_id)
-        {
-            return;
-        }
         self.forget_account(account_id, cx);
         self.save_settings(cx);
         self.update_tray();
@@ -1420,8 +2215,10 @@ impl AppModel {
         }
         self.account_xids.remove(account_id);
         self.crash_recovery.remove(account_id);
-        self.scales.remove(account_id);
+        self.connection.remove(account_id);
+        self.active_downloads.remove(account_id);
         self.hidden_accounts.remove(account_id);
+        self.scales.remove(account_id);
         self.gtk.close(account_id);
         self.settings.remove_account(account_id);
     }
@@ -1450,11 +2247,9 @@ impl AppModel {
     /// visible while the new one is being computed.
     pub fn refresh_storage(&mut self, cx: &mut Context<Self>) {
         if self.storage.scanning {
-            self.storage.refresh_pending = true;
             return;
         }
         self.storage.scanning = true;
-        self.storage.refresh_pending = false;
         let paths = self.paths.clone();
         let account_ids: Vec<String> = self
             .settings
@@ -1470,11 +2265,7 @@ impl AppModel {
             this.update(cx, |model, cx| {
                 model.storage.scanning = false;
                 model.storage.snapshot = Some(snapshot);
-                let refresh_again = std::mem::take(&mut model.storage.refresh_pending);
                 cx.refresh_windows();
-                if refresh_again {
-                    model.refresh_storage(cx);
-                }
             })
             .ok();
         })
@@ -1559,7 +2350,6 @@ impl AppModel {
         };
         self.storage.notice = Some(notice);
         self.save_settings(cx);
-        self.sync_download_layout();
         self.update_tray();
         self.refresh_storage(cx);
         cx.refresh_windows();
@@ -1592,6 +2382,7 @@ impl AppModel {
             scale,
             zoom: self.settings.zoom,
             writing: self.settings.writing.clone(),
+            proxy: self.settings.network.proxy.clone(),
         });
     }
 
@@ -1617,10 +2408,38 @@ impl AppModel {
         self.gtk.set_writing(self.settings.writing.clone());
     }
 
-    pub fn set_shortcut(&mut self, shortcut: Shortcut, cx: &mut Context<Self>) {
-        self.settings.shortcut = shortcut.to_string();
-        self.hotkey.set(shortcut);
+    pub fn set_network_proxy(&mut self, proxy: ProxySettings, cx: &mut Context<Self>) {
+        if self.settings.network.proxy == proxy {
+            return;
+        }
+        self.settings.network.proxy = proxy;
         self.apply_settings(cx);
+    }
+
+    pub fn set_shortcut(
+        &mut self,
+        shortcut: Shortcut,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if Shortcut::parse(&self.settings.boss_key).ok().as_ref() == Some(&shortcut) {
+            return Err("The show/hide shortcut must differ from the boss key.".to_string());
+        }
+        self.settings.shortcut = shortcut.to_string();
+        self.apply_settings(cx);
+        Ok(())
+    }
+
+    pub fn set_boss_key(
+        &mut self,
+        shortcut: Shortcut,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if Shortcut::parse(&self.settings.shortcut).ok().as_ref() == Some(&shortcut) {
+            return Err("The boss key must differ from the show/hide shortcut.".to_string());
+        }
+        self.settings.boss_key = shortcut.to_string();
+        self.apply_settings(cx);
+        Ok(())
     }
 
     pub fn set_password(&mut self, password: &str, cx: &mut Context<Self>) -> Result<(), String> {
@@ -1637,6 +2456,8 @@ impl AppModel {
         self.settings.lock.enabled = false;
         self.settings.lock.lock_on_launch = false;
         self.settings.lock.lock_on_hide = false;
+        self.settings.lock.lock_on_suspend = false;
+        self.settings.lock.lock_on_screen_lock = false;
         self.settings.lock.idle_minutes = 0;
         self.apply_settings(cx);
     }
@@ -1748,12 +2569,17 @@ impl AppModel {
         {
             self.gtk.set_zoom(&account_id, self.settings.zoom);
         }
-        if let Ok(shortcut) = Shortcut::parse(&self.settings.shortcut) {
-            self.hotkey.set(shortcut);
-        }
-        self.sync_download_layout();
+        self.apply_hotkeys();
+        self.gtk.set_proxy(self.settings.network.proxy.clone());
         self.update_tray();
         cx.refresh_windows();
+    }
+
+    fn apply_hotkeys(&self) {
+        if let Ok(shortcut) = Shortcut::parse(&self.settings.shortcut) {
+            self.hotkey
+                .set(hotkey_bindings(shortcut, &self.settings.boss_key));
+        }
     }
 
     /// Coalesces a settings change and writes it after a short quiet period.
@@ -1921,6 +2747,8 @@ impl AppModel {
         }
         self.quitting = true;
         self.crash_recovery.clear();
+        self.connection.clear();
+        self.active_downloads.clear();
 
         let windows: Vec<(String, WindowHandle<AccountWindow>)> = self
             .account_windows
@@ -2182,6 +3010,14 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
 }
 
 fn open_settings_window_deferred(model: Entity<AppModel>, cx: &mut App) {
+    let hidden_or_locked = {
+        let model = model.read(cx);
+        model.locked || model.boss_hidden.is_some()
+    };
+    if hidden_or_locked {
+        model.update(cx, |model, _| model.pending_settings = false);
+        return;
+    }
     info!("opening settings window");
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(920.0), px(660.0)), cx)),
@@ -2430,11 +3266,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn account_window_title_is_the_discovery_identity() {
-        assert_eq!(account_window_title("Work"), "OxideZap — Work");
-    }
-
-    #[test]
     fn crash_retries_back_off_then_stop() {
         let mut now = Instant::now();
         let mut recovery = CrashRecovery::default();
@@ -2543,6 +3374,248 @@ mod tests {
         );
         assert_eq!(recovery, CrashRecovery::default());
     }
+
+    #[test]
+    fn account_window_title_is_the_discovery_identity() {
+        assert_eq!(account_window_title("Work"), "OxideZap — Work");
+    }
+
+    fn online_tracker(now: Instant) -> ConnectionTracker {
+        let mut tracker = ConnectionTracker::default();
+        tracker.on_browser(now, true, false);
+        tracker.on_load_started(now);
+        tracker.on_load_finished(now);
+        assert_eq!(tracker.state(), ConnectionState::Connected);
+        tracker
+    }
+
+    #[test]
+    fn connection_tracker_reports_offline_and_reconnected() {
+        let now = Instant::now();
+        let mut tracker = online_tracker(now);
+
+        assert_eq!(
+            tracker.on_browser(now, false, false),
+            ConnectionDecision::Offline
+        );
+        assert_eq!(tracker.state(), ConnectionState::Offline);
+        assert_eq!(
+            tracker.on_browser(now, false, false),
+            ConnectionDecision::None
+        );
+        assert_eq!(
+            tracker.on_browser(now, true, false),
+            ConnectionDecision::Reconnected
+        );
+        assert_eq!(tracker.state(), ConnectionState::Connected);
+        assert_eq!(
+            tracker.on_browser(now, true, false),
+            ConnectionDecision::None
+        );
+    }
+
+    #[test]
+    fn finished_load_without_a_browser_report_does_not_report_an_outage() {
+        let now = Instant::now();
+        let mut tracker = ConnectionTracker::default();
+        tracker.on_load_started(now);
+
+        assert_eq!(tracker.on_load_finished(now), ConnectionDecision::None);
+
+        assert_eq!(tracker.state(), ConnectionState::Connected);
+        assert!(!tracker.offline_notified);
+    }
+
+    #[test]
+    fn load_failure_schedules_exponential_backoff() {
+        let now = Instant::now();
+        let mut tracker = ConnectionTracker::default();
+        tracker.on_browser(now, true, false);
+        tracker.on_load_started(now);
+
+        let mut at = now;
+        assert_eq!(tracker.on_load_failed(at), ConnectionDecision::None);
+        assert_eq!(tracker.state(), ConnectionState::Reconnecting);
+        assert_eq!(tracker.attempts, 1);
+        assert_eq!(tracker.next_retry, Some(at + Duration::from_secs(2)));
+        assert_eq!(tracker.take_due_retry(at, false), RetryAction::Idle);
+
+        for (index, delay) in RECONNECT_BACKOFF.iter().enumerate() {
+            if index > 0 {
+                assert_eq!(tracker.on_load_failed(at), ConnectionDecision::None);
+                assert_eq!(tracker.attempts, index as u32 + 1);
+                assert_eq!(tracker.next_retry, Some(at + *delay));
+            }
+            at += *delay;
+            assert_eq!(tracker.take_due_retry(at, false), RetryAction::Fire);
+            assert_eq!(tracker.state(), ConnectionState::Reconnecting);
+        }
+
+        assert_eq!(tracker.on_load_failed(at), ConnectionDecision::Exhausted);
+        assert!(tracker.exhausted);
+        assert_eq!(tracker.next_retry, None);
+        assert_eq!(tracker.state(), ConnectionState::Offline);
+        assert_eq!(tracker.on_load_failed(at), ConnectionDecision::None);
+    }
+
+    #[test]
+    fn retry_waits_for_active_downloads_without_consuming_an_attempt() {
+        let now = Instant::now();
+        let mut tracker = ConnectionTracker::default();
+        tracker.on_browser(now, true, false);
+        tracker.on_load_started(now);
+        tracker.on_load_failed(now);
+        let retry_at = now + Duration::from_secs(2);
+
+        assert_eq!(
+            tracker.take_due_retry(retry_at, true),
+            RetryAction::Postponed
+        );
+        assert_eq!(tracker.attempts, 1);
+        assert_eq!(tracker.next_retry, Some(retry_at));
+        assert_eq!(tracker.take_due_retry(retry_at, false), RetryAction::Fire);
+    }
+
+    #[test]
+    fn login_page_never_reloads_automatically() {
+        let now = Instant::now();
+        let mut tracker = ConnectionTracker::default();
+        tracker.on_browser(now, true, true);
+        tracker.on_load_started(now);
+
+        assert_eq!(
+            tracker.on_load_failed(now),
+            ConnectionDecision::LoginPageBlocked
+        );
+        assert_eq!(tracker.state(), ConnectionState::Offline);
+        assert_eq!(tracker.next_retry, None);
+        assert_eq!(tracker.attempts, 0);
+        assert_eq!(tracker.take_due_retry(now, false), RetryAction::Idle);
+    }
+
+    #[test]
+    fn login_page_cancels_an_already_scheduled_retry() {
+        let now = Instant::now();
+        let mut tracker = ConnectionTracker::default();
+        tracker.on_browser(now, true, false);
+        tracker.on_load_started(now);
+        tracker.on_load_failed(now);
+        assert_eq!(tracker.next_retry, Some(now + Duration::from_secs(2)));
+
+        assert_eq!(
+            tracker.on_browser(now, true, true),
+            ConnectionDecision::LoginPageBlocked
+        );
+        assert_eq!(tracker.next_retry, None);
+        assert_eq!(
+            tracker.take_due_retry(now + Duration::from_secs(2), false),
+            RetryAction::Idle
+        );
+    }
+
+    #[test]
+    fn load_timeout_is_the_native_fallback() {
+        let now = Instant::now();
+        let mut tracker = ConnectionTracker::default();
+        tracker.on_browser(now, true, false);
+        tracker.on_load_started(now);
+
+        assert_eq!(
+            tracker.on_load_timeout(now + LOAD_TIMEOUT - Duration::from_secs(1)),
+            ConnectionDecision::None
+        );
+        assert_eq!(
+            tracker.on_load_timeout(now + LOAD_TIMEOUT),
+            ConnectionDecision::None
+        );
+        assert_eq!(tracker.state(), ConnectionState::Reconnecting);
+        assert_eq!(
+            tracker.next_retry,
+            Some(now + LOAD_TIMEOUT + Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn an_internal_navigation_does_not_arm_the_load_timeout() {
+        let now = Instant::now();
+        let mut tracker = online_tracker(now);
+
+        tracker.on_load_started(now + Duration::from_secs(1));
+
+        assert_eq!(tracker.load_started, None);
+        assert_eq!(
+            tracker.on_load_timeout(now + LOAD_TIMEOUT),
+            ConnectionDecision::None
+        );
+        assert_eq!(tracker.state(), ConnectionState::Connected);
+    }
+
+    #[test]
+    fn successful_retry_resets_the_budget() {
+        let now = Instant::now();
+        let mut tracker = ConnectionTracker::default();
+        tracker.on_browser(now, true, false);
+        tracker.on_load_started(now);
+        tracker.on_load_failed(now);
+        let retry_at = now + Duration::from_secs(2);
+        assert_eq!(tracker.take_due_retry(retry_at, false), RetryAction::Fire);
+
+        tracker.on_load_started(retry_at);
+        assert_eq!(
+            tracker.on_load_finished(retry_at),
+            ConnectionDecision::Reconnected
+        );
+
+        assert_eq!(tracker.state(), ConnectionState::Connected);
+        assert_eq!(tracker.attempts, 0);
+        assert!(!tracker.exhausted);
+        assert_eq!(tracker.next_retry, None);
+    }
+
+    #[test]
+    fn manual_retry_restarts_an_exhausted_connection_budget() {
+        let now = Instant::now();
+        let mut tracker = ConnectionTracker::default();
+        tracker.on_browser(now, true, false);
+        tracker.on_load_started(now);
+        assert_eq!(tracker.on_load_failed(now), ConnectionDecision::None);
+        let mut at = now;
+        for (index, delay) in RECONNECT_BACKOFF.iter().enumerate() {
+            at += *delay;
+            assert_eq!(tracker.take_due_retry(at, false), RetryAction::Fire);
+            let decision = tracker.on_load_failed(at);
+            if index + 1 == RECONNECT_BACKOFF.len() {
+                assert_eq!(decision, ConnectionDecision::Exhausted);
+            } else {
+                assert_eq!(decision, ConnectionDecision::None);
+            }
+        }
+        assert!(tracker.exhausted);
+
+        tracker.retry_now(at);
+
+        assert_eq!(tracker.state(), ConnectionState::Reconnecting);
+        assert_eq!(tracker.attempts, 0);
+        assert!(!tracker.exhausted);
+        assert_eq!(tracker.next_retry, None);
+        assert_eq!(tracker.on_load_failed(at), ConnectionDecision::None);
+        assert_eq!(tracker.next_retry, Some(at + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn blocked_reload_returns_to_offline() {
+        let now = Instant::now();
+        let mut tracker = ConnectionTracker::default();
+        tracker.on_browser(now, true, false);
+        tracker.retry_now(now);
+        assert_eq!(tracker.state(), ConnectionState::Reconnecting);
+
+        tracker.on_reload_blocked();
+
+        assert_eq!(tracker.state(), ConnectionState::Offline);
+        assert_eq!(tracker.load_started, None);
+    }
+
     fn settings_with_accounts() -> Settings {
         Settings {
             accounts: vec![
@@ -2618,5 +3691,85 @@ mod tests {
             "a\tWork\tinactive\nb\tBad Name\tactive\n"
         );
         assert_eq!(account_list_text(&Settings::default()), "");
+    }
+
+    fn configured_lock() -> LockSettings {
+        LockSettings {
+            enabled: true,
+            hash: Some("$argon2id$v=19$m=19456,t=2,p=1$abc$def".to_string()),
+            ..LockSettings::default()
+        }
+    }
+
+    #[test]
+    fn lock_triggers_follow_the_security_toggles() {
+        let lock = configured_lock();
+
+        assert!(lock_on_trigger(LockTrigger::Manual, &lock));
+        assert!(lock_on_trigger(LockTrigger::Idle, &lock));
+        assert!(lock_on_trigger(LockTrigger::Suspend, &lock));
+        assert!(lock_on_trigger(LockTrigger::Resume, &lock));
+        assert!(lock_on_trigger(LockTrigger::ScreenLocked, &lock));
+
+        let mut lock = configured_lock();
+        lock.lock_on_suspend = false;
+        assert!(!lock_on_trigger(LockTrigger::Suspend, &lock));
+        assert!(!lock_on_trigger(LockTrigger::Resume, &lock));
+        assert!(lock_on_trigger(LockTrigger::ScreenLocked, &lock));
+
+        lock.lock_on_screen_lock = false;
+        assert!(!lock_on_trigger(LockTrigger::ScreenLocked, &lock));
+
+        lock.lock_on_hide = false;
+        assert!(!lock_on_trigger(LockTrigger::Hide, &lock));
+        lock.lock_on_hide = true;
+        assert!(lock_on_trigger(LockTrigger::Hide, &lock));
+    }
+
+    #[test]
+    fn a_disabled_or_missing_password_never_locks() {
+        let mut lock = configured_lock();
+        lock.hash = None;
+        assert!(!lock_on_trigger(LockTrigger::Manual, &lock));
+        assert!(!lock_on_trigger(LockTrigger::Suspend, &lock));
+
+        let mut lock = configured_lock();
+        lock.enabled = false;
+        assert!(!lock_on_trigger(LockTrigger::Manual, &lock));
+        assert!(!lock_on_trigger(LockTrigger::ScreenLocked, &lock));
+    }
+
+    #[test]
+    fn an_already_locked_session_ignores_new_triggers() {
+        let lock = configured_lock();
+
+        assert!(should_begin_lock(false, LockTrigger::Suspend, &lock));
+        assert!(!should_begin_lock(true, LockTrigger::Suspend, &lock));
+        assert!(!should_begin_lock(true, LockTrigger::Manual, &lock));
+    }
+
+    #[test]
+    fn unlock_requires_the_configured_password() {
+        let hash = crate::lock::hash_password("correct horse").unwrap();
+
+        assert!(unlock_is_authorized(Some(&hash), "correct horse"));
+        assert!(!unlock_is_authorized(Some(&hash), "wrong password"));
+        assert!(!unlock_is_authorized(None, "correct horse"));
+    }
+
+    #[test]
+    fn prepare_for_sleep_maps_to_lock_events() {
+        assert_eq!(logind_event(true), SystemLockEvent::Suspend);
+        assert_eq!(logind_event(false), SystemLockEvent::Resume);
+    }
+
+    #[test]
+    fn screen_saver_interfaces_are_recognized() {
+        assert!(is_screen_saver_interface("org.freedesktop.ScreenSaver"));
+        assert!(is_screen_saver_interface("org.gnome.ScreenSaver"));
+        assert!(is_screen_saver_interface("org.cinnamon.ScreenSaver"));
+        assert!(is_screen_saver_interface("org.kde.screensaver"));
+        assert!(!is_screen_saver_interface("org.freedesktop.login1.Manager"));
+        assert!(!is_screen_saver_interface("org.freedesktop.Notifications"));
     }
 }

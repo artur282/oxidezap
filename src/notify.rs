@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{Sender, unbounded};
 use notify_rust::Hint;
 use tracing::warn;
 
@@ -152,22 +152,30 @@ mod tests {
     fn sound_preference_maps_to_notification_hints() {
         let mut audible = notify_rust::Notification::new();
         apply_sound_preference(&mut audible, true);
-        assert!(audible
-            .hints
-            .contains(&notify_rust::Hint::SoundName(SYSTEM_SOUND.to_string())));
-        assert!(!audible
-            .hints
-            .contains(&notify_rust::Hint::SuppressSound(true)));
+        assert!(
+            audible
+                .hints
+                .contains(&notify_rust::Hint::SoundName(SYSTEM_SOUND.to_string()))
+        );
+        assert!(
+            !audible
+                .hints
+                .contains(&notify_rust::Hint::SuppressSound(true))
+        );
 
         let mut silent = notify_rust::Notification::new();
         apply_sound_preference(&mut silent, false);
-        assert!(silent
-            .hints
-            .contains(&notify_rust::Hint::SuppressSound(true)));
-        assert!(!silent
-            .hints
-            .iter()
-            .any(|hint| matches!(hint, notify_rust::Hint::SoundName(_))));
+        assert!(
+            silent
+                .hints
+                .contains(&notify_rust::Hint::SuppressSound(true))
+        );
+        assert!(
+            !silent
+                .hints
+                .iter()
+                .any(|hint| matches!(hint, notify_rust::Hint::SoundName(_)))
+        );
     }
 
     #[test]

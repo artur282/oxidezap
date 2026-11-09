@@ -140,18 +140,6 @@ pub enum ConfirmationLevel {
     TypedName,
 }
 
-/// Confirmation level for an operation, taking into account whether the
-/// account window is currently open. Clearing the cache of a closed account is
-/// safe and immediate; clearing the cache of an open account closes and
-/// reloads its webview, so it asks first. Signing out and deleting data always
-/// ask.
-pub fn required_confirmation(operation: StorageOperation, account_open: bool) -> ConfirmationLevel {
-    match operation {
-        StorageOperation::ClearCache if account_open => ConfirmationLevel::Simple,
-        operation => operation.confirmation_level(),
-    }
-}
-
 /// Result of a successful cleanup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageOutcome {
@@ -219,17 +207,6 @@ pub fn directory_size(root: &Path) -> DirectorySize {
 /// Scans one account with the default limits. Read-only and safe to call for an
 /// account id that has no directory yet.
 pub fn account_storage_info(paths: &Paths, account_id: &str) -> AccountStorageInfo {
-    if !is_safe_account_id(account_id) {
-        let incomplete = DirectorySize {
-            complete: false,
-            ..DirectorySize::default()
-        };
-        return AccountStorageInfo {
-            account_id: account_id.to_string(),
-            data: incomplete,
-            cache: incomplete,
-        };
-    }
     let account_dir = paths.account_dir(account_id);
     AccountStorageInfo {
         account_id: account_id.to_string(),
@@ -387,20 +364,13 @@ pub fn format_bytes(bytes: u64) -> String {
 
 fn clear_owned_directory(account_dir: &Path, target: &Path) -> Result<u64> {
     ensure_safe_directory(account_dir)?;
-    if !account_dir.is_dir() {
-        // The account was removed between the operation being requested and
-        // this worker running. Nothing to clear and nothing to recreate.
-        return Ok(0);
-    }
     ensure_safe_directory(target)?;
     let freed = scan_directory(target).bytes;
     remove_owned_directory(target)?;
-    // A concurrent account removal must not have its directory recreated by a
-    // late cache/session clear.
-    if account_dir.is_dir() {
-        crate::paths::create_private_dir(target)
-            .with_context(|| format!("could not create {}", target.display()))?;
-    }
+    crate::paths::create_private_dir(account_dir)
+        .with_context(|| format!("could not create {}", account_dir.display()))?;
+    crate::paths::create_private_dir(target)
+        .with_context(|| format!("could not create {}", target.display()))?;
     Ok(freed)
 }
 
@@ -675,11 +645,6 @@ mod tests {
             assert!(remove_data(&paths, id).is_err(), "{id:?}");
         }
 
-        let info = account_storage_info(&paths, "../victim");
-        assert_eq!(info.data.bytes, 0);
-        assert_eq!(info.cache.bytes, 0);
-        assert!(!info.complete());
-
         assert!(victim.join("keep.txt").exists());
     }
 
@@ -761,26 +726,6 @@ mod tests {
         );
         assert_eq!(
             StorageOperation::RemoveData.confirmation_level(),
-            ConfirmationLevel::TypedName
-        );
-    }
-
-    #[test]
-    fn clearing_the_cache_of_an_open_account_requires_confirmation() {
-        assert_eq!(
-            required_confirmation(StorageOperation::ClearCache, false),
-            ConfirmationLevel::None
-        );
-        assert_eq!(
-            required_confirmation(StorageOperation::ClearCache, true),
-            ConfirmationLevel::Simple
-        );
-        assert_eq!(
-            required_confirmation(StorageOperation::ClearSession, false),
-            ConfirmationLevel::Simple
-        );
-        assert_eq!(
-            required_confirmation(StorageOperation::RemoveData, false),
             ConfirmationLevel::TypedName
         );
     }

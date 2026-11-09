@@ -171,10 +171,7 @@ impl InstanceMessage {
         if let Some(rest) = line.strip_prefix("chat ") {
             return Self::parse_chat(rest);
         }
-        if let Some(mode) = line
-            .strip_prefix("dnd ")
-            .and_then(|value| DndMode::parse(value))
-        {
+        if let Some(mode) = line.strip_prefix("dnd ").and_then(DndMode::parse) {
             return Some(Self::SetDoNotDisturb(mode));
         }
         None

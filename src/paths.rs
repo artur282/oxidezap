@@ -506,14 +506,18 @@ mod tests {
 
             assert_eq!(mode(&victim), 0o755);
             assert_eq!(mode(&victim_settings), 0o644);
-            assert!(fs::symlink_metadata(&config_link)
-                .unwrap()
-                .file_type()
-                .is_symlink());
-            assert!(fs::symlink_metadata(&account_link)
-                .unwrap()
-                .file_type()
-                .is_symlink());
+            assert!(
+                fs::symlink_metadata(&config_link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(
+                fs::symlink_metadata(&account_link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
         }
     }
 }

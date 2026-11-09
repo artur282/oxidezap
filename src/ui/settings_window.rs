@@ -13,14 +13,15 @@ use crate::assets::{ICON_BELL, ICON_GEAR, ICON_INFO, ICON_PALETTE, ICON_SHIELD, 
 use crate::lock::MIN_PASSWORD_LENGTH;
 use crate::settings::storage::{self, ConfirmationLevel, StorageOperation};
 use crate::settings::{
-    ImportPreview, MAX_ZOOM, MIN_ZOOM, Settings, SettingsExport, SpellCheckLanguage, ThemeMode,
-    export_file_name, json_path, write_settings_backup,
+    ImportPreview, MAX_ZOOM, MIN_ZOOM, ManualProxy, ProxyMode, ProxyProtocol, ProxySettings,
+    Settings, SettingsExport, SpellCheckLanguage, ThemeMode, export_file_name, json_path,
+    test_proxy_connection, write_settings_backup,
 };
 use crate::shortcut::Shortcut;
 use crate::theme::Theme;
 use crate::ui::components::{
-    app_icon, button, card, divider, handle_focus_traversal, labeled_field,
-    register_field_tab_stop, section_header, sidebar_item, toggle_row, TAB_INDEX,
+    TAB_INDEX, app_icon, button, card, divider, handle_focus_traversal, labeled_field,
+    register_field_tab_stop, section_header, sidebar_item, toggle_row,
 };
 use crate::ui::text_input::TextField;
 use crate::updates::UpdateState;
@@ -37,8 +38,7 @@ enum FileChooserMode {
 /// A storage operation waiting for the user to confirm it.
 #[derive(Clone)]
 enum StorageConfirm {
-    Simple {
-        operation: StorageOperation,
+    SignOut {
         account_id: String,
         account_name: String,
     },
@@ -52,7 +52,7 @@ enum StorageConfirm {
 impl StorageConfirm {
     fn account_id(&self) -> &str {
         match self {
-            StorageConfirm::Simple { account_id, .. } => account_id,
+            StorageConfirm::SignOut { account_id, .. } => account_id,
             StorageConfirm::DeleteData { account_id, .. } => account_id,
         }
     }
@@ -88,6 +88,7 @@ pub enum SettingsSection {
     Storage,
     Appearance,
     Notifications,
+    Network,
     General,
     Security,
     About,
@@ -100,6 +101,7 @@ impl SettingsSection {
             SettingsSection::Storage => "Storage",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Notifications => "Notifications",
+            SettingsSection::Network => "Network",
             SettingsSection::General => "General",
             SettingsSection::Security => "Security",
             SettingsSection::About => "About",
@@ -112,6 +114,7 @@ impl SettingsSection {
             SettingsSection::Storage => ICON_STORAGE,
             SettingsSection::Appearance => ICON_PALETTE,
             SettingsSection::Notifications => ICON_BELL,
+            SettingsSection::Network => ICON_INFO,
             SettingsSection::General => ICON_GEAR,
             SettingsSection::Security => ICON_SHIELD,
             SettingsSection::About => ICON_INFO,
@@ -128,10 +131,20 @@ pub struct SettingsWindow {
     password_field: Entity<TextField>,
     confirm_field: Entity<TextField>,
     shortcut_field: Entity<TextField>,
+    boss_key_field: Entity<TextField>,
     downloads_dir_field: Entity<TextField>,
+    downloads_error: Option<String>,
+    proxy_mode: ProxyMode,
+    proxy_protocol: ProxyProtocol,
+    proxy_host_field: Entity<TextField>,
+    proxy_port_field: Entity<TextField>,
+    proxy_username_field: Entity<TextField>,
+    proxy_password_field: Entity<TextField>,
+    proxy_feedback: Option<Notice>,
+    proxy_test_running: bool,
     security_error: Option<String>,
     shortcut_error: Option<String>,
-    downloads_error: Option<String>,
+    boss_key_error: Option<String>,
     remove_password_confirm: bool,
     pending_import: Option<ImportPreview>,
     reset_confirm: bool,
@@ -149,21 +162,47 @@ impl SettingsWindow {
         let password_field = cx.new(|cx| TextField::new("New password", cx).masked(true));
         let confirm_field = cx.new(|cx| TextField::new("Confirm password", cx).masked(true));
         let shortcut = model.read(cx).settings.shortcut.clone();
+        let boss_key = model.read(cx).settings.boss_key.clone();
         let shortcut_field = cx.new(|cx| TextField::new("Ctrl+Shift+W", cx).with_content(shortcut));
-        let downloads_dir = {
-            let model = model.read(cx);
-            model
-                .settings
-                .downloads_directory
-                .clone()
-                .unwrap_or_else(|| model.paths.downloads_dir.display().to_string())
-        };
+        let boss_key_field = cx.new(|cx| TextField::new("Ctrl+Shift+H", cx).with_content(boss_key));
+        let downloads_dir = model
+            .read(cx)
+            .settings
+            .downloads_directory
+            .clone()
+            .unwrap_or_else(|| model.read(cx).paths.downloads_dir.display().to_string());
         let downloads_dir_field =
             cx.new(|cx| TextField::new("Download folder", cx).with_content(downloads_dir));
+        let proxy = model.read(cx).settings.network.proxy.clone();
+        let proxy_mode = proxy.mode;
+        let proxy_protocol = proxy.manual.protocol;
+        let proxy_host_field = cx.new(|cx| {
+            TextField::new("proxy.example.com", cx).with_content(proxy.manual.host.clone())
+        });
+        let proxy_port_text = if proxy.manual.port == 0 {
+            String::new()
+        } else {
+            proxy.manual.port.to_string()
+        };
+        let proxy_port_field =
+            cx.new(|cx| TextField::new("8080", cx).with_content(proxy_port_text));
+        let proxy_username_field = cx.new(|cx| {
+            TextField::new("Optional username", cx).with_content(proxy.manual.username.clone())
+        });
+        let proxy_password_field = cx.new(|cx| {
+            TextField::new("Optional password", cx)
+                .masked(true)
+                .with_content(proxy.manual.password.clone())
+        });
         register_field_tab_stop(&password_field, cx);
         register_field_tab_stop(&confirm_field, cx);
         register_field_tab_stop(&shortcut_field, cx);
+        register_field_tab_stop(&boss_key_field, cx);
         register_field_tab_stop(&downloads_dir_field, cx);
+        register_field_tab_stop(&proxy_host_field, cx);
+        register_field_tab_stop(&proxy_port_field, cx);
+        register_field_tab_stop(&proxy_username_field, cx);
+        register_field_tab_stop(&proxy_password_field, cx);
         Self {
             model,
             section: SettingsSection::Accounts,
@@ -173,10 +212,20 @@ impl SettingsWindow {
             password_field,
             confirm_field,
             shortcut_field,
+            boss_key_field,
             downloads_dir_field,
+            downloads_error: None,
+            proxy_mode,
+            proxy_protocol,
+            proxy_host_field,
+            proxy_port_field,
+            proxy_username_field,
+            proxy_password_field,
+            proxy_feedback: None,
+            proxy_test_running: false,
             security_error: None,
             shortcut_error: None,
-            downloads_error: None,
+            boss_key_error: None,
             remove_password_confirm: false,
             pending_import: None,
             reset_confirm: false,
@@ -242,16 +291,12 @@ impl SettingsWindow {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let storage_running = self.model.read(cx).storage.running.clone();
         let mut list = div().flex().flex_col().gap(px(10.));
         for account in &settings.accounts {
             let id = account.id.clone();
             let name = account.name.clone();
             let initial = account.initial();
             let unread = account.unread;
-            let storage_busy = storage_running
-                .as_ref()
-                .is_some_and(|running| running.account_id == id);
 
             if let Some((renaming_id, field)) = &self.renaming {
                 if renaming_id == &id {
@@ -424,7 +469,7 @@ impl SettingsWindow {
                                         cx.notify();
                                     }),
                                 ))
-                                .when(settings.accounts.len() > 1 && !storage_busy, |style| {
+                                .when(settings.accounts.len() > 1, |style| {
                                     style.child(button(
                                         SharedString::from(format!("remove-{remove_id}")),
                                         "Remove",
@@ -478,18 +523,14 @@ impl SettingsWindow {
         operation: StorageOperation,
         cx: &mut Context<Self>,
     ) {
-        match storage::required_confirmation(
-            operation,
-            self.model.read(cx).is_account_window_open(account_id),
-        ) {
+        match operation.confirmation_level() {
             ConfirmationLevel::None => {
                 self.model.update(cx, |model, cx| {
                     model.start_storage_operation(account_id, operation, cx);
                 });
             }
             ConfirmationLevel::Simple => {
-                self.storage_confirm = Some(StorageConfirm::Simple {
-                    operation,
+                self.storage_confirm = Some(StorageConfirm::SignOut {
                     account_id: account_id.to_string(),
                     account_name: account_name.to_string(),
                 });
@@ -718,22 +759,20 @@ impl SettingsWindow {
                                 );
                             }),
                         ))
-                        .when(settings.accounts.len() > 1, |style| {
-                            style.child(button(
-                                SharedString::from(format!("storage-delete-{delete_id}")),
-                                "Delete account data",
-                                theme,
-                                false,
-                                cx.listener(move |this, _event, _window, cx| {
-                                    this.request_storage_action(
-                                        &delete_id,
-                                        &delete_name,
-                                        StorageOperation::RemoveData,
-                                        cx,
-                                    );
-                                }),
-                            ))
-                        }),
+                        .child(button(
+                            SharedString::from(format!("storage-delete-{delete_id}")),
+                            "Delete account data",
+                            theme,
+                            false,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.request_storage_action(
+                                    &delete_id,
+                                    &delete_name,
+                                    StorageOperation::RemoveData,
+                                    cx,
+                                );
+                            }),
+                        )),
                 );
             }
             accounts = accounts.child(entry);
@@ -775,63 +814,53 @@ impl SettingsWindow {
     ) -> AnyElement {
         let error = self.storage_confirm_error.clone();
         match confirm.clone() {
-            StorageConfirm::Simple {
-                operation,
+            StorageConfirm::SignOut {
                 account_id,
                 account_name,
             } => {
                 let confirm_id = account_id.clone();
                 let cancel_id = account_id.clone();
                 let name = account_name.clone();
-                let (title, description, action_label, id_prefix) = match operation {
-                    StorageOperation::ClearCache => (
-                        format!("Clear the cache for \"{name}\"?"),
-                        "The account window will close and reload. The WhatsApp session is kept.",
-                        "Clear cache",
-                        "storage-clear-cache",
-                    ),
-                    StorageOperation::ClearSession => (
-                        format!("Sign out of \"{name}\"?"),
-                        "The account and its settings are kept, but its WebKit data is deleted. WhatsApp Web will ask for the QR code again.",
-                        "Sign out",
-                        "storage-sign-out",
-                    ),
-                    StorageOperation::RemoveData => (
-                        format!("Delete the data for \"{name}\"?"),
-                        "This cannot be undone.",
-                        "Delete account data",
-                        "storage-delete",
-                    ),
-                };
                 card(theme)
                     .border_color(theme.danger)
-                    .child(div().text_size(px(12.)).text_color(theme.text).child(title))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.text)
+                            .child(format!("Sign out of \"{name}\"?")),
+                    )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_muted)
-                            .child(description),
+                            .child(
+                                "The account and its settings are kept, but its WebKit data is deleted. WhatsApp Web will ask for the QR code again.",
+                            ),
                     )
                     .child(
                         div()
                             .flex()
                             .gap(px(8.))
                             .child(button(
-                                SharedString::from(format!("{id_prefix}-yes-{confirm_id}")),
-                                action_label,
+                                SharedString::from(format!("storage-sign-out-yes-{confirm_id}")),
+                                "Sign out",
                                 theme,
                                 true,
                                 cx.listener(move |this, _event, _window, cx| {
                                     this.storage_confirm = None;
                                     this.storage_confirm_error = None;
                                     this.model.update(cx, |model, cx| {
-                                        model.start_storage_operation(&confirm_id, operation, cx);
+                                        model.start_storage_operation(
+                                            &confirm_id,
+                                            StorageOperation::ClearSession,
+                                            cx,
+                                        );
                                     });
                                     cx.notify();
                                 }),
                             ))
                             .child(button(
-                                SharedString::from(format!("{id_prefix}-no-{cancel_id}")),
+                                SharedString::from(format!("storage-sign-out-no-{cancel_id}")),
                                 "Cancel",
                                 theme,
                                 false,
@@ -1176,6 +1205,20 @@ impl SettingsWindow {
                     ))
                     .child(divider(theme))
                     .child(toggle_row(
+                        "connection-notifications",
+                        "Connection notifications",
+                        "Show a native notification when an account goes offline or reconnects.",
+                        settings.connection_notifications,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.connection_notifications =
+                                    !settings.connection_notifications;
+                            });
+                        }),
+                    ))
+                    .child(divider(theme))
+                    .child(toggle_row(
                         "do-not-disturb",
                         "Do not disturb",
                         "Pause message notifications and sounds from every account. Unread counts keep updating.",
@@ -1188,6 +1231,7 @@ impl SettingsWindow {
                         }),
                     )),
             )
+            .child(writing_card(settings, theme, cx))
             .child(
                 card(theme)
                     .child(
@@ -1207,6 +1251,7 @@ impl SettingsWindow {
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
                     .child("Muted accounts and Do not disturb have priority over per-account sounds.")
+                    .child("Connection notifications also follow Do not disturb and per-account mute.")
                     .child("Notifications are also suppressed while the app is locked.")
                     .child("Sound playback depends on the notification service and its sound theme; some servers ignore the requested sound or always use their own."),
             )
@@ -1369,13 +1414,6 @@ impl SettingsWindow {
 
     fn apply_pending_import(&mut self, cx: &mut Context<Self>) {
         if self.operation_running {
-            return;
-        }
-        if self.model.read(cx).storage.running.is_some() {
-            self.feedback = Some(Notice::error(
-                "Wait for the storage operation to finish before importing settings.",
-            ));
-            cx.notify();
             return;
         }
         let Some(preview) = self.pending_import.take() else {
@@ -1641,6 +1679,296 @@ impl SettingsWindow {
         card.into_any_element()
     }
 
+    fn collect_proxy(&self, cx: &App) -> Result<ProxySettings, String> {
+        let port_text = self.proxy_port_field.read(cx).content().trim().to_string();
+        let port = if self.proxy_mode == ProxyMode::Manual {
+            if port_text.is_empty() {
+                return Err("Enter the proxy port.".to_string());
+            }
+            port_text
+                .parse::<u16>()
+                .map_err(|_| "The proxy port must be a number between 1 and 65535.".to_string())?
+        } else {
+            port_text.parse().unwrap_or(ManualProxy::DEFAULT_PORT)
+        };
+        let proxy = ProxySettings {
+            mode: self.proxy_mode,
+            manual: ManualProxy {
+                protocol: self.proxy_protocol,
+                host: self.proxy_host_field.read(cx).content().trim().to_string(),
+                port,
+                username: self
+                    .proxy_username_field
+                    .read(cx)
+                    .content()
+                    .trim()
+                    .to_string(),
+                password: self.proxy_password_field.read(cx).content().to_string(),
+            },
+        };
+        proxy.validate()?;
+        Ok(proxy)
+    }
+
+    fn apply_network_proxy(&mut self, cx: &mut Context<Self>) {
+        match self.collect_proxy(cx) {
+            Ok(proxy) => {
+                self.model
+                    .update(cx, |model, cx| model.set_network_proxy(proxy, cx));
+                self.proxy_feedback = Some(Notice::success(
+                    "Proxy settings saved. Reopen an account if the new route does not take effect.",
+                ));
+            }
+            Err(error) => {
+                self.proxy_feedback = Some(Notice::error(error));
+            }
+        }
+        cx.notify();
+    }
+
+    fn start_proxy_test(&mut self, cx: &mut Context<Self>) {
+        if self.proxy_test_running {
+            return;
+        }
+        let proxy = match self.collect_proxy(cx) {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                self.proxy_feedback = Some(Notice::error(error));
+                cx.notify();
+                return;
+            }
+        };
+        self.proxy_test_running = true;
+        self.proxy_feedback = None;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { test_proxy_connection(&proxy) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.proxy_test_running = false;
+                this.proxy_feedback = Some(match result {
+                    Ok(message) => Notice::success(message),
+                    Err(error) => Notice::error(error),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn render_network(
+        &mut self,
+        settings: &Settings,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut mode_row = div().flex().gap(px(10.));
+        for mode in [ProxyMode::System, ProxyMode::NoProxy, ProxyMode::Manual] {
+            let selected = self.proxy_mode == mode;
+            let label = if selected {
+                format!("✓ {}", mode.label())
+            } else {
+                mode.label().to_string()
+            };
+            mode_row = mode_row.child(button(
+                SharedString::from(format!(
+                    "proxy-mode-{}",
+                    mode.label().to_lowercase().replace(' ', "-")
+                )),
+                label,
+                theme,
+                selected,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.proxy_mode = mode;
+                    this.proxy_feedback = None;
+                    cx.notify();
+                }),
+            ));
+        }
+
+        let mut mode_card = card(theme)
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child("Connection mode"),
+            )
+            .child(mode_row)
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(self.proxy_mode.description()),
+            );
+
+        if self.proxy_mode == ProxyMode::Manual {
+            let host_field = self.proxy_host_field.clone();
+            let port_field = self.proxy_port_field.clone();
+            let username_field = self.proxy_username_field.clone();
+            let password_field = self.proxy_password_field.clone();
+
+            let mut protocol_row = div().flex().gap(px(8.));
+            for protocol in [
+                ProxyProtocol::Http,
+                ProxyProtocol::Https,
+                ProxyProtocol::Socks,
+            ] {
+                let selected = self.proxy_protocol == protocol;
+                let label = if selected {
+                    format!("✓ {}", protocol.label())
+                } else {
+                    protocol.label().to_string()
+                };
+                protocol_row = protocol_row.child(button(
+                    SharedString::from(format!("proxy-protocol-{}", protocol.label())),
+                    label,
+                    theme,
+                    selected,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.proxy_protocol = protocol;
+                        this.proxy_feedback = None;
+                        cx.notify();
+                    }),
+                ));
+            }
+
+            mode_card = mode_card
+                .child(divider(theme))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted)
+                        .child("Proxy protocol"),
+                )
+                .child(protocol_row)
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(12.))
+                        .child(div().flex_1().child(labeled_field(
+                            "Host",
+                            None,
+                            theme,
+                            host_field,
+                        )))
+                        .child(div().w(px(120.)).child(labeled_field(
+                            "Port",
+                            None,
+                            theme,
+                            port_field,
+                        ))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(12.))
+                        .child(div().flex_1().child(labeled_field(
+                            "Username",
+                            Some(SharedString::from("Optional")),
+                            theme,
+                            username_field,
+                        )))
+                        .child(div().flex_1().child(labeled_field(
+                            "Password",
+                            Some(SharedString::from("Optional, stored as plain text")),
+                            theme,
+                            password_field,
+                        ))),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.danger)
+                        .child(
+                            "Proxy credentials are stored as plain text in settings.json. The file is private (0600) and credentials are never logged or written to exports, but this build does not use a system keyring. Prefer a proxy that does not require a password.",
+                        ),
+                );
+        }
+
+        let running = self.proxy_test_running;
+        mode_card = mode_card
+            .child(divider(theme))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(
+                        "The proxy is applied to each account's WebKit data manager when the account opens. Existing connections keep their route, so reopen an account if the change does not take effect.",
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child("Test connection checks web.whatsapp.com through the configured route without blocking the interface. HTTP and SOCKS5 proxies are tested end to end; an HTTPS proxy is checked for reachability before the TLS handshake."),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_muted)
+                    .child(format!(
+                        "Saved configuration: {}",
+                        settings.network.proxy.redacted_summary()
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(button(
+                        "proxy-test-connection",
+                        if running {
+                            "Testing\u{2026}"
+                        } else {
+                            "Test connection"
+                        },
+                        theme,
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.start_proxy_test(cx);
+                        }),
+                    ))
+                    .child(button(
+                        "proxy-apply",
+                        "Apply proxy settings",
+                        theme,
+                        true,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.apply_network_proxy(cx);
+                        }),
+                    )),
+            );
+
+        if let Some(notice) = self.proxy_feedback.clone() {
+            mode_card = mode_card.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(if notice.error {
+                        theme.danger
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(notice.text),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .child(section_header(
+                "Network",
+                "Choose how WhatsApp Web reaches the network. Changes apply per account and may require reopening an account.",
+                theme,
+            ))
+            .child(mode_card)
+            .into_any_element()
+    }
+
     fn render_general(
         &mut self,
         settings: &Settings,
@@ -1648,7 +1976,9 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let shortcut_field = self.shortcut_field.clone();
+        let boss_key_field = self.boss_key_field.clone();
         let error = self.shortcut_error.clone();
+        let boss_error = self.boss_key_error.clone();
         let downloads_dir_field = self.downloads_dir_field.clone();
         let downloads_error = self.downloads_error.clone();
         let backup_card = self.backup_card(theme, cx);
@@ -1703,7 +2033,6 @@ impl SettingsWindow {
                         }),
                     )),
             )
-            .child(writing_card(settings, theme, cx))
             .child(
                 card(theme)
                     .child(
@@ -1738,10 +2067,14 @@ impl SettingsWindow {
                             let value = this.shortcut_field.read(cx).content().to_string();
                             match Shortcut::parse(&value) {
                                 Ok(shortcut) => {
-                                    this.shortcut_error = None;
-                                    this.model.update(cx, |model, cx| {
-                                        model.set_shortcut(shortcut, cx);
+                                    let result = this.model.update(cx, |model, cx| {
+                                        model.set_shortcut(shortcut, cx)
                                     });
+                                    match result {
+                                        Ok(()) => this.shortcut_error = None,
+                                        Err(error) => this.shortcut_error = Some(error),
+                                    }
+                                    cx.notify();
                                 }
                                 Err(error) => {
                                     this.shortcut_error = Some(error.to_string());
@@ -1755,6 +2088,61 @@ impl SettingsWindow {
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
                             .child("Global shortcuts require an X11 or XWayland session."),
+                    )
+                    .child(divider(theme))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child("Boss key"),
+                    )
+                    .child(labeled_field(
+                        "Hide or restore every window",
+                        Some(SharedString::from(
+                            "A second global shortcut for instant privacy. A second press restores the windows that were visible.",
+                        )),
+                        theme,
+                        boss_key_field,
+                    ))
+                    .when_some(boss_error, |style, error| {
+                        style.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.danger)
+                                .child(error),
+                        )
+                    })
+                    .child(div().flex().gap(px(8.)).child(button(
+                        "apply-boss-key",
+                        "Apply boss key",
+                        theme,
+                        true,
+                        cx.listener(|this, _event, _window, cx| {
+                            let value = this.boss_key_field.read(cx).content().to_string();
+                            match Shortcut::parse(&value) {
+                                Ok(shortcut) => {
+                                    let result = this.model.update(cx, |model, cx| {
+                                        model.set_boss_key(shortcut, cx)
+                                    });
+                                    match result {
+                                        Ok(()) => this.boss_key_error = None,
+                                        Err(error) => this.boss_key_error = Some(error),
+                                    }
+                                    cx.notify();
+                                }
+                                Err(error) => {
+                                    this.boss_key_error = Some(error.to_string());
+                                    cx.notify();
+                                }
+                            }
+                        }),
+                    )))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child("The boss key uses the same X11/XWayland grab and can conflict with desktop shortcuts."),
                     ),
             )
             .child(
@@ -1919,6 +2307,32 @@ impl SettingsWindow {
                     }),
                 ))
                 .child(divider(theme))
+                .child(toggle_row(
+                    "lock-on-suspend",
+                    "Lock on system suspend",
+                    "Lock before sleeping and after waking, using the logind D-Bus signal when available.",
+                    settings.lock.lock_on_suspend,
+                    theme,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.model.update_settings(cx, |settings| {
+                            settings.lock.lock_on_suspend = !settings.lock.lock_on_suspend;
+                        });
+                    }),
+                ))
+                .child(divider(theme))
+                .child(toggle_row(
+                    "lock-on-screen-lock",
+                    "Lock when the desktop screen locks",
+                    "Best effort: depends on the desktop exposing a ScreenSaver D-Bus interface.",
+                    settings.lock.lock_on_screen_lock,
+                    theme,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.model.update_settings(cx, |settings| {
+                            settings.lock.lock_on_screen_lock = !settings.lock.lock_on_screen_lock;
+                        });
+                    }),
+                ))
+                .child(divider(theme))
                 .child(
                     div()
                         .flex()
@@ -1936,6 +2350,7 @@ impl SettingsWindow {
                                 .flex()
                                 .gap(px(6.))
                                 .child(idle_button(0, settings, theme, cx))
+                                .child(idle_button(1, settings, theme, cx))
                                 .child(idle_button(5, settings, theme, cx))
                                 .child(idle_button(15, settings, theme, cx))
                                 .child(idle_button(30, settings, theme, cx)),
@@ -2080,7 +2495,7 @@ impl SettingsWindow {
             .gap(px(18.))
             .child(section_header(
                 "Security",
-                "The app lock uses Argon2id. The password never leaves this device.",
+                "The app lock uses Argon2id. System suspend and screen-lock detection are best effort through D-Bus.",
                 theme,
             ))
             .child(security_card)
@@ -2393,15 +2808,16 @@ impl Focusable for SettingsWindow {
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle);
+        }
+
         // The theme is resolved from the window appearance on every render, so a
         // repaint is enough when the system appearance changes. Register once per
         // view; a recreated window gets a new view and a new subscription.
         if self.appearance_subscription.is_none() {
             self.appearance_subscription =
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
-        }
-        if window.focused(cx).is_none() {
-            window.focus(&self.focus_handle);
         }
 
         let (theme, settings, update) = {
@@ -2418,6 +2834,7 @@ impl Render for SettingsWindow {
             SettingsSection::Storage => self.render_storage(&settings, theme, cx),
             SettingsSection::Appearance => self.render_appearance(&settings, theme, cx),
             SettingsSection::Notifications => self.render_notifications(&settings, theme, cx),
+            SettingsSection::Network => self.render_network(&settings, theme, cx),
             SettingsSection::General => self.render_general(&settings, theme, cx),
             SettingsSection::Security => self.render_security(&settings, theme, cx),
             SettingsSection::About => self.render_about(&settings, &update, theme, cx),
@@ -2467,6 +2884,7 @@ impl Render for SettingsWindow {
             SettingsSection::Storage,
             SettingsSection::Appearance,
             SettingsSection::Notifications,
+            SettingsSection::Network,
             SettingsSection::General,
             SettingsSection::Security,
             SettingsSection::About,

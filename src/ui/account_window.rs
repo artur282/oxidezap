@@ -1,10 +1,11 @@
 use gpui::{
-    div, prelude::*, px, App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement,
-    MouseButton, Render, ResizeEdge, SharedString, Subscription, Window,
+    App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render,
+    ResizeEdge, SharedString, Subscription, Window, div, prelude::*, px, rgb,
 };
 
-use crate::app::AppModel;
+use crate::app::{AppModel, ConnectionState};
 use crate::assets::{ICON_GEAR, ICON_LOCK, ICON_MINUS, ICON_SQUARE, ICON_X};
+use crate::theme::Theme;
 use crate::ui::components::{
     app_icon, button, handle_focus_traversal, titlebar_button, unread_badge,
 };
@@ -60,6 +61,10 @@ impl Focusable for AccountWindow {
 
 impl Render for AccountWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle);
+        }
+
         // The theme is resolved from the window appearance on every render, so a
         // repaint is enough when the system appearance changes. Register once per
         // view; a recreated window gets a new view and a new subscription.
@@ -67,17 +72,15 @@ impl Render for AccountWindow {
             self.appearance_subscription =
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
         }
-        if window.focused(cx).is_none() {
-            window.focus(&self.focus_handle);
-        }
 
-        let (theme, name, unread, crash_failed) = {
+        let (theme, name, unread, crash_failed, connection) = {
             let model = self.model.read(cx);
             (
                 model.theme(window),
                 model.account_name(&self.account_id),
                 model.account_unread(&self.account_id),
                 model.account_crash_failed(&self.account_id),
+                model.account_connection(&self.account_id),
             )
         };
 
@@ -90,6 +93,20 @@ impl Render for AccountWindow {
             window.set_window_title(&title);
             self.last_title = title;
         }
+
+        let (connection_message, connection_hint) = match connection {
+            ConnectionState::Connecting | ConnectionState::Connected => {
+                ("Loading WhatsApp Web…", None)
+            }
+            ConnectionState::Offline => (
+                "WhatsApp Web is offline.",
+                Some("OxideZap will reconnect when the network returns."),
+            ),
+            ConnectionState::Reconnecting => (
+                "Reconnecting…",
+                Some("OxideZap is trying to recover the page."),
+            ),
+        };
 
         let drag_area = div()
             .id("account-drag-area")
@@ -134,6 +151,25 @@ impl Render for AccountWindow {
                     .border_b_1()
                     .border_color(theme.border)
                     .child(drag_area)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .h_full()
+                            .gap(px(4.))
+                            .child(connection_badge(connection, theme))
+                            .when(connection.retry_available(), |element| {
+                                element.child(button(
+                                    "account-connection-retry",
+                                    "Retry now",
+                                    theme,
+                                    false,
+                                    cx.listener(|this, _event, _window, cx| {
+                                        this.retry(cx);
+                                    }),
+                                ))
+                            }),
+                    )
                     .child(
                         div()
                             .flex()
@@ -207,12 +243,35 @@ impl Render for AccountWindow {
                             .gap(px(14.))
                             .child(app_icon(64.0))
                             .when(!crash_failed, |element| {
-                                element.child(
-                                    div()
-                                        .text_size(px(13.))
-                                        .text_color(theme.text_muted)
-                                        .child("Loading WhatsApp Web…"),
-                                )
+                                element
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(theme.text_muted)
+                                            .child(connection_message),
+                                    )
+                                    .when_some(connection_hint, |element, hint| {
+                                        element.child(
+                                            div()
+                                                .w(px(420.))
+                                                .text_center()
+                                                .text_size(px(12.))
+                                                .text_color(theme.text_faint)
+                                                .child(hint),
+                                        )
+                                    })
+                                    .when(connection.retry_available(), |element| {
+                                            element.child(button(
+                                                "account-connection-content-retry",
+                                                "Retry now",
+                                                theme,
+                                                true,
+                                                cx.listener(|this, _event, _window, cx| {
+                                                    this.retry(cx);
+                                                }),
+                                            ))
+                                        },
+                                    )
                             })
                             .when(crash_failed, |element| {
                                 element
@@ -314,6 +373,28 @@ impl Render for AccountWindow {
                 div().absolute().bottom(px(0.)).right(px(0.)).size(px(8.)),
             ))
     }
+}
+
+fn connection_badge(state: ConnectionState, theme: Theme) -> impl IntoElement {
+    let color = match state {
+        ConnectionState::Connecting => theme.text_muted,
+        ConnectionState::Connected => rgb(0x25d366),
+        ConnectionState::Offline => theme.danger,
+        ConnectionState::Reconnecting => rgb(0xf0b429),
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .h_full()
+        .px(px(8.))
+        .child(div().size(px(7.)).rounded_full().bg(color))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(theme.text_muted)
+                .child(state.label()),
+        )
 }
 
 fn resize_handle(

@@ -1,29 +1,32 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
+use anyhow::{Context, Result, anyhow};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use gtk::prelude::*;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use webkit2gtk::{
-    DownloadExt, NavigationPolicyDecision, NavigationPolicyDecisionExt, NotificationExt,
-    NotificationPermissionRequest, PermissionRequest, PermissionRequestExt, PolicyDecisionExt,
-    PolicyDecisionType, SettingsExt, URIRequestExt, URIResponseExt, UserMediaPermissionRequest,
-    UserMediaPermissionRequestExt, WebContextExt, WebProcessTerminationReason, WebViewExt,
+    DownloadExt, NavigationPolicyDecision, NavigationPolicyDecisionExt, NetworkError,
+    NetworkProxyMode, NetworkProxySettings, NotificationExt, NotificationPermissionRequest,
+    PermissionRequest, PermissionRequestExt, PolicyDecisionExt, PolicyDecisionType, PolicyError,
+    SettingsExt, URIRequestExt, URIResponseExt, UserContentInjectedFrames, UserContentManager,
+    UserContentManagerExt, UserMediaPermissionRequest, UserMediaPermissionRequestExt, UserScript,
+    UserScriptInjectionTime, WebContextExt, WebProcessTerminationReason, WebViewExt,
+    WebViewExtManual, WebsiteDataManagerExt,
 };
 
 use crate::app::downloads::{
-    discard_empty_reservation, sanitize_filename, DownloadLayout, DOWNLOAD_PROGRESS_INTERVAL,
+    DOWNLOAD_PROGRESS_INTERVAL, DownloadLayout, discard_empty_reservation, sanitize_filename,
 };
 use crate::links::{self, LinkAction};
 use crate::paths::Paths;
-use crate::settings::WritingSettings;
 use crate::settings::storage::{self, StorageOperation};
+use crate::settings::{ProxyMode, ProxySettings, WritingSettings};
 use crate::unread::parse_unread;
 use crate::x11::{Geometry, X11};
 
@@ -43,6 +46,21 @@ pub enum LoadState {
     Finished,
 }
 
+/// What the browser itself reports through `navigator.onLine`. This is only
+/// the primary signal; load failures and the native load timeout in the
+/// application layer are the fallback when the page cannot report at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    Online,
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionReport {
+    pub state: ConnectionState,
+    pub login_page: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum GtkEvent {
     Ready {
@@ -52,6 +70,18 @@ pub enum GtkEvent {
     LoadState {
         account_id: String,
         state: LoadState,
+    },
+    LoadFailed {
+        account_id: String,
+        uri: String,
+        message: String,
+    },
+    ConnectionState {
+        account_id: String,
+        report: ConnectionReport,
+    },
+    ReloadBlocked {
+        account_id: String,
     },
     Title {
         account_id: String,
@@ -128,6 +158,7 @@ pub enum GtkCommand {
         scale: f32,
         zoom: f64,
         writing: WritingSettings,
+        proxy: ProxySettings,
     },
     Show {
         account_id: String,
@@ -141,6 +172,9 @@ pub enum GtkCommand {
     },
     SetWriting {
         writing: WritingSettings,
+    },
+    SetProxy {
+        proxy: ProxySettings,
     },
     SetDownloadLayout(DownloadLayout),
     CancelDownload {
@@ -206,6 +240,10 @@ impl GtkHandle {
 
     pub fn set_writing(&self, writing: WritingSettings) {
         self.send(GtkCommand::SetWriting { writing });
+    }
+
+    pub fn set_proxy(&self, proxy: ProxySettings) {
+        self.send(GtkCommand::SetProxy { proxy });
     }
 
     pub fn set_download_layout(&self, layout: DownloadLayout) {
@@ -296,6 +334,7 @@ pub fn spawn(
                 entries: HashMap::new(),
                 x11,
                 paste: paste.clone(),
+                proxy: ProxySettings::default(),
             }));
 
             let command_state = state.clone();
@@ -345,6 +384,9 @@ struct GtkState {
     entries: HashMap<String, WebEntry>,
     x11: X11,
     paste: Rc<RefCell<PasteQueue>>,
+    /// Proxy settings already applied to every open account. Reapplying them
+    /// on unrelated settings changes would reset live connections.
+    proxy: ProxySettings,
 }
 
 struct WebEntry {
@@ -359,6 +401,10 @@ struct WebEntry {
     zoom: f64,
     transient_for: Option<u32>,
     last_geometry: Option<(i32, i32, u32, u32)>,
+    /// Number of downloads that have started but not finished. Reloading the
+    /// page while a download is streaming would cancel it, so the command
+    /// handler refuses to do that.
+    downloads: Rc<Cell<u32>>,
 }
 
 impl WebEntry {
@@ -397,6 +443,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
             scale,
             zoom,
             writing,
+            proxy,
         } => {
             match create_entry(
                 &account_id,
@@ -408,6 +455,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 scale,
                 zoom,
                 &writing,
+                &proxy,
                 state.events.clone(),
                 state.download_layout.clone(),
                 state.downloads.clone(),
@@ -424,6 +472,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                     }
                     let xid = entry.xid;
                     state.entries.insert(account_id.clone(), entry);
+                    state.proxy = proxy;
                     let _ = state.events.send(GtkEvent::Ready { account_id, xid });
                 }
                 Err(error) => {
@@ -459,6 +508,17 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                     apply_spell_checking(&context, &writing);
                 }
             }
+        }
+        GtkCommand::SetProxy { proxy } => {
+            if state.proxy == proxy {
+                return;
+            }
+            for entry in state.entries.values() {
+                if let Some(manager) = entry.webview.website_data_manager() {
+                    apply_proxy(&manager, &proxy);
+                }
+            }
+            state.proxy = proxy;
         }
         GtkCommand::SetDownloadLayout(layout) => {
             *state.download_layout.borrow_mut() = layout;
@@ -508,7 +568,15 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
         }
         GtkCommand::Reload { account_id } => {
             if let Some(entry) = state.entries.get(&account_id) {
-                entry.webview.reload();
+                if entry.downloads.get() > 0 {
+                    warn!(
+                        %account_id,
+                        "skipped a WhatsApp Web reload while a download is active"
+                    );
+                    let _ = state.events.send(GtkEvent::ReloadBlocked { account_id });
+                } else {
+                    entry.webview.reload();
+                }
             }
         }
         GtkCommand::ClearStorage {
@@ -578,9 +646,10 @@ fn create_entry(
     scale: f32,
     zoom: f64,
     writing: &WritingSettings,
+    proxy: &ProxySettings,
     events: Sender<GtkEvent>,
     download_layout: Rc<RefCell<DownloadLayout>>,
-    downloads: Rc<RefCell<HashMap<String, webkit2gtk::Download>>>,
+    download_registry: Rc<RefCell<HashMap<String, webkit2gtk::Download>>>,
     cancelled_downloads: Rc<RefCell<HashSet<String>>>,
     notifications_enabled: bool,
     paste: Rc<RefCell<PasteQueue>>,
@@ -604,9 +673,13 @@ fn create_entry(
         .base_data_directory(data_dir.to_string_lossy().as_ref())
         .base_cache_directory(cache_dir.to_string_lossy().as_ref())
         .build();
+    apply_proxy(&manager, proxy);
     let context = webkit2gtk::WebContext::with_website_data_manager(&manager);
     apply_spell_checking(&context, writing);
-    let webview = webkit2gtk::WebView::with_context(&context);
+    let user_content = UserContentManager::new();
+    connect_connection_script(&user_content, account_id, events.clone());
+    let webview =
+        webkit2gtk::WebView::new_with_context_and_user_content_manager(&context, &user_content);
     webview.set_hexpand(true);
     webview.set_vexpand(true);
     if let Some(settings) = WebViewExt::settings(&webview) {
@@ -627,13 +700,15 @@ fn create_entry(
         notifications_enabled,
         window.clone(),
     );
+    let downloads = Rc::new(Cell::new(0));
     connect_downloads(
         &context,
         account_id,
         events,
         download_layout,
-        downloads,
+        download_registry,
         cancelled_downloads,
+        downloads.clone(),
     );
     let paste_account = account_id.to_string();
     webview.connect_key_press_event(move |_webview, event| {
@@ -671,7 +746,147 @@ fn create_entry(
         zoom,
         transient_for: None,
         last_geometry: None,
+        downloads,
     })
+}
+
+const CONNECTION_MESSAGE_HANDLER: &str = "oxidezapConnection";
+
+/// Reports the browser's online state and whether the QR login screen is
+/// showing. User scripts are injected by WebKit itself, so the page CSP does
+/// not block them. The script deliberately reads only `navigator.onLine` and
+/// a short list of known QR containers; it does not inspect chat content.
+const CONNECTION_SCRIPT: &str = r#"
+(function () {
+  if (location.hostname !== "web.whatsapp.com") return;
+  if (window.__oxidezapConnection) return;
+  window.__oxidezapConnection = true;
+
+  var qrSelectors = [
+    '[data-testid="qrcode"]',
+    'canvas[aria-label*="QR"]',
+    'canvas[aria-label*="Scan"]',
+    '[aria-label*="Scan this QR"]',
+    'div[data-ref] canvas'
+  ];
+
+  function loginPage() {
+    for (var i = 0; i < qrSelectors.length; i++) {
+      if (document.querySelector(qrSelectors[i])) return true;
+    }
+    return false;
+  }
+
+  var last = "";
+  function report() {
+    var online = navigator.onLine === false ? "0" : "1";
+    var login = loginPage() ? "1" : "0";
+    var payload = "online=" + online + "&login=" + login;
+    if (payload === last) return;
+    last = payload;
+    try {
+      window.webkit.messageHandlers.oxidezapConnection.postMessage(payload);
+    } catch (error) {
+      last = "";
+    }
+  }
+
+  window.addEventListener("online", report);
+  window.addEventListener("offline", report);
+  setInterval(report, 2000);
+  report();
+})();
+"#;
+
+fn connect_connection_script(
+    manager: &UserContentManager,
+    account_id: &str,
+    events: Sender<GtkEvent>,
+) {
+    if !manager.register_script_message_handler(CONNECTION_MESSAGE_HANDLER) {
+        warn!(account_id = %account_id, "could not register the connection message handler");
+        return;
+    }
+    manager.add_script(&UserScript::new(
+        CONNECTION_SCRIPT,
+        UserContentInjectedFrames::TopFrame,
+        UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    ));
+
+    let script_account = account_id.to_string();
+    manager.connect_script_message_received(
+        Some(CONNECTION_MESSAGE_HANDLER),
+        move |_manager, result| {
+            let Some(value) = result.js_value() else {
+                return;
+            };
+            let message = value.to_string();
+            let Some(report) = parse_connection_report(&message) else {
+                debug!(
+                    account_id = %script_account,
+                    %message,
+                    "ignored an unknown connection report"
+                );
+                return;
+            };
+            let _ = events.send(GtkEvent::ConnectionState {
+                account_id: script_account.clone(),
+                report,
+            });
+        },
+    );
+}
+
+fn parse_connection_report(message: &str) -> Option<ConnectionReport> {
+    let mut state = None;
+    let mut login_page = None;
+    for part in message.split('&') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match (key, value) {
+            ("online", "0") => state = Some(ConnectionState::Offline),
+            ("online", "1") => state = Some(ConnectionState::Online),
+            ("login", "0") => login_page = Some(false),
+            ("login", "1") => login_page = Some(true),
+            _ => {}
+        }
+    }
+    Some(ConnectionReport {
+        state: state?,
+        login_page: login_page?,
+    })
+}
+
+/// Applies the proxy configuration to a per-account WebKit data manager.
+///
+/// WebKitGTK 2.0.2 exposes this on `WebsiteDataManager` since 2.32
+/// (`webkit_website_data_manager_set_network_proxy_settings`); the older
+/// `WebContext` method is deprecated. A custom proxy URI is only passed for
+/// manual mode, and the URI may contain credentials, so only the redacted
+/// summary is ever logged.
+fn apply_proxy(manager: &webkit2gtk::WebsiteDataManager, proxy: &ProxySettings) {
+    match proxy.uri() {
+        Ok(Some(uri)) => {
+            let mut settings = NetworkProxySettings::new(Some(&uri), &[]);
+            manager.set_network_proxy_settings(NetworkProxyMode::Custom, Some(&mut settings));
+            info!(proxy = %proxy.redacted_summary(), "applied the network proxy");
+        }
+        Ok(None) => {
+            let mode = match proxy.mode {
+                ProxyMode::System | ProxyMode::Manual => NetworkProxyMode::Default,
+                ProxyMode::NoProxy => NetworkProxyMode::NoProxy,
+            };
+            manager.set_network_proxy_settings(mode, None);
+            info!(proxy = %proxy.redacted_summary(), "applied the network proxy");
+        }
+        Err(error) => {
+            warn!(%error, "the manual proxy configuration is invalid; using the system proxy");
+            manager.set_network_proxy_settings(NetworkProxyMode::Default, None);
+        }
+    }
 }
 
 /// Applies the composer writing preferences to a WebKit context.
@@ -717,6 +932,32 @@ fn connect_webview_signals(
             account_id: load_account.clone(),
             state,
         });
+    });
+
+    let failure_account = account_id.to_string();
+    let failure_events = events.clone();
+    webview.connect_load_failed(move |_webview, _event, uri, error| {
+        // Ignoring a navigation in `decide-policy` and replacing an in-flight
+        // load are not connection failures.
+        if error.matches(NetworkError::Cancelled)
+            || error.matches(PolicyError::FrameLoadInterruptedByPolicyChange)
+        {
+            return false;
+        }
+        let uri = uri.to_string();
+        let message = error.message().to_string();
+        warn!(
+            account_id = %failure_account,
+            %uri,
+            %message,
+            "WhatsApp Web load failed"
+        );
+        let _ = failure_events.send(GtkEvent::LoadFailed {
+            account_id: failure_account.clone(),
+            uri,
+            message,
+        });
+        false
     });
 
     let title_account = account_id.to_string();
@@ -989,6 +1230,7 @@ fn connect_downloads(
     layout: Rc<RefCell<DownloadLayout>>,
     downloads: Rc<RefCell<HashMap<String, webkit2gtk::Download>>>,
     cancelled_downloads: Rc<RefCell<HashSet<String>>>,
+    active_downloads: Rc<Cell<u32>>,
 ) {
     let download_account = account_id.to_string();
     context.connect_download_started(move |_context, download| {
@@ -997,6 +1239,8 @@ fn connect_downloads(
         let layout = layout.clone();
         let downloads = downloads.clone();
         let cancelled_downloads = cancelled_downloads.clone();
+        active_downloads.set(active_downloads.get().saturating_add(1));
+        let released = Rc::new(Cell::new(false));
         // One id identifies the download across every event. The GTK object is
         // retained as soon as it is announced, so a `download_uri` retry whose
         // return value is dropped cannot cancel itself.
@@ -1030,7 +1274,12 @@ fn connect_downloads(
         let finished_events = events.clone();
         let finished_downloads = downloads.clone();
         let finished_cancelled = cancelled_downloads.clone();
+        let finished_active = active_downloads.clone();
+        let finished_released = released.clone();
         download.connect_finished(move |download| {
+            if !finished_released.replace(true) {
+                finished_active.set(finished_active.get().saturating_sub(1));
+            }
             let received = download.received_data_length();
             let total = download
                 .response()
@@ -1055,7 +1304,12 @@ fn connect_downloads(
         let failed_downloads = downloads.clone();
         let failed_cancelled = cancelled_downloads.clone();
         let failed_path = reserved_path.clone();
+        let failed_active = active_downloads.clone();
+        let failed_released = released.clone();
         download.connect_failed(move |_download, error| {
+            if !failed_released.replace(true) {
+                failed_active.set(failed_active.get().saturating_sub(1));
+            }
             let cancelled = failed_cancelled.borrow_mut().remove(&failed_id);
             failed_downloads.borrow_mut().remove(&failed_id);
             if let Some(path) = failed_path.borrow_mut().take() {
@@ -1806,6 +2060,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_browser_connection_reports() {
+        assert_eq!(
+            parse_connection_report("online=1&login=0"),
+            Some(ConnectionReport {
+                state: ConnectionState::Online,
+                login_page: false,
+            })
+        );
+        assert_eq!(
+            parse_connection_report("online=0&login=1"),
+            Some(ConnectionReport {
+                state: ConnectionState::Offline,
+                login_page: true,
+            })
+        );
+        assert_eq!(
+            parse_connection_report("login=1&online=1"),
+            Some(ConnectionReport {
+                state: ConnectionState::Online,
+                login_page: true,
+            })
+        );
+        assert_eq!(parse_connection_report("online=1"), None);
+        assert_eq!(parse_connection_report("login=0"), None);
+        assert_eq!(parse_connection_report("online=2&login=0"), None);
+        assert_eq!(parse_connection_report(""), None);
+    }
+
+    #[test]
+    fn sanitizes_download_names() {
+        assert_eq!(sanitize_filename("photo.jpg"), "photo.jpg");
+        assert_eq!(sanitize_filename("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_filename(""), "download");
+    }
+
+    #[test]
     fn base64_chunks_round_trip() {
         let bytes = vec![0x5a; PASTE_CHUNK_BYTES + 5];
         let chunks = base64_chunks(&bytes);
@@ -1815,147 +2105,6 @@ mod tests {
             .flat_map(|chunk| glib::base64_decode(chunk))
             .collect();
         assert_eq!(decoded, bytes);
-    }
-
-    #[test]
-    fn reserves_an_empty_download_file() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let path = reserve_download_path(dir.path(), "file.txt").unwrap();
-
-        assert_eq!(path, dir.path().join("file.txt"));
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-    }
-
-    #[test]
-    fn download_reservations_do_not_overwrite_existing_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("file.txt"), b"keep").unwrap();
-
-        let first = reserve_download_path(dir.path(), "file.txt").unwrap();
-        let second = reserve_download_path(dir.path(), "file.txt").unwrap();
-
-        assert_eq!(first, dir.path().join("file (1).txt"));
-        assert_eq!(second, dir.path().join("file (2).txt"));
-        assert_eq!(std::fs::read(dir.path().join("file.txt")).unwrap(), b"keep");
-    }
-
-    #[test]
-    fn concurrent_download_reservations_get_distinct_paths() {
-        const DOWNLOADS: usize = 8;
-        let dir = tempfile::tempdir().unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(DOWNLOADS));
-        let handles: Vec<_> = (0..DOWNLOADS)
-            .map(|_| {
-                let dir = dir.path().to_path_buf();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    reserve_download_path(&dir, "file.txt").unwrap()
-                })
-            })
-            .collect();
-        let mut paths: Vec<PathBuf> = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect();
-        paths.sort();
-        paths.dedup();
-
-        assert_eq!(paths.len(), DOWNLOADS);
-        for path in paths {
-            assert!(path.exists(), "{} was not reserved", path.display());
-            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-        }
-    }
-
-    #[test]
-    fn failed_download_removes_the_empty_reservation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = reserve_download_path(dir.path(), "file.txt").unwrap();
-
-        discard_empty_reservation(&path);
-
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn failed_download_keeps_partially_written_data() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = reserve_download_path(dir.path(), "file.txt").unwrap();
-        std::fs::write(&path, b"partial").unwrap();
-
-        discard_empty_reservation(&path);
-
-        assert_eq!(std::fs::read(&path).unwrap(), b"partial");
-    }
-
-    #[test]
-    fn only_whatsapp_origins_may_request_permissions() {
-        assert_eq!(
-            permission_action(
-                Some("https://web.whatsapp.com/"),
-                PermissionKind::UserMedia,
-                true
-            ),
-            PermissionAction::Prompt
-        );
-        assert_eq!(
-            permission_action(
-                Some("https://web.whatsapp.com/"),
-                PermissionKind::Notifications,
-                true
-            ),
-            PermissionAction::Allow
-        );
-        assert_eq!(
-            permission_action(
-                Some("https://web.whatsapp.com/"),
-                PermissionKind::Notifications,
-                false
-            ),
-            PermissionAction::Deny
-        );
-        assert_eq!(
-            permission_action(
-                Some("https://example.com/"),
-                PermissionKind::UserMedia,
-                true
-            ),
-            PermissionAction::Deny
-        );
-        assert_eq!(
-            permission_action(
-                Some("https://web.whatsapp.com.evil.test/"),
-                PermissionKind::Notifications,
-                true
-            ),
-            PermissionAction::Deny
-        );
-        assert_eq!(
-            permission_action(None, PermissionKind::UserMedia, true),
-            PermissionAction::Deny
-        );
-    }
-
-    #[test]
-    fn unrelated_permissions_are_denied_even_on_whatsapp() {
-        assert_eq!(
-            permission_action(
-                Some("https://web.whatsapp.com/"),
-                PermissionKind::Other,
-                true
-            ),
-            PermissionAction::Deny
-        );
-        assert_eq!(
-            permission_action(
-                Some("https://flows.whatsapp.net/flows/cache_management/"),
-                PermissionKind::Other,
-                true
-            ),
-            PermissionAction::Deny
-        );
     }
 
     #[test]
@@ -2099,5 +2248,73 @@ mod tests {
         };
 
         assert_eq!(overlay_target(&geometry, 0, 0, 1.0), None);
+    }
+
+    #[test]
+    fn only_whatsapp_origins_may_request_permissions() {
+        assert_eq!(
+            permission_action(
+                Some("https://web.whatsapp.com/"),
+                PermissionKind::UserMedia,
+                true
+            ),
+            PermissionAction::Prompt
+        );
+        assert_eq!(
+            permission_action(
+                Some("https://web.whatsapp.com/"),
+                PermissionKind::Notifications,
+                true
+            ),
+            PermissionAction::Allow
+        );
+        assert_eq!(
+            permission_action(
+                Some("https://web.whatsapp.com/"),
+                PermissionKind::Notifications,
+                false
+            ),
+            PermissionAction::Deny
+        );
+        assert_eq!(
+            permission_action(
+                Some("https://example.com/"),
+                PermissionKind::UserMedia,
+                true
+            ),
+            PermissionAction::Deny
+        );
+        assert_eq!(
+            permission_action(
+                Some("https://web.whatsapp.com.evil.test/"),
+                PermissionKind::Notifications,
+                true
+            ),
+            PermissionAction::Deny
+        );
+        assert_eq!(
+            permission_action(None, PermissionKind::UserMedia, true),
+            PermissionAction::Deny
+        );
+    }
+
+    #[test]
+    fn unrelated_permissions_are_denied_even_on_whatsapp() {
+        assert_eq!(
+            permission_action(
+                Some("https://web.whatsapp.com/"),
+                PermissionKind::Other,
+                true
+            ),
+            PermissionAction::Deny
+        );
+        assert_eq!(
+            permission_action(
+                Some("https://flows.whatsapp.net/flows/cache_management/"),
+                PermissionKind::Other,
+                true
+            ),
+            PermissionAction::Deny
+        );
     }
 }

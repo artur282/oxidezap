@@ -1,5 +1,5 @@
 use gpui::{
-    div, prelude::*, px, App, Context, Entity, FocusHandle, Focusable, Render, Subscription, Window,
+    App, Context, Entity, FocusHandle, Focusable, Render, Subscription, Window, div, prelude::*, px,
 };
 
 use crate::app::AppModel;
@@ -75,15 +75,16 @@ impl Focusable for LockWindow {
 
 impl Render for LockWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle);
+        }
+
         // The theme is resolved from the window appearance on every render, so a
         // repaint is enough when the system appearance changes. Register once per
         // view; a recreated window gets a new view and a new subscription.
         if self.appearance_subscription.is_none() {
             self.appearance_subscription =
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
-        }
-        if window.focused(cx).is_none() {
-            window.focus(&self.focus_handle);
         }
 
         let theme = self.model.read(cx).theme(window);
@@ -135,7 +136,7 @@ impl Render for LockWindow {
                                 div()
                                     .text_size(px(12.))
                                     .text_color(theme.text_muted)
-                                    .child("Enter your password to return to WhatsApp."),
+                                    .child("Enter your password to return to WhatsApp. Account windows stay hidden until you unlock."),
                             ),
                     )
                     .child(

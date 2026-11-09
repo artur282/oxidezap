@@ -57,3 +57,12 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Fast release validation for CI. Distributable releases keep the full
+# `release` profile above; this profile only proves that the optimized code
+# links without paying for thin LTO on every pull request.
+[profile.ci-release]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
