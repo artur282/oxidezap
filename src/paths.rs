@@ -53,6 +53,24 @@ pub fn restrict_directory(path: &Path) -> Result<()> {
     }
 }
 
+/// Validates a user-supplied absolute directory setting. Relative paths and
+/// paths that exist but are not directories are rejected instead of being
+/// silently reinterpreted against the current working directory.
+pub fn valid_directory_setting(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return None;
+    }
+    if path.exists() && !path.is_dir() {
+        return None;
+    }
+    Some(path)
+}
+
 /// Write a file that must remain private. On Unix the file is created with
 /// `0600`, an existing file is corrected to `0600`, and `O_NOFOLLOW` prevents
 /// writing through a symlink.
@@ -294,6 +312,12 @@ impl Paths {
         self.cache_dir.join("update-check.json")
     }
 
+    /// Bounded download history, stored next to the settings file so it is
+    /// private and easy to back up independently from account data.
+    pub fn downloads_index_file(&self) -> PathBuf {
+        self.config_dir.join("downloads.json")
+    }
+
     pub fn write_runtime_assets(&self) -> Result<()> {
         let icon = self.runtime_icon();
         if !icon.exists() {
@@ -358,6 +382,24 @@ mod tests {
         assert_eq!(
             paths.update_cache_file(),
             PathBuf::from("/tmp/cache/update-check.json")
+        );
+    }
+
+    #[test]
+    fn download_history_lives_in_the_config_directory() {
+        let paths = Paths {
+            config_dir: PathBuf::from("/tmp/config"),
+            data_dir: PathBuf::from("/tmp/data"),
+            cache_dir: PathBuf::from("/tmp/cache"),
+            downloads_dir: PathBuf::from("/tmp/downloads"),
+            settings_file: PathBuf::from("/tmp/config/settings.json"),
+            accounts_dir: PathBuf::from("/tmp/data/accounts"),
+            socket_file: PathBuf::from("/tmp/run/oxidezap.sock"),
+            lock_file: PathBuf::from("/tmp/run/oxidezap.lock"),
+        };
+        assert_eq!(
+            paths.downloads_index_file(),
+            PathBuf::from("/tmp/config/downloads.json")
         );
     }
 

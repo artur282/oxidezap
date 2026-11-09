@@ -42,6 +42,7 @@ pub enum TrayAction {
     ShowHide,
     OpenAccount(String),
     AddAccount,
+    Downloads,
     Settings,
     Lock,
     Quit,
@@ -200,6 +201,17 @@ impl ksni::Tray for OxideTray {
                 icon_name: "list-add".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.try_send(TrayAction::AddAccount);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Downloads…".to_string(),
+                icon_name: "folder-download".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.try_send(TrayAction::Downloads);
                 }),
                 ..Default::default()
             }

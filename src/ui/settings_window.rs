@@ -7,6 +7,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Subscription, Timer, Window, div, prelude::*, px,
 };
 
+use crate::app::downloads::{DOWNLOAD_HISTORY_LIMIT, valid_base_dir};
 use crate::app::{AppModel, AppModelEntityExt};
 use crate::assets::{ICON_BELL, ICON_GEAR, ICON_INFO, ICON_PALETTE, ICON_SHIELD, ICON_USER};
 use crate::lock::MIN_PASSWORD_LENGTH;
@@ -29,6 +30,7 @@ use gtk::prelude::{FileChooserExt, NativeDialogExt};
 enum FileChooserMode {
     Open,
     Save,
+    Folder,
 }
 
 #[derive(Clone, Debug)]
@@ -96,8 +98,10 @@ pub struct SettingsWindow {
     password_field: Entity<TextField>,
     confirm_field: Entity<TextField>,
     shortcut_field: Entity<TextField>,
+    downloads_dir_field: Entity<TextField>,
     security_error: Option<String>,
     shortcut_error: Option<String>,
+    downloads_error: Option<String>,
     remove_password_confirm: bool,
     pending_import: Option<ImportPreview>,
     reset_confirm: bool,
@@ -114,9 +118,20 @@ impl SettingsWindow {
         let confirm_field = cx.new(|cx| TextField::new("Confirm password", cx).masked(true));
         let shortcut = model.read(cx).settings.shortcut.clone();
         let shortcut_field = cx.new(|cx| TextField::new("Ctrl+Shift+W", cx).with_content(shortcut));
+        let downloads_dir = {
+            let model = model.read(cx);
+            model
+                .settings
+                .downloads_directory
+                .clone()
+                .unwrap_or_else(|| model.paths.downloads_dir.display().to_string())
+        };
+        let downloads_dir_field =
+            cx.new(|cx| TextField::new("Download folder", cx).with_content(downloads_dir));
         register_field_tab_stop(&password_field, cx);
         register_field_tab_stop(&confirm_field, cx);
         register_field_tab_stop(&shortcut_field, cx);
+        register_field_tab_stop(&downloads_dir_field, cx);
         Self {
             model,
             section: SettingsSection::Accounts,
@@ -126,8 +141,10 @@ impl SettingsWindow {
             password_field,
             confirm_field,
             shortcut_field,
+            downloads_dir_field,
             security_error: None,
             shortcut_error: None,
+            downloads_error: None,
             remove_password_confirm: false,
             pending_import: None,
             reset_confirm: false,
@@ -781,6 +798,67 @@ impl SettingsWindow {
         .detach();
     }
 
+    fn apply_downloads_directory(&mut self, cx: &mut Context<Self>) {
+        let default_dir = self.model.read(cx).paths.downloads_dir.clone();
+        let value = self
+            .downloads_dir_field
+            .read(cx)
+            .content()
+            .trim()
+            .to_string();
+        let Some(path) = valid_base_dir(&value) else {
+            self.downloads_error =
+                Some("Enter an absolute folder path, or use the default.".to_string());
+            cx.notify();
+            return;
+        };
+        let configured = (path != default_dir).then(|| path.display().to_string());
+        self.downloads_error = None;
+        self.downloads_dir_field.update(cx, |field, cx| {
+            field.set_content(path.display().to_string(), cx)
+        });
+        self.model.update_settings(cx, |settings| {
+            settings.downloads_directory = configured;
+        });
+        cx.notify();
+    }
+
+    fn use_default_downloads_directory(&mut self, cx: &mut Context<Self>) {
+        let default_dir = self.model.read(cx).paths.downloads_dir.clone();
+        self.downloads_error = None;
+        self.downloads_dir_field.update(cx, |field, cx| {
+            field.set_content(default_dir.display().to_string(), cx);
+        });
+        self.model.update_settings(cx, |settings| {
+            settings.downloads_directory = None;
+        });
+        cx.notify();
+    }
+
+    fn start_choose_downloads_directory(&mut self, cx: &mut Context<Self>) {
+        if self.file_dialog_open || self.operation_running {
+            return;
+        }
+        self.file_dialog_open = true;
+        let (sender, receiver) = bounded(1);
+        request_file_chooser(FileChooserMode::Folder, String::new(), sender);
+        cx.spawn(async move |this, cx| {
+            let chosen = wait_for_file_choice(receiver).await;
+            this.update(cx, |this, cx| {
+                this.file_dialog_open = false;
+                if let Some(path) = chosen {
+                    this.downloads_dir_field.update(cx, |field, cx| {
+                        field.set_content(path.display().to_string(), cx);
+                    });
+                    this.apply_downloads_directory(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn apply_pending_import(&mut self, cx: &mut Context<Self>) {
         if self.operation_running {
             return;
@@ -1056,6 +1134,8 @@ impl SettingsWindow {
     ) -> AnyElement {
         let shortcut_field = self.shortcut_field.clone();
         let error = self.shortcut_error.clone();
+        let downloads_dir_field = self.downloads_dir_field.clone();
+        let downloads_error = self.downloads_error.clone();
         let backup_card = self.backup_card(theme, cx);
 
         div()
@@ -1160,6 +1240,112 @@ impl SettingsWindow {
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
                             .child("Global shortcuts require an X11 or XWayland session."),
+                    ),
+            )
+            .child(
+                card(theme)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child("Downloads"),
+                    )
+                    .child(labeled_field(
+                        "Download folder",
+                        Some(SharedString::from(
+                            "Leave the default to follow the desktop Downloads directory.",
+                        )),
+                        theme,
+                        downloads_dir_field,
+                    ))
+                    .when_some(downloads_error, |style, error| {
+                        style.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.danger)
+                                .child(error),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .child(button(
+                                "choose-downloads-directory",
+                                "Choose…",
+                                theme,
+                                false,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.start_choose_downloads_directory(cx);
+                                }),
+                            ))
+                            .child(button(
+                                "apply-downloads-directory",
+                                "Apply folder",
+                                theme,
+                                true,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.apply_downloads_directory(cx);
+                                }),
+                            ))
+                            .child(button(
+                                "default-downloads-directory",
+                                "Use default",
+                                theme,
+                                false,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.use_default_downloads_directory(cx);
+                                }),
+                            ))
+                            .child(button(
+                                "open-download-center",
+                                "Open Download Center",
+                                theme,
+                                false,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.model.update(cx, |model, cx| {
+                                        model.open_downloads_window(cx);
+                                    });
+                                }),
+                            )),
+                    )
+                    .child(divider(theme))
+                    .child(toggle_row(
+                        "downloads-account-folders",
+                        "Organize by account",
+                        "Save each account's files in its own subfolder.",
+                        settings.downloads_account_folders,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.downloads_account_folders =
+                                    !settings.downloads_account_folders;
+                            });
+                        }),
+                    ))
+                    .child(divider(theme))
+                    .child(toggle_row(
+                        "downloads-date-folders",
+                        "Organize by month",
+                        "Add a YYYY-MM subfolder (UTC) for the month each file was downloaded.",
+                        settings.downloads_date_folders,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.downloads_date_folders =
+                                    !settings.downloads_date_folders;
+                            });
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(format!(
+                                "The download history keeps the last {DOWNLOAD_HISTORY_LIMIT} entries. Existing files are never overwritten; collisions get a numbered suffix."
+                            )),
                     ),
             )
             .child(backup_card)
@@ -1876,11 +2062,18 @@ fn request_file_chooser(
 ) {
     glib::MainContext::default().invoke(move || {
         let save = mode == FileChooserMode::Save;
+        let folder = mode == FileChooserMode::Folder;
         let (title, action, accept) = if save {
             (
                 "Export OxideZap settings",
                 gtk::FileChooserAction::Save,
                 "Export",
+            )
+        } else if folder {
+            (
+                "Choose the OxideZap download folder",
+                gtk::FileChooserAction::SelectFolder,
+                "Select",
             )
         } else {
             (
@@ -1900,10 +2093,12 @@ fn request_file_chooser(
         if save {
             dialog.set_current_name(&suggested_name);
         }
-        let filter = gtk::FileFilter::new();
-        filter.set_name(Some("OxideZap settings (*.json)"));
-        filter.add_pattern("*.json");
-        dialog.add_filter(filter);
+        if !folder {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("OxideZap settings (*.json)"));
+            filter.add_pattern("*.json");
+            dialog.add_filter(filter);
+        }
 
         let response = dialog.run();
         let chosen = (response == gtk::ResponseType::Accept)

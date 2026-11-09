@@ -1,22 +1,25 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
-use std::fs::OpenOptions;
-use std::io::{self, Read};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use gtk::prelude::*;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 use webkit2gtk::{
     DownloadExt, NavigationPolicyDecision, NavigationPolicyDecisionExt, NotificationExt,
     NotificationPermissionRequest, PermissionRequest, PermissionRequestExt, PolicyDecisionExt,
-    PolicyDecisionType, SettingsExt, URIRequestExt, UserMediaPermissionRequest,
+    PolicyDecisionType, SettingsExt, URIRequestExt, URIResponseExt, UserMediaPermissionRequest,
     UserMediaPermissionRequestExt, WebContextExt, WebProcessTerminationReason, WebViewExt,
 };
 
+use crate::app::downloads::{
+    discard_empty_reservation, sanitize_filename, DownloadLayout, DOWNLOAD_PROGRESS_INTERVAL,
+};
 use crate::links::{self, LinkAction};
 use crate::settings::WritingSettings;
 use crate::unread::parse_unread;
@@ -59,14 +62,31 @@ pub enum GtkEvent {
         body: String,
     },
     DownloadStarted {
-        account_id: String,
-        filename: String,
-    },
-    DownloadFinished {
+        id: String,
         account_id: String,
         filename: String,
         path: PathBuf,
+        source_url: Option<String>,
+        total_bytes: Option<u64>,
+    },
+    DownloadProgress {
+        id: String,
+        received: u64,
+        total: Option<u64>,
+    },
+    DownloadFinished {
+        id: String,
         success: bool,
+        cancelled: bool,
+    },
+    DownloadRejected {
+        account_id: String,
+        filename: String,
+        reason: String,
+    },
+    DownloadRetryFailed {
+        id: String,
+        message: String,
     },
     OpenExternal {
         url: String,
@@ -112,6 +132,15 @@ pub enum GtkCommand {
     },
     SetWriting {
         writing: WritingSettings,
+    },
+    SetDownloadLayout(DownloadLayout),
+    CancelDownload {
+        id: String,
+    },
+    RetryDownload {
+        id: String,
+        account_id: String,
+        url: String,
     },
     SetScale {
         account_id: String,
@@ -161,6 +190,22 @@ impl GtkHandle {
 
     pub fn set_writing(&self, writing: WritingSettings) {
         self.send(GtkCommand::SetWriting { writing });
+    }
+
+    pub fn set_download_layout(&self, layout: DownloadLayout) {
+        self.send(GtkCommand::SetDownloadLayout(layout));
+    }
+
+    pub fn cancel_download(&self, id: &str) {
+        self.send(GtkCommand::CancelDownload { id: id.to_string() });
+    }
+
+    pub fn retry_download(&self, id: &str, account_id: &str, url: &str) {
+        self.send(GtkCommand::RetryDownload {
+            id: id.to_string(),
+            account_id: account_id.to_string(),
+            url: url.to_string(),
+        });
     }
 
     pub fn set_scale(&self, account_id: &str, scale: f32) {
@@ -220,7 +265,9 @@ pub fn spawn(
             let paste = Rc::new(RefCell::new(PasteQueue::start()));
             let state = Rc::new(RefCell::new(GtkState {
                 events,
-                downloads_dir,
+                download_layout: Rc::new(RefCell::new(DownloadLayout::new(downloads_dir))),
+                downloads: Rc::new(RefCell::new(HashMap::new())),
+                cancelled_downloads: Rc::new(RefCell::new(HashSet::new())),
                 notifications_enabled,
                 entries: HashMap::new(),
                 x11,
@@ -267,7 +314,9 @@ pub fn spawn(
 
 struct GtkState {
     events: Sender<GtkEvent>,
-    downloads_dir: PathBuf,
+    download_layout: Rc<RefCell<DownloadLayout>>,
+    downloads: Rc<RefCell<HashMap<String, webkit2gtk::Download>>>,
+    cancelled_downloads: Rc<RefCell<HashSet<String>>>,
     notifications_enabled: bool,
     entries: HashMap<String, WebEntry>,
     x11: X11,
@@ -336,7 +385,9 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 zoom,
                 &writing,
                 state.events.clone(),
-                state.downloads_dir.clone(),
+                state.download_layout.clone(),
+                state.downloads.clone(),
+                state.cancelled_downloads.clone(),
                 state.notifications_enabled,
                 state.paste.clone(),
             ) {
@@ -385,6 +436,39 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 }
             }
         }
+        GtkCommand::SetDownloadLayout(layout) => {
+            *state.download_layout.borrow_mut() = layout;
+        }
+        GtkCommand::CancelDownload { id } => {
+            let download = state.downloads.borrow().get(&id).cloned();
+            if let Some(download) = download {
+                state.cancelled_downloads.borrow_mut().insert(id);
+                download.cancel();
+            }
+        }
+        GtkCommand::RetryDownload {
+            id,
+            account_id,
+            url,
+        } => {
+            let context = state
+                .entries
+                .get(&account_id)
+                .and_then(|entry| entry.webview.context());
+            let started = context
+                .as_ref()
+                .and_then(|context| context.download_uri(&url))
+                .is_some();
+            if started {
+                info!(account_id = %account_id, url = %url, "retrying a download");
+            } else {
+                let _ = state.events.send(GtkEvent::DownloadRetryFailed {
+                    id,
+                    message: "The account window is not available; open that account and start the download again."
+                        .to_string(),
+                });
+            }
+        }
         GtkCommand::SetScale { account_id, scale } => {
             if let Some(entry) = state.entries.get_mut(&account_id) {
                 if (entry.scale - scale).abs() > f32::EPSILON {
@@ -429,7 +513,9 @@ fn create_entry(
     zoom: f64,
     writing: &WritingSettings,
     events: Sender<GtkEvent>,
-    downloads_dir: PathBuf,
+    download_layout: Rc<RefCell<DownloadLayout>>,
+    downloads: Rc<RefCell<HashMap<String, webkit2gtk::Download>>>,
+    cancelled_downloads: Rc<RefCell<HashSet<String>>>,
     notifications_enabled: bool,
     paste: Rc<RefCell<PasteQueue>>,
 ) -> Result<WebEntry> {
@@ -475,7 +561,14 @@ fn create_entry(
         notifications_enabled,
         window.clone(),
     );
-    connect_downloads(&context, account_id, events, downloads_dir);
+    connect_downloads(
+        &context,
+        account_id,
+        events,
+        download_layout,
+        downloads,
+        cancelled_downloads,
+    );
     let paste_account = account_id.to_string();
     webview.connect_key_press_event(move |_webview, event| {
         if try_paste_clipboard(&paste_account, event, &paste) {
@@ -827,58 +920,138 @@ fn connect_downloads(
     context: &webkit2gtk::WebContext,
     account_id: &str,
     events: Sender<GtkEvent>,
-    downloads_dir: PathBuf,
+    layout: Rc<RefCell<DownloadLayout>>,
+    downloads: Rc<RefCell<HashMap<String, webkit2gtk::Download>>>,
+    cancelled_downloads: Rc<RefCell<HashSet<String>>>,
 ) {
     let download_account = account_id.to_string();
     context.connect_download_started(move |_context, download| {
         let account_id = download_account.clone();
         let events = events.clone();
-        let downloads_dir = downloads_dir.clone();
-        download.connect_decide_destination(move |download, suggested| {
-            let filename = sanitize_filename(suggested);
-            let path = match reserve_download_path(&downloads_dir, &filename) {
-                Ok(path) => path,
-                Err(error) => {
-                    warn!(%error, %filename, "could not reserve a download destination");
-                    return false;
+        let layout = layout.clone();
+        let downloads = downloads.clone();
+        let cancelled_downloads = cancelled_downloads.clone();
+        // One id identifies the download across every event. The GTK object is
+        // retained as soon as it is announced, so a `download_uri` retry whose
+        // return value is dropped cannot cancel itself.
+        let id = Uuid::new_v4().to_string();
+        downloads.borrow_mut().insert(id.clone(), download.clone());
+        let reserved_path: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+        let last_progress = Rc::new(RefCell::new(Instant::now()));
+
+        let progress_id = id.clone();
+        let progress_events = events.clone();
+        download.connect_received_data(move |download, received| {
+            {
+                let mut last = last_progress.borrow_mut();
+                if last.elapsed() < DOWNLOAD_PROGRESS_INTERVAL {
+                    return;
                 }
-            };
-
-            let finished_path = path.clone();
-            let finished_filename = filename.clone();
-            let finished_account = account_id.clone();
-            let finished_events = events.clone();
-            download.connect_finished(move |_download| {
-                let _ = finished_events.send(GtkEvent::DownloadFinished {
-                    account_id: finished_account.clone(),
-                    filename: finished_filename.clone(),
-                    path: finished_path.clone(),
-                    success: true,
-                });
+                *last = Instant::now();
+            }
+            let total = download
+                .response()
+                .map(|response| response.content_length())
+                .filter(|length| *length > 0);
+            let _ = progress_events.send(GtkEvent::DownloadProgress {
+                id: progress_id.clone(),
+                received,
+                total,
             });
+        });
 
-            let failed_path = path.clone();
-            let failed_filename = filename.clone();
-            let failed_account = account_id.clone();
-            let failed_events = events.clone();
-            download.connect_failed(move |_download, error| {
+        let finished_id = id.clone();
+        let finished_events = events.clone();
+        let finished_downloads = downloads.clone();
+        let finished_cancelled = cancelled_downloads.clone();
+        download.connect_finished(move |download| {
+            let received = download.received_data_length();
+            let total = download
+                .response()
+                .map(|response| response.content_length())
+                .filter(|length| *length > 0);
+            let _ = finished_events.send(GtkEvent::DownloadProgress {
+                id: finished_id.clone(),
+                received,
+                total,
+            });
+            finished_downloads.borrow_mut().remove(&finished_id);
+            finished_cancelled.borrow_mut().remove(&finished_id);
+            let _ = finished_events.send(GtkEvent::DownloadFinished {
+                id: finished_id.clone(),
+                success: true,
+                cancelled: false,
+            });
+        });
+
+        let failed_id = id.clone();
+        let failed_events = events.clone();
+        let failed_downloads = downloads.clone();
+        let failed_cancelled = cancelled_downloads.clone();
+        let failed_path = reserved_path.clone();
+        download.connect_failed(move |_download, error| {
+            let cancelled = failed_cancelled.borrow_mut().remove(&failed_id);
+            failed_downloads.borrow_mut().remove(&failed_id);
+            if let Some(path) = failed_path.borrow_mut().take() {
+                discard_empty_reservation(&path);
+            }
+            if !cancelled {
                 warn!(%error, "download failed");
-                discard_empty_reservation(&failed_path);
-                let _ = failed_events.send(GtkEvent::DownloadFinished {
-                    account_id: failed_account.clone(),
-                    filename: failed_filename.clone(),
-                    path: failed_path.clone(),
-                    success: false,
-                });
+            }
+            let _ = failed_events.send(GtkEvent::DownloadFinished {
+                id: failed_id.clone(),
+                success: false,
+                cancelled,
             });
+        });
+
+        let decide_id = id.clone();
+        let decide_events = events.clone();
+        let decide_downloads = downloads.clone();
+        let decide_layout = layout.clone();
+        download.connect_decide_destination(move |download, suggested| {
+            let path =
+                match decide_layout
+                    .borrow()
+                    .reserve(&account_id, suggested, SystemTime::now())
+                {
+                    Ok(path) => path,
+                    Err(error) => {
+                        warn!(%error, %suggested, "could not reserve a download destination");
+                        decide_downloads.borrow_mut().remove(&decide_id);
+                        let _ = decide_events.send(GtkEvent::DownloadRejected {
+                            account_id: account_id.clone(),
+                            filename: sanitize_filename(suggested),
+                            reason: error.to_string(),
+                        });
+                        return false;
+                    }
+                };
+            *reserved_path.borrow_mut() = Some(path.clone());
+            let filename = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| sanitize_filename(suggested));
+            let source_url = download
+                .request()
+                .and_then(|request| request.uri())
+                .map(|uri| uri.to_string());
+            let total_bytes = download
+                .response()
+                .map(|response| response.content_length())
+                .filter(|length| *length > 0);
 
             // The destination already exists as our empty reservation, so
             // WebKit has to be allowed to truncate it instead of refusing it.
             download.set_allow_overwrite(true);
             download.set_destination(path.to_string_lossy().as_ref());
-            let _ = events.send(GtkEvent::DownloadStarted {
+            let _ = decide_events.send(GtkEvent::DownloadStarted {
+                id: decide_id.clone(),
                 account_id: account_id.clone(),
-                filename: filename.clone(),
+                filename,
+                path,
+                source_url,
+                total_bytes,
             });
             true
         });
@@ -996,80 +1169,6 @@ fn install_css() {
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
-    }
-}
-
-fn sanitize_filename(filename: &str) -> String {
-    let filename = filename
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | '\0' => '_',
-            _ => ch,
-        })
-        .collect::<String>();
-    let filename = filename.trim();
-    if filename.is_empty() {
-        "download".to_string()
-    } else {
-        filename.to_string()
-    }
-}
-
-/// How many `name (n).ext` variants are tried before giving up on a download.
-const MAX_DOWNLOAD_PATH_ATTEMPTS: u32 = 10_000;
-
-/// Claims `dir/filename`, or the first free `name (n).ext` variant, by creating
-/// the file with `create_new`. Two downloads racing for the same name can never
-/// both win the same path, and an existing file is never overwritten: the
-/// returned path is an existing, empty file that belongs to this download.
-fn reserve_download_path(dir: &Path, filename: &str) -> io::Result<PathBuf> {
-    let (stem, extension) = split_download_name(filename);
-    for index in 0..MAX_DOWNLOAD_PATH_ATTEMPTS {
-        let candidate = if index == 0 {
-            dir.join(filename)
-        } else {
-            dir.join(format!("{stem} ({index}){extension}"))
-        };
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(_reservation) => return Ok(candidate),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!("no free download name for {filename}"),
-    ))
-}
-
-fn split_download_name(filename: &str) -> (String, String) {
-    let path = Path::new(filename);
-    let stem = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| filename.to_string());
-    let extension = path
-        .extension()
-        .map(|extension| format!(".{}", extension.to_string_lossy()))
-        .unwrap_or_default();
-    (stem, extension)
-}
-
-/// Drops the empty reservation of a download WebKit could not write to.
-/// Partial files stay on disk because they may still be worth recovering.
-fn discard_empty_reservation(path: &Path) {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
-    };
-    if !metadata.is_file() || metadata.len() > 0 {
-        return;
-    }
-    if let Err(error) = std::fs::remove_file(path) {
-        warn!(%error, path = %path.display(), "could not remove an empty download reservation");
     }
 }
 
@@ -1639,13 +1738,6 @@ fn mime_for_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sanitizes_download_names() {
-        assert_eq!(sanitize_filename("photo.jpg"), "photo.jpg");
-        assert_eq!(sanitize_filename("../../etc/passwd"), ".._.._etc_passwd");
-        assert_eq!(sanitize_filename(""), "download");
-    }
 
     #[test]
     fn base64_chunks_round_trip() {

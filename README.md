@@ -71,7 +71,7 @@ That split matters:
 - **Global show/hide shortcut** through X11 `XGrabKey`, default `Ctrl+Shift+W`, configurable in Settings. This is X11/XWayland-only.
 - **Launch at login** through an XDG autostart entry at `~/.config/autostart/oxidezap.desktop`.
 - **Link handling.** External `http(s)`, `mailto:`, and `tel:` links open in the system browser or application. `wa.me`, `chat.whatsapp.com`, and `web.whatsapp.com` links stay inside OxideZap. WhatsApp's internal `whatsapp.net` utility pages (such as the Flows cache manager) stay in the webview and never open a system browser tab. `whatsapp://` URLs are translated to their WhatsApp Web equivalents.
-- **Downloads** go to `~/Downloads` and produce a native notification with the destination. `oxidezap --downloads` opens that folder until the download center lands.
+- **Native Download Center.** WebKit downloads are tracked with live progress, status, account, size, timestamps, and destination in a bounded 500-entry history. Cancel an active transfer, retry a failed one when WebKit exposed an HTTP(S) source, open the file or its folder, copy the path, or remove finished rows. Set a custom base folder and optionally organize files into per-account and `YYYY-MM` subfolders. Names are sanitized, collisions get a numbered suffix, and existing files are never overwritten. Open it from the tray or Settings.
 - **CLI control** with `--toggle`, `--hide`, `--lock`, `--quit`, `--account`, `--chat`, `--dnd`, `--downloads`, `--status`, and `--list-accounts`, plus URL forwarding to a running instance.
 
 ## Requirements
@@ -288,7 +288,7 @@ windows: 1
 
 `--chat` accepts a phone number (with optional `+`, spaces, dashes, dots, and parentheses) or a phone-based chat id such as `5491100000000@c.us` or `5491100000000@s.whatsapp.net`. It opens the conversation in the active account and never sends a message because it never adds WhatsApp's `text` parameter. Group ids cannot be deep-linked by WhatsApp Web and are rejected with a clear error.
 
-`--dnd 1h` and `--dnd tomorrow` currently enable Do Not Disturb until it is turned off; the scheduling model from the Do Not Disturb feature is not duplicated here. `--downloads` opens the downloads folder until the download center exists.
+`--dnd 1h` and `--dnd tomorrow` currently enable Do Not Disturb until it is turned off; the scheduling model from the Do Not Disturb feature is not duplicated here. `--downloads` still opens the downloads folder; open the native Download Center from the tray or Settings.
 
 `--smoke-test` starts the application under X11 with a local HTML page, verifies that the GPUI window and the WebKit transient overlay have the expected geometry, prints `SMOKE OK`, and exits with status 0.
 
@@ -296,13 +296,14 @@ windows: 1
 
 | Path | Purpose |
 | --- | --- |
-| `~/.config/oxidezap/settings.json` | Accounts, appearance, notifications, general, and security settings |
+| `~/.config/oxidezap/settings.json` | Accounts, appearance, notifications, downloads, general, and security settings |
 | `~/.config/oxidezap/backups/` | Dated settings backups written before an import or reset (`0600` files in a `0700` directory) |
 | `~/.local/share/oxidezap/accounts/<uuid>/` | Per-account WebKit data (`data/`) and cache (`cache/`) |
 | `~/.cache/oxidezap/` | Runtime assets such as the tray icon |
 | `~/.config/autostart/oxidezap.desktop` | Autostart entry, created when launch at login is enabled |
 | `$XDG_RUNTIME_DIR/oxidezap-<uid>.sock` | Single-instance socket |
 | `~/Downloads` | Default download directory |
+| `~/.config/oxidezap/downloads.json` | Bounded download history (newest 500 records, `0600`) |
 
 OxideZap follows `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_RUNTIME_DIR` when they are set. Removing an account from Settings also removes its WebKit profile directory.
 
@@ -346,7 +347,7 @@ GPUI window (taskbar entry)
 - **Accounts are isolated** with separate `WebKitWebsiteDataManager` data and cache directories.
 - On a Wayland session the application runs through **XWayland**, because embedding a foreign GTK surface into a Wayland client is not portable. Native Wayland support is on the roadmap.
 
-The two threads communicate over channels. The GPUI side sends commands such as create, show, hide, load, zoom, reload, and quit; the WebKit side reports ready state, load state, titles (from which unread counts are derived), notifications, downloads, external links, and crashes.
+The two threads communicate over channels. The GPUI side sends commands such as create, show, hide, load, zoom, reload, cancel a download, retry a download, and quit; the WebKit side reports ready state, load state, titles (from which unread counts are derived), notifications, download started/progress/finished events, external links, and crashes.
 
 ## Security and privacy
 
@@ -369,10 +370,11 @@ The two threads communicate over channels. The GPUI side sends commands such as 
 - **Notifications** require a notification daemon. **The tray** requires a StatusNotifier host; desktops without one will not show the tray icon. Notification sounds depend on the daemon and sound theme, and some hosts ignore dynamic tray pixmaps, in which case the per-account tooltip remains available.
 - **Spell checking depends on system dictionaries and WhatsApp Web.** WebKitGTK checks only languages whose hunspell dictionaries are installed, and WhatsApp Web owns the composer, so it can override spellcheck attributes or Enter-to-send behavior. Language changes apply to open accounts immediately, but the composer may need focus or a reload before it shows new underlines.
 - **The first login requires a QR scan** from the WhatsApp mobile app.
+- **Downloads depend on WebKit's delivery mode.** Files served as ordinary HTTP(S) responses can be tracked, cancelled, and retried. `blob:`/`data:` transfers, encrypted media that never becomes a normal download, and view-once media do not appear in the Download Center; view-once downloads are deliberately unsupported.
 - **No auto-update.** Reinstall or replace the binary to update.
 - **The app lock does not encrypt data at rest.** It gates the UI, not the files on disk.
 - **The AppImage is not self-contained.** It bundles OxideZap but requires the host's GTK 3 and WebKitGTK 4.1 >= 2.46.1; see [AppImage](#appimage).
-- **Flatpak sandboxing changes desktop integration.** Tray, notifications, autostart, and audio are subject to the limitations documented under [Flatpak](#flatpak).
+- **Flatpak sandboxing changes desktop integration.** Tray, notifications, autostart, and audio are subject to the limitations documented under [Flatpak](#flatpak). The sandbox exposes the real `~/Downloads`; a custom download folder outside that path is not writable unless the Flatpak permissions are extended.
 - **Screen readers cannot inspect the native GPUI shell.** The native titlebar, settings window, and lock screen are keyboard-operable: `Tab` and `Shift+Tab` move focus, focused buttons activate with `Enter` or `Space`, and focus is drawn with a visible border. GPUI 0.2.2 has no AccessKit/AT-SPI bridge, so assistive technology has no semantic view of these native controls; the WhatsApp Web content inside WebKitGTK is unaffected.
 - **Linux only.** There are no macOS or Windows builds.
 

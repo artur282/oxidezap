@@ -1,5 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// The download center belongs to the application model. It is declared here
+/// with an explicit path so `src/downloads.rs` stays a focused module.
+#[path = "downloads.rs"]
+pub mod downloads;
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -28,6 +34,7 @@ use crate::single_instance::{
 use crate::theme::Theme;
 use crate::tray::{TrayAction, TrayHandle};
 use crate::ui::account_window::AccountWindow;
+use crate::ui::downloads_window::DownloadsWindow;
 use crate::ui::lock_window::LockWindow;
 use crate::ui::settings_window::SettingsWindow;
 use crate::updates::{self, UpdateState};
@@ -35,6 +42,10 @@ use crate::webview::{
     GtkCommand, GtkEvent, GtkHandle, LoadState, OVERLAY_MARGIN, TITLEBAR_HEIGHT, WHATSAPP_URL,
 };
 use crate::x11::{WindowInfo, X11, select_account_window};
+
+use self::downloads::{
+    DownloadLayout, DownloadManager, DownloadRecord, DownloadStatus, DownloadWriter, now_millis,
+};
 
 pub trait AppModelEntityExt {
     fn update_settings(&self, cx: &mut App, update: impl FnOnce(&mut Settings));
@@ -150,6 +161,10 @@ pub struct AppModel {
     scales: HashMap<String, f32>,
     settings_window: Option<WindowHandle<SettingsWindow>>,
     lock_window: Option<WindowHandle<LockWindow>>,
+    downloads_window: Option<WindowHandle<DownloadsWindow>>,
+    downloads: DownloadManager,
+    downloads_writer: DownloadWriter,
+    pending_downloads: bool,
     smoke: Option<SmokeState>,
     startup_html: Option<String>,
     startup_url: Option<String>,
@@ -202,6 +217,7 @@ impl AppModel {
             paths.update_cache_file(),
         );
         let update_state = updates::cached_state(&update_config);
+        let downloads = DownloadManager::load(paths.downloads_index_file());
         Self {
             paths,
             settings,
@@ -223,6 +239,10 @@ impl AppModel {
             scales: HashMap::new(),
             settings_window: None,
             lock_window: None,
+            downloads_window: None,
+            downloads,
+            downloads_writer: DownloadWriter::start(),
+            pending_downloads: false,
             smoke,
             startup_html,
             startup_url,
@@ -264,6 +284,8 @@ impl AppModel {
             self.open_account_window(&account_id, cx);
             return;
         }
+
+        self.sync_download_layout();
 
         let initial_action = self.initial_action.take();
 
@@ -538,38 +560,100 @@ impl AppModel {
                 }
             }
             GtkEvent::DownloadStarted {
+                id,
                 account_id,
                 filename,
+                path,
+                source_url,
+                total_bytes,
             } => {
-                debug!(%account_id, %filename, "download started");
+                debug!(%account_id, %filename, path = %path.display(), "download started");
+                let account_name = self.account_name(&account_id);
+                let record = DownloadRecord {
+                    id,
+                    account_id: account_id.clone(),
+                    account_name,
+                    filename: filename.clone(),
+                    path: Some(path.clone()),
+                    source_url,
+                    received_bytes: 0,
+                    total_bytes,
+                    status: DownloadStatus::InProgress,
+                    started_at: now_millis(),
+                    finished_at: None,
+                };
+                if self.downloads.start(record) {
+                    self.save_downloads();
+                }
                 if self.settings.notifications {
+                    let folder = path
+                        .parent()
+                        .map(|parent| parent.display().to_string())
+                        .unwrap_or_else(|| self.downloads_base_dir().display().to_string());
                     notify::notify(
                         "Downloading",
-                        &format!(
-                            "{filename}\nSaving to {}",
-                            self.paths.downloads_dir.display()
-                        ),
+                        &format!("{filename}\nSaving to {folder}"),
+                        Some(&self.paths.runtime_icon()),
+                    );
+                }
+                self.refresh_downloads_window(cx);
+            }
+            GtkEvent::DownloadProgress {
+                id,
+                received,
+                total,
+            } => {
+                if self.downloads.progress(&id, received, total) {
+                    self.refresh_downloads_window(cx);
+                }
+            }
+            GtkEvent::DownloadFinished {
+                id,
+                success,
+                cancelled,
+            } => {
+                let record = self.downloads.get(&id).cloned();
+                if let Some(record) = record {
+                    debug!(
+                        %id,
+                        filename = %record.filename,
+                        success,
+                        cancelled,
+                        "download finished"
+                    );
+                    if self.downloads.finish(&id, success, cancelled, now_millis()) {
+                        self.save_downloads();
+                        if self.settings.notifications {
+                            self.notify_download_outcome(&record, success, cancelled);
+                        }
+                    }
+                } else {
+                    debug!(%id, "ignored a download event for an unknown record");
+                }
+                self.refresh_downloads_window(cx);
+            }
+            GtkEvent::DownloadRejected {
+                account_id,
+                filename,
+                reason,
+            } => {
+                warn!(%account_id, %filename, %reason, "download could not start");
+                if self.settings.notifications {
+                    notify::notify(
+                        "Download could not start",
+                        &format!("{filename}\n{reason}"),
                         Some(&self.paths.runtime_icon()),
                     );
                 }
             }
-            GtkEvent::DownloadFinished {
-                account_id,
-                filename,
-                path,
-                success,
-            } => {
-                debug!(%account_id, %filename, path = %path.display(), success, "download finished");
+            GtkEvent::DownloadRetryFailed { id, message } => {
+                debug!(%id, %message, "download retry failed");
                 if self.settings.notifications {
-                    if success {
-                        notify::notify_download(&filename, &path, Some(&self.paths.runtime_icon()));
-                    } else {
-                        notify::notify(
-                            "Download failed",
-                            &filename,
-                            Some(&self.paths.runtime_icon()),
-                        );
-                    }
+                    notify::notify(
+                        "Download could not be retried",
+                        &message,
+                        Some(&self.paths.runtime_icon()),
+                    );
                 }
             }
             GtkEvent::OpenExternal { url } => {
@@ -722,18 +806,168 @@ impl AppModel {
     }
 
     fn open_downloads(&mut self, cx: &mut Context<Self>) {
-        let path = self.paths.downloads_dir.clone();
+        self.open_downloads_folder(cx);
+    }
+
+    pub fn open_downloads_window(&mut self, cx: &mut Context<Self>) {
+        if self.locked {
+            self.open_lock_window(cx);
+            return;
+        }
+        if let Some(handle) = self.downloads_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.downloads_window = None;
+        }
+        if self.pending_downloads {
+            return;
+        }
+        self.pending_downloads = true;
+        let model = cx.entity().clone();
+        cx.defer(move |cx| open_downloads_window_deferred(model, cx));
+    }
+
+    pub fn downloads(&self) -> &[DownloadRecord] {
+        self.downloads.records()
+    }
+
+    pub fn active_downloads(&self) -> usize {
+        self.downloads.active_count()
+    }
+
+    pub fn downloads_base_dir(&self) -> PathBuf {
+        self.settings
+            .downloads_directory
+            .as_deref()
+            .and_then(downloads::valid_base_dir)
+            .unwrap_or_else(|| self.paths.downloads_dir.clone())
+    }
+
+    pub fn download_path(&self, id: &str) -> Option<PathBuf> {
+        self.downloads
+            .get(id)
+            .and_then(|record| record.path.clone())
+    }
+
+    pub fn cancel_download(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.downloads.cancel(id, now_millis()) {
+            return;
+        }
+        self.gtk.cancel_download(id);
+        self.save_downloads();
+        self.refresh_downloads_window(cx);
+    }
+
+    pub fn retry_download(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(record) = self.downloads.get(id) else {
+            return;
+        };
+        let Some(url) = record.retry_url().map(str::to_string) else {
+            notify::notify(
+                "Retry unavailable",
+                "This download has no reusable source URL. Start it again from WhatsApp Web.",
+                Some(&self.paths.runtime_icon()),
+            );
+            return;
+        };
+        let account_id = record.account_id.clone();
+        self.gtk.retry_download(id, &account_id, &url);
+        cx.notify();
+    }
+
+    pub fn remove_download(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.downloads.remove(id) {
+            return;
+        }
+        self.save_downloads();
+        self.refresh_downloads_window(cx);
+    }
+
+    pub fn open_download(&self, id: &str, cx: &mut Context<Self>) {
+        let Some(path) = self.download_path(id) else {
+            return;
+        };
+        self.open_path(path, cx);
+    }
+
+    pub fn open_download_folder(&self, id: &str, cx: &mut Context<Self>) {
+        let Some(folder) = self
+            .downloads
+            .get(id)
+            .and_then(|record| record.destination_dir().map(PathBuf::from))
+        else {
+            return;
+        };
+        self.open_path(folder, cx);
+    }
+
+    pub fn open_downloads_folder(&self, cx: &mut Context<Self>) {
+        let folder = self.downloads_base_dir();
+        self.open_path(folder, cx);
+    }
+
+    fn open_path(&self, path: PathBuf, cx: &mut Context<Self>) {
         cx.background_executor()
             .spawn(async move {
                 if let Err(error) = open::that_detached(&path) {
-                    warn!(
-                        path = %path.display(),
-                        %error,
-                        "could not open the downloads folder"
-                    );
+                    warn!(path = %path.display(), %error, "could not open a download path");
                 }
             })
             .detach();
+    }
+
+    fn notify_download_outcome(&self, record: &DownloadRecord, success: bool, cancelled: bool) {
+        let icon = self.paths.runtime_icon();
+        if success {
+            if let Some(path) = record.path.as_deref() {
+                notify::notify_download(&record.filename, path, Some(&icon));
+            } else {
+                notify::notify("Download complete", &record.filename, Some(&icon));
+            }
+        } else if cancelled {
+            notify::notify("Download cancelled", &record.filename, Some(&icon));
+        } else {
+            notify::notify(
+                "Download failed",
+                &format!("{}\nOpen the Download Center to retry.", record.filename),
+                Some(&icon),
+            );
+        }
+    }
+
+    fn download_layout(&self) -> DownloadLayout {
+        DownloadLayout::new(self.downloads_base_dir())
+            .with_options(
+                self.settings.downloads_account_folders,
+                self.settings.downloads_date_folders,
+            )
+            .with_accounts(
+                self.settings
+                    .accounts
+                    .iter()
+                    .map(|account| (account.id.clone(), account.name.clone())),
+            )
+    }
+
+    fn sync_download_layout(&self) {
+        self.gtk.set_download_layout(self.download_layout());
+    }
+
+    fn save_downloads(&self) {
+        self.downloads_writer.save(
+            self.downloads.snapshot(),
+            self.downloads.file().to_path_buf(),
+        );
+    }
+
+    fn refresh_downloads_window(&self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.downloads_window {
+            let _ = handle.update(cx, |_, _, cx| cx.notify());
+        }
     }
 
     fn apply_do_not_disturb(&mut self, mode: DndMode, cx: &mut Context<Self>) {
@@ -750,6 +984,7 @@ impl AppModel {
             TrayAction::OpenAccount(id) => self.open_account_window(&id, cx),
             TrayAction::AddAccount => self.add_account(cx),
             TrayAction::Settings => self.open_settings_window(cx),
+            TrayAction::Downloads => self.open_downloads_window(cx),
             TrayAction::Lock => self.lock(cx),
             TrayAction::Quit => self.quit(cx),
         }
@@ -910,6 +1145,9 @@ impl AppModel {
             return;
         }
         self.locked = true;
+        if let Some(handle) = self.downloads_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
         let ids: Vec<String> = self.account_windows.keys().cloned().collect();
         for id in ids {
             self.hide_account_window(&id, cx);
@@ -1070,6 +1308,7 @@ impl AppModel {
         let name = format!("Account {}", self.settings.accounts.len() + 1);
         let id = self.settings.add_account(name);
         self.save_settings(cx);
+        self.sync_download_layout();
         self.open_account_window(&id, cx);
         self.update_tray();
     }
@@ -1077,6 +1316,7 @@ impl AppModel {
     pub fn rename_account(&mut self, account_id: &str, name: &str, cx: &mut Context<Self>) {
         if self.settings.rename_account(account_id, name) {
             self.save_settings(cx);
+            self.sync_download_layout();
             self.update_account_title(account_id, cx);
             self.update_tray();
             cx.refresh_windows();
@@ -1097,6 +1337,7 @@ impl AppModel {
         self.gtk.close(account_id);
         self.settings.remove_account(account_id);
         self.save_settings(cx);
+        self.sync_download_layout();
         self.update_tray();
         cx.refresh_windows();
 
@@ -1265,6 +1506,7 @@ impl AppModel {
         if let Ok(shortcut) = Shortcut::parse(&self.settings.shortcut) {
             self.hotkey.set(shortcut);
         }
+        self.sync_download_layout();
         self.update_tray();
         cx.refresh_windows();
     }
@@ -1456,6 +1698,10 @@ impl AppModel {
             }
         }
         self.save_settings_now();
+        self.downloads_writer.save_and_wait(
+            self.downloads.snapshot(),
+            self.downloads.file().to_path_buf(),
+        );
         self.gtk.quit();
         if let Some(tray) = &self.tray {
             tray.shutdown();
@@ -1729,6 +1975,51 @@ fn open_settings_window_deferred(model: Entity<AppModel>, cx: &mut App) {
         Err(error) => {
             error!(%error, "could not open the settings window");
             model.update(cx, |model, _| model.pending_settings = false);
+        }
+    }
+}
+
+fn open_downloads_window_deferred(model: Entity<AppModel>, cx: &mut App) {
+    if model.read(cx).locked {
+        model.update(cx, |model, _| model.pending_downloads = false);
+        return;
+    }
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(1040.0), px(640.0)), cx)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(SharedString::from("OxideZap Downloads")),
+            appears_transparent: false,
+            traffic_light_position: None,
+        }),
+        focus: true,
+        show: true,
+        kind: WindowKind::Normal,
+        is_movable: true,
+        is_resizable: true,
+        is_minimizable: true,
+        display_id: None,
+        window_background: WindowBackgroundAppearance::Opaque,
+        app_id: Some("oxidezap-downloads".to_string()),
+        window_min_size: Some(size(px(820.0), px(480.0))),
+        window_decorations: Some(WindowDecorations::Client),
+        tabbing_identifier: None,
+    };
+
+    let model_for_view = model.clone();
+    match cx.open_window(options, move |window, cx| {
+        window.request_decorations(WindowDecorations::Client);
+        window.set_app_id("oxidezap-downloads");
+        cx.new(|cx| DownloadsWindow::new(model_for_view.clone(), cx))
+    }) {
+        Ok(handle) => {
+            model.update(cx, |model, _| {
+                model.pending_downloads = false;
+                model.downloads_window = Some(handle);
+            });
+        }
+        Err(error) => {
+            error!(%error, "could not open the downloads window");
+            model.update(cx, |model, _| model.pending_downloads = false);
         }
     }
 }

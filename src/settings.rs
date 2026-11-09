@@ -277,6 +277,11 @@ pub struct Settings {
     pub shortcut: String,
     pub lock: LockSettings,
     pub writing: WritingSettings,
+    /// Custom download base folder. `None` means the platform Downloads
+    /// directory reported by `Paths`.
+    pub downloads_directory: Option<String>,
+    pub downloads_account_folders: bool,
+    pub downloads_date_folders: bool,
 }
 
 impl Default for Settings {
@@ -297,6 +302,9 @@ impl Default for Settings {
             shortcut: DEFAULT_SHORTCUT.to_string(),
             lock: LockSettings::default(),
             writing: WritingSettings::default(),
+            downloads_directory: None,
+            downloads_account_folders: true,
+            downloads_date_folders: false,
         }
     }
 }
@@ -372,6 +380,10 @@ impl Settings {
             self.lock.enabled = false;
         }
         self.writing.normalize();
+        if let Some(directory) = self.downloads_directory.take() {
+            self.downloads_directory = crate::paths::valid_directory_setting(&directory)
+                .map(|path| path.to_string_lossy().into_owned());
+        }
         self.ensure_first_account();
         if self
             .active_account
@@ -940,6 +952,63 @@ mod tests {
         assert!(!settings.do_not_disturb);
         assert!(settings.close_to_tray);
         assert!(!settings.lock.enabled);
+    }
+
+    #[test]
+    fn download_preferences_default_to_per_account_folders() {
+        let settings = Settings::default();
+        assert_eq!(settings.downloads_directory, None);
+        assert!(settings.downloads_account_folders);
+        assert!(!settings.downloads_date_folders);
+    }
+
+    #[test]
+    fn legacy_settings_get_the_download_defaults() {
+        let json = br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"active_account":"a"}"#;
+        let mut settings: Settings = serde_json::from_slice(json).unwrap();
+        settings.normalize();
+
+        assert_eq!(settings.downloads_directory, None);
+        assert!(settings.downloads_account_folders);
+        assert!(!settings.downloads_date_folders);
+    }
+
+    #[test]
+    fn download_preferences_round_trip_and_normalize_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let folder = dir.path().join("downloads");
+        fs::create_dir(&folder).unwrap();
+        let settings = Settings {
+            downloads_directory: Some(format!(" {} ", folder.display())),
+            downloads_account_folders: false,
+            downloads_date_folders: true,
+            ..Settings::default()
+        };
+
+        settings.save(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+
+        assert_eq!(
+            loaded.downloads_directory.as_deref(),
+            Some(folder.to_string_lossy().as_ref())
+        );
+        assert!(!loaded.downloads_account_folders);
+        assert!(loaded.downloads_date_folders);
+    }
+
+    #[test]
+    fn relative_download_folders_are_discarded() {
+        let mut settings = Settings {
+            downloads_directory: Some("relative/downloads".to_string()),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.downloads_directory, None);
+
+        settings.downloads_directory = Some("/tmp/oxidezap-downloads\nbad".to_string());
+        settings.normalize();
+        assert_eq!(settings.downloads_directory, None);
     }
 
     #[test]
