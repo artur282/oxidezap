@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// On-disk account storage inspection and cleanup. The implementation lives in
+/// `src/storage.rs`; declaring it here keeps the settings window, the app model,
+/// and the WebKit thread on the same module without a crate-root declaration.
+#[path = "storage.rs"]
+pub mod storage;
+
 pub const SETTINGS_VERSION: u32 = 1;
 /// Version of the portable `SettingsExport` file format. It is independent
 /// from `SETTINGS_VERSION`, so the on-disk settings schema can keep evolving
@@ -273,6 +279,9 @@ pub struct Settings {
     pub start_at_login: bool,
     pub automatic_update_checks: bool,
     pub skipped_update_version: Option<String>,
+    /// RFC 3339 UTC timestamp of the last successful storage cleanup, shown in
+    /// Settings > Storage. `None` means the user has never cleaned anything.
+    pub last_storage_cleanup: Option<String>,
     pub remember_bounds: bool,
     pub shortcut: String,
     pub lock: LockSettings,
@@ -298,6 +307,7 @@ impl Default for Settings {
             start_at_login: false,
             automatic_update_checks: true,
             skipped_update_version: None,
+            last_storage_cleanup: None,
             remember_bounds: true,
             shortcut: DEFAULT_SHORTCUT.to_string(),
             lock: LockSettings::default(),
@@ -609,6 +619,7 @@ fn scrub_lock_password(settings: &mut Settings) {
 fn exportable_settings(settings: &Settings) -> Settings {
     let mut settings = settings.clone();
     scrub_lock_password(&mut settings);
+    settings.last_storage_cleanup = None;
     for account in &mut settings.accounts {
         account.unread = 0;
         account.bounds = None;
@@ -1083,6 +1094,28 @@ mod tests {
 
         assert!(settings.automatic_update_checks);
         assert!(settings.skipped_update_version.is_none());
+    }
+
+    #[test]
+    fn storage_cleanup_timestamp_defaults_to_none_and_round_trips() {
+        let json = br#"{"version":1,"accounts":[{"id":"a","name":"A"}]}"#;
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+        assert!(settings.last_storage_cleanup.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.ensure_first_account();
+        settings.last_storage_cleanup = Some("2026-11-12T10:00:00Z".to_string());
+        settings.save(&path).unwrap();
+
+        assert_eq!(
+            Settings::load(&path)
+                .unwrap()
+                .last_storage_cleanup
+                .as_deref(),
+            Some("2026-11-12T10:00:00Z")
+        );
     }
 
     #[test]
@@ -1615,7 +1648,8 @@ mod tests {
 
     #[test]
     fn export_excludes_the_lock_password_and_runtime_state() {
-        let settings = exported_fixture();
+        let mut settings = exported_fixture();
+        settings.last_storage_cleanup = Some("2026-11-12T10:00:00Z".to_string());
         let hash = settings.lock.hash.clone().unwrap();
         let export = SettingsExport::new(&settings, UNIX_EPOCH);
         let json = export.to_json().unwrap();
@@ -1633,6 +1667,10 @@ mod tests {
             "unread counts are runtime state"
         );
         assert!(!json.contains("1280.0"), "window bounds are runtime state");
+        assert!(
+            !json.contains("2026-11-12T10:00:00Z"),
+            "the cleanup timestamp is runtime state"
+        );
 
         let restored = SettingsExport::from_bytes(json.as_bytes()).unwrap();
         assert!(restored.lock.hash.is_none());
@@ -1640,6 +1678,7 @@ mod tests {
         assert_eq!(restored.accounts[0].unread, 0);
         assert!(restored.accounts[0].bounds.is_none());
         assert!(!restored.accounts[0].maximized);
+        assert!(restored.last_storage_cleanup.is_none());
     }
 
     #[test]

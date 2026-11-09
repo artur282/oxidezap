@@ -11,6 +11,7 @@ use crate::app::downloads::{DOWNLOAD_HISTORY_LIMIT, valid_base_dir};
 use crate::app::{AppModel, AppModelEntityExt};
 use crate::assets::{ICON_BELL, ICON_GEAR, ICON_INFO, ICON_PALETTE, ICON_SHIELD, ICON_USER};
 use crate::lock::MIN_PASSWORD_LENGTH;
+use crate::settings::storage::{self, ConfirmationLevel, StorageOperation};
 use crate::settings::{
     ImportPreview, MAX_ZOOM, MIN_ZOOM, Settings, SettingsExport, SpellCheckLanguage, ThemeMode,
     export_file_name, json_path, write_settings_backup,
@@ -32,6 +33,32 @@ enum FileChooserMode {
     Save,
     Folder,
 }
+
+/// A storage operation waiting for the user to confirm it.
+#[derive(Clone)]
+enum StorageConfirm {
+    Simple {
+        operation: StorageOperation,
+        account_id: String,
+        account_name: String,
+    },
+    DeleteData {
+        account_id: String,
+        account_name: String,
+        field: Entity<TextField>,
+    },
+}
+
+impl StorageConfirm {
+    fn account_id(&self) -> &str {
+        match self {
+            StorageConfirm::Simple { account_id, .. } => account_id,
+            StorageConfirm::DeleteData { account_id, .. } => account_id,
+        }
+    }
+}
+
+const ICON_STORAGE: &str = "icons/download.svg";
 
 #[derive(Clone, Debug)]
 struct Notice {
@@ -58,6 +85,7 @@ impl Notice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSection {
     Accounts,
+    Storage,
     Appearance,
     Notifications,
     General,
@@ -69,6 +97,7 @@ impl SettingsSection {
     fn label(self) -> &'static str {
         match self {
             SettingsSection::Accounts => "Accounts",
+            SettingsSection::Storage => "Storage",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::General => "General",
@@ -80,6 +109,7 @@ impl SettingsSection {
     fn icon(self) -> &'static str {
         match self {
             SettingsSection::Accounts => ICON_USER,
+            SettingsSection::Storage => ICON_STORAGE,
             SettingsSection::Appearance => ICON_PALETTE,
             SettingsSection::Notifications => ICON_BELL,
             SettingsSection::General => ICON_GEAR,
@@ -105,6 +135,8 @@ pub struct SettingsWindow {
     remove_password_confirm: bool,
     pending_import: Option<ImportPreview>,
     reset_confirm: bool,
+    storage_confirm: Option<StorageConfirm>,
+    storage_confirm_error: Option<String>,
     feedback: Option<Notice>,
     file_dialog_open: bool,
     operation_running: bool,
@@ -148,6 +180,8 @@ impl SettingsWindow {
             remove_password_confirm: false,
             pending_import: None,
             reset_confirm: false,
+            storage_confirm: None,
+            storage_confirm_error: None,
             feedback: None,
             file_dialog_open: false,
             operation_running: false,
@@ -156,7 +190,14 @@ impl SettingsWindow {
     }
 
     fn set_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if section != SettingsSection::Storage {
+            self.storage_confirm = None;
+            self.storage_confirm_error = None;
+        }
         self.section = section;
+        if section == SettingsSection::Storage {
+            self.model.update(cx, |model, cx| model.refresh_storage(cx));
+        }
         cx.notify();
     }
 
@@ -179,7 +220,8 @@ impl SettingsWindow {
             || self.remove_confirm.is_some()
             || self.remove_password_confirm
             || self.pending_import.is_some()
-            || self.reset_confirm;
+            || self.reset_confirm
+            || self.storage_confirm.is_some();
         if !pending {
             return false;
         }
@@ -188,6 +230,8 @@ impl SettingsWindow {
         self.remove_password_confirm = false;
         self.pending_import = None;
         self.reset_confirm = false;
+        self.storage_confirm = None;
+        self.storage_confirm_error = None;
         cx.notify();
         true
     }
@@ -198,12 +242,16 @@ impl SettingsWindow {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let storage_running = self.model.read(cx).storage.running.clone();
         let mut list = div().flex().flex_col().gap(px(10.));
         for account in &settings.accounts {
             let id = account.id.clone();
             let name = account.name.clone();
             let initial = account.initial();
             let unread = account.unread;
+            let storage_busy = storage_running
+                .as_ref()
+                .is_some_and(|running| running.account_id == id);
 
             if let Some((renaming_id, field)) = &self.renaming {
                 if renaming_id == &id {
@@ -376,7 +424,7 @@ impl SettingsWindow {
                                         cx.notify();
                                     }),
                                 ))
-                                .when(settings.accounts.len() > 1, |style| {
+                                .when(settings.accounts.len() > 1 && !storage_busy, |style| {
                                     style.child(button(
                                         SharedString::from(format!("remove-{remove_id}")),
                                         "Remove",
@@ -421,6 +469,466 @@ impl SettingsWindow {
                     .child("Adding an account opens a new window with a fresh QR code."),
             )
             .into_any_element()
+    }
+
+    fn request_storage_action(
+        &mut self,
+        account_id: &str,
+        account_name: &str,
+        operation: StorageOperation,
+        cx: &mut Context<Self>,
+    ) {
+        match storage::required_confirmation(
+            operation,
+            self.model.read(cx).is_account_window_open(account_id),
+        ) {
+            ConfirmationLevel::None => {
+                self.model.update(cx, |model, cx| {
+                    model.start_storage_operation(account_id, operation, cx);
+                });
+            }
+            ConfirmationLevel::Simple => {
+                self.storage_confirm = Some(StorageConfirm::Simple {
+                    operation,
+                    account_id: account_id.to_string(),
+                    account_name: account_name.to_string(),
+                });
+                self.storage_confirm_error = None;
+            }
+            ConfirmationLevel::TypedName => {
+                let field = cx.new(|cx| TextField::new("Account name", cx));
+                register_field_tab_stop(&field, cx);
+                self.storage_confirm = Some(StorageConfirm::DeleteData {
+                    account_id: account_id.to_string(),
+                    account_name: account_name.to_string(),
+                    field,
+                });
+                self.storage_confirm_error = None;
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_storage(
+        &mut self,
+        settings: &Settings,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (snapshot, scanning, running, notice, data_dir) = {
+            let model = self.model.read(cx);
+            (
+                model.storage.snapshot.clone(),
+                model.storage.scanning,
+                model.storage.running.clone(),
+                model.storage.notice.clone(),
+                model.paths.data_dir.clone(),
+            )
+        };
+        let total = snapshot
+            .as_ref()
+            .map(|snapshot| storage::format_bytes(snapshot.total_bytes))
+            .unwrap_or_else(|| {
+                if scanning {
+                    "Scanning…".to_string()
+                } else {
+                    "Not scanned yet".to_string()
+                }
+            });
+        let free = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.free_bytes)
+            .map(storage::format_bytes)
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let last_cleanup = settings
+            .last_storage_cleanup
+            .clone()
+            .unwrap_or_else(|| "Never".to_string());
+
+        let mut summary = card(theme)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(28.))
+                    .child(storage_stat("Total account data", total, theme))
+                    .child(storage_stat("Free disk space", free, theme))
+                    .child(storage_stat("Last cleanup", last_cleanup, theme)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(button(
+                        "storage-refresh",
+                        if scanning { "Scanning…" } else { "Refresh" },
+                        theme,
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update(cx, |model, cx| model.refresh_storage(cx));
+                            cx.notify();
+                        }),
+                    ))
+                    .child(button(
+                        "storage-open-folder",
+                        "Open data folder",
+                        theme,
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model
+                                .update(cx, |model, cx| model.open_storage_folder(cx));
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(format!("Data folder: {}", data_dir.display())),
+            );
+        if let Some(notice) = notice {
+            summary = summary.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(if notice.error {
+                        theme.danger
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(notice.text),
+            );
+        }
+
+        let pending = self.storage_confirm.clone();
+        let mut accounts = div().flex().flex_col().gap(px(10.));
+        for account in &settings.accounts {
+            let account_id = account.id.clone();
+            if let Some(confirm) = pending
+                .as_ref()
+                .filter(|confirm| confirm.account_id() == account_id.as_str())
+            {
+                accounts = accounts.child(self.render_storage_confirm(confirm, theme, cx));
+                continue;
+            }
+
+            let name = account.name.clone();
+            let clear_name = name.clone();
+            let sign_out_name = name.clone();
+            let delete_name = name.clone();
+            let info_line = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.account(&account_id))
+                .map(|info| {
+                    let partial = if info.complete() { "" } else { " · partial" };
+                    format!(
+                        "Data {} · Cache {} · Total {}{partial}",
+                        storage::format_bytes(info.data.bytes),
+                        storage::format_bytes(info.cache.bytes),
+                        storage::format_bytes(info.total_bytes())
+                    )
+                })
+                .unwrap_or_else(|| {
+                    if scanning {
+                        "Scanning…".to_string()
+                    } else {
+                        "Not scanned yet".to_string()
+                    }
+                });
+            let open = self.model.read(cx).is_account_window_open(&account_id);
+            let working = running
+                .as_ref()
+                .is_some_and(|running| running.account_id == account_id);
+
+            let mut entry = card(theme).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(14.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.text_muted)
+                                    .child(info_line),
+                            ),
+                    )
+                    .when(open, |style| {
+                        style.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme.text_faint)
+                                .child("Window open"),
+                        )
+                    }),
+            );
+
+            if working {
+                entry = entry.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_muted)
+                        .child("Running storage operation…"),
+                );
+            } else {
+                let clear_id = account_id.clone();
+                let sign_out_id = account_id.clone();
+                let delete_id = account_id.clone();
+                entry = entry.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(6.))
+                        .child(button(
+                            SharedString::from(format!("storage-clear-cache-{clear_id}")),
+                            "Clear cache",
+                            theme,
+                            false,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.request_storage_action(
+                                    &clear_id,
+                                    &clear_name,
+                                    StorageOperation::ClearCache,
+                                    cx,
+                                );
+                            }),
+                        ))
+                        .child(button(
+                            SharedString::from(format!("storage-sign-out-{sign_out_id}")),
+                            "Sign out",
+                            theme,
+                            false,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.request_storage_action(
+                                    &sign_out_id,
+                                    &sign_out_name,
+                                    StorageOperation::ClearSession,
+                                    cx,
+                                );
+                            }),
+                        ))
+                        .when(settings.accounts.len() > 1, |style| {
+                            style.child(button(
+                                SharedString::from(format!("storage-delete-{delete_id}")),
+                                "Delete account data",
+                                theme,
+                                false,
+                                cx.listener(move |this, _event, _window, cx| {
+                                    this.request_storage_action(
+                                        &delete_id,
+                                        &delete_name,
+                                        StorageOperation::RemoveData,
+                                        cx,
+                                    );
+                                }),
+                            ))
+                        }),
+                );
+            }
+            accounts = accounts.child(entry);
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .child(section_header(
+                "Storage",
+                "Inspect and clean the WebKit profile behind each account.",
+                theme,
+            ))
+            .child(summary)
+            .child(accounts)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(
+                        "Clearing data closes and recreates the account's webview. Clearing the cache keeps the WhatsApp session; signing out requires the QR code again. Sizes are approximate while WhatsApp Web is running and stop at a bounded scan limit.",
+                    )
+                    .child(
+                        "Deleting account data requires typing the account name and removes the account from OxideZap. The last account cannot be deleted.",
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_storage_confirm(
+        &mut self,
+        confirm: &StorageConfirm,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let error = self.storage_confirm_error.clone();
+        match confirm.clone() {
+            StorageConfirm::Simple {
+                operation,
+                account_id,
+                account_name,
+            } => {
+                let confirm_id = account_id.clone();
+                let cancel_id = account_id.clone();
+                let name = account_name.clone();
+                let (title, description, action_label, id_prefix) = match operation {
+                    StorageOperation::ClearCache => (
+                        format!("Clear the cache for \"{name}\"?"),
+                        "The account window will close and reload. The WhatsApp session is kept.",
+                        "Clear cache",
+                        "storage-clear-cache",
+                    ),
+                    StorageOperation::ClearSession => (
+                        format!("Sign out of \"{name}\"?"),
+                        "The account and its settings are kept, but its WebKit data is deleted. WhatsApp Web will ask for the QR code again.",
+                        "Sign out",
+                        "storage-sign-out",
+                    ),
+                    StorageOperation::RemoveData => (
+                        format!("Delete the data for \"{name}\"?"),
+                        "This cannot be undone.",
+                        "Delete account data",
+                        "storage-delete",
+                    ),
+                };
+                card(theme)
+                    .border_color(theme.danger)
+                    .child(div().text_size(px(12.)).text_color(theme.text).child(title))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_muted)
+                            .child(description),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(button(
+                                SharedString::from(format!("{id_prefix}-yes-{confirm_id}")),
+                                action_label,
+                                theme,
+                                true,
+                                cx.listener(move |this, _event, _window, cx| {
+                                    this.storage_confirm = None;
+                                    this.storage_confirm_error = None;
+                                    this.model.update(cx, |model, cx| {
+                                        model.start_storage_operation(&confirm_id, operation, cx);
+                                    });
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(button(
+                                SharedString::from(format!("{id_prefix}-no-{cancel_id}")),
+                                "Cancel",
+                                theme,
+                                false,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.storage_confirm = None;
+                                    this.storage_confirm_error = None;
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .into_any_element()
+            }
+            StorageConfirm::DeleteData {
+                account_id,
+                account_name,
+                field,
+            } => {
+                let delete_id = account_id.clone();
+                let cancel_id = account_id.clone();
+                let expected = account_name.clone();
+                let name = account_name.clone();
+                card(theme)
+                    .border_color(theme.danger)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.text)
+                            .child(format!("Delete all data for \"{name}\"?")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "This closes the account, deletes its WebKit profile, and removes it from OxideZap. This cannot be undone.",
+                            ),
+                    )
+                    .child(labeled_field(
+                        "Type the account name to confirm",
+                        None,
+                        theme,
+                        field.clone(),
+                    ))
+                    .when_some(error, |style, error| {
+                        style.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.danger)
+                                .child(error),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(button(
+                                SharedString::from(format!("storage-delete-yes-{delete_id}")),
+                                "Delete account data",
+                                theme,
+                                true,
+                                cx.listener(move |this, _event, _window, cx| {
+                                    let typed = field.read(cx).content().to_string();
+                                    if !storage::typed_confirmation_matches(&typed, &expected) {
+                                        this.storage_confirm_error = Some(
+                                            "Type the account name exactly to confirm."
+                                                .to_string(),
+                                        );
+                                        cx.notify();
+                                        return;
+                                    }
+                                    this.storage_confirm = None;
+                                    this.storage_confirm_error = None;
+                                    this.model.update(cx, |model, cx| {
+                                        model.start_storage_operation(
+                                            &delete_id,
+                                            StorageOperation::RemoveData,
+                                            cx,
+                                        );
+                                    });
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(button(
+                                SharedString::from(format!("storage-delete-no-{cancel_id}")),
+                                "Cancel",
+                                theme,
+                                false,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.storage_confirm = None;
+                                    this.storage_confirm_error = None;
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .into_any_element()
+            }
+        }
     }
 
     fn render_appearance(
@@ -861,6 +1369,13 @@ impl SettingsWindow {
 
     fn apply_pending_import(&mut self, cx: &mut Context<Self>) {
         if self.operation_running {
+            return;
+        }
+        if self.model.read(cx).storage.running.is_some() {
+            self.feedback = Some(Notice::error(
+                "Wait for the storage operation to finish before importing settings.",
+            ));
+            cx.notify();
             return;
         }
         let Some(preview) = self.pending_import.take() else {
@@ -1900,6 +2415,7 @@ impl Render for SettingsWindow {
 
         let content = match self.section {
             SettingsSection::Accounts => self.render_accounts(&settings, theme, cx),
+            SettingsSection::Storage => self.render_storage(&settings, theme, cx),
             SettingsSection::Appearance => self.render_appearance(&settings, theme, cx),
             SettingsSection::Notifications => self.render_notifications(&settings, theme, cx),
             SettingsSection::General => self.render_general(&settings, theme, cx),
@@ -1948,6 +2464,7 @@ impl Render for SettingsWindow {
 
         for section in [
             SettingsSection::Accounts,
+            SettingsSection::Storage,
             SettingsSection::Appearance,
             SettingsSection::Notifications,
             SettingsSection::General,
@@ -2006,6 +2523,26 @@ impl Render for SettingsWindow {
                     .child(content),
             )
     }
+}
+
+fn storage_stat(label: &'static str, value: String, theme: Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(theme.text_faint)
+                .child(label),
+        )
+        .child(
+            div()
+                .text_size(px(16.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .child(value),
+        )
 }
 
 fn avatar(initial: &str, theme: Theme) -> impl IntoElement {

@@ -21,7 +21,9 @@ use crate::app::downloads::{
     discard_empty_reservation, sanitize_filename, DownloadLayout, DOWNLOAD_PROGRESS_INTERVAL,
 };
 use crate::links::{self, LinkAction};
+use crate::paths::Paths;
 use crate::settings::WritingSettings;
+use crate::settings::storage::{self, StorageOperation};
 use crate::unread::parse_unread;
 use crate::x11::{Geometry, X11};
 
@@ -102,6 +104,13 @@ pub enum GtkEvent {
         account_id: String,
         message: String,
     },
+    /// A storage operation finished after the GTK thread closed the account's
+    /// webview. `result` is the number of freed bytes or a user-facing error.
+    StorageFinished {
+        account_id: String,
+        operation: StorageOperation,
+        result: Result<u64, String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +161,13 @@ pub enum GtkCommand {
     },
     Reload {
         account_id: String,
+    },
+    /// Closes the account's webview and then deletes or clears its profile
+    /// directories on a worker thread.
+    ClearStorage {
+        account_id: String,
+        operation: StorageOperation,
+        paths: Paths,
     },
     Close {
         account_id: String,
@@ -225,6 +241,14 @@ impl GtkHandle {
     pub fn reload(&self, account_id: &str) {
         self.send(GtkCommand::Reload {
             account_id: account_id.to_string(),
+        });
+    }
+
+    pub fn clear_storage(&self, account_id: &str, operation: StorageOperation, paths: Paths) {
+        self.send(GtkCommand::ClearStorage {
+            account_id: account_id.to_string(),
+            operation,
+            paths,
         });
     }
 
@@ -485,6 +509,48 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
         GtkCommand::Reload { account_id } => {
             if let Some(entry) = state.entries.get(&account_id) {
                 entry.webview.reload();
+            }
+        }
+        GtkCommand::ClearStorage {
+            account_id,
+            operation,
+            paths,
+        } => {
+            // Close the view on the GTK thread before the profile is touched.
+            // WebKitGTK 2.0.2 does not expose a coordinated
+            // `WebsiteDataManager::clear`, so removing the view and letting the
+            // web process release its files is the supported path.
+            if let Some(entry) = state.entries.remove(&account_id) {
+                if let Some(context) = entry.webview.context() {
+                    context.clear_cache();
+                }
+                entry.window.close();
+            }
+            let events = state.events.clone();
+            let worker_account = account_id.clone();
+            let spawned = std::thread::Builder::new()
+                .name("oxidezap-storage".to_string())
+                .spawn(move || {
+                    // The web process releases its profile handles shortly
+                    // after the view is destroyed. Deleting immediately can
+                    // race SQLite and leave the profile half recreated.
+                    std::thread::sleep(Duration::from_millis(400));
+                    let result = storage::perform(&paths, &worker_account, operation)
+                        .map(|outcome| outcome.freed_bytes)
+                        .map_err(|error| error.to_string());
+                    let _ = events.send(GtkEvent::StorageFinished {
+                        account_id: worker_account,
+                        operation,
+                        result,
+                    });
+                });
+            if let Err(error) = spawned {
+                warn!(%error, "could not start the storage worker");
+                let _ = state.events.send(GtkEvent::StorageFinished {
+                    account_id,
+                    operation,
+                    result: Err(error.to_string()),
+                });
             }
         }
         GtkCommand::Close { account_id } => {

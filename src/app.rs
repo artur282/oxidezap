@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// The download center belongs to the application model. It is declared here
 /// with an explicit path so `src/downloads.rs` stays a focused module.
@@ -23,6 +23,7 @@ use crate::links;
 use crate::lock;
 use crate::notify;
 use crate::paths::{APP_ID, Paths};
+use crate::settings::storage::{self, StorageOperation, StorageSnapshot};
 use crate::settings::{
     Account, SETTINGS_SAVE_DEBOUNCE, SaveDebounce, SavedBounds, Settings, SettingsWriter,
     WritingSettings,
@@ -140,6 +141,46 @@ fn crash_decision(quitting: bool, recovery: &mut CrashRecovery, now: Instant) ->
     recovery.on_crash(now)
 }
 
+/// A storage operation currently running on the GTK/storage worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningStorageOperation {
+    pub account_id: String,
+    pub operation: StorageOperation,
+}
+
+/// Result banner shown by Settings > Storage.
+#[derive(Clone, Debug)]
+pub struct StorageNotice {
+    pub error: bool,
+    pub text: String,
+}
+
+impl StorageNotice {
+    pub fn success(text: impl Into<String>) -> Self {
+        Self {
+            error: false,
+            text: text.into(),
+        }
+    }
+
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            error: true,
+            text: text.into(),
+        }
+    }
+}
+
+/// Storage UI state shared by the app model and the settings window.
+#[derive(Clone, Debug, Default)]
+pub struct StorageState {
+    pub scanning: bool,
+    pub refresh_pending: bool,
+    pub snapshot: Option<StorageSnapshot>,
+    pub running: Option<RunningStorageOperation>,
+    pub notice: Option<StorageNotice>,
+}
+
 pub struct AppModel {
     pub paths: Paths,
     pub settings: Settings,
@@ -178,6 +219,7 @@ pub struct AppModel {
     settings_writer: SettingsWriter,
     save_debounce: SaveDebounce,
     pub update_state: UpdateState,
+    pub storage: StorageState,
     update_tx: Sender<UpdateState>,
     update_rx: Receiver<UpdateState>,
     update_check_running: bool,
@@ -256,6 +298,7 @@ impl AppModel {
             settings_writer: SettingsWriter::start(),
             save_debounce: SaveDebounce::default(),
             update_state,
+            storage: StorageState::default(),
             update_tx,
             update_rx,
             update_check_running: false,
@@ -701,6 +744,13 @@ impl AppModel {
                     Some(&self.paths.runtime_icon()),
                 );
             }
+            GtkEvent::StorageFinished {
+                account_id,
+                operation,
+                result,
+            } => {
+                self.handle_storage_finished(account_id, operation, result, cx);
+            }
         }
     }
 
@@ -1019,6 +1069,15 @@ impl AppModel {
             self.open_lock_window(cx);
             return;
         }
+        if self
+            .storage
+            .running
+            .as_ref()
+            .is_some_and(|running| running.account_id == account_id)
+        {
+            // Recreating the webview now would race the profile worker.
+            return;
+        }
         if let Some(handle) = self.account_windows.get(account_id).copied() {
             if handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -1327,6 +1386,35 @@ impl AppModel {
         if self.settings.accounts.len() <= 1 {
             return;
         }
+        if self
+            .storage
+            .running
+            .as_ref()
+            .is_some_and(|running| running.account_id == account_id)
+        {
+            return;
+        }
+        self.forget_account(account_id, cx);
+        self.save_settings(cx);
+        self.update_tray();
+        cx.refresh_windows();
+
+        let paths = self.paths.clone();
+        let account_id = account_id.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            if let Err(error) = storage::perform(&paths, &account_id, StorageOperation::RemoveData)
+            {
+                warn!(account_id = %account_id, %error, "could not remove account data");
+            }
+        });
+    }
+
+    /// Shared by the Accounts section and a successful storage deletion: the
+    /// window and every runtime map are dropped, and the account leaves the
+    /// settings. The directory itself is removed separately, after the webview
+    /// is gone.
+    fn forget_account(&mut self, account_id: &str, cx: &mut Context<Self>) {
         if let Some(handle) = self.account_windows.remove(account_id) {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
@@ -1336,17 +1424,174 @@ impl AppModel {
         self.hidden_accounts.remove(account_id);
         self.gtk.close(account_id);
         self.settings.remove_account(account_id);
+    }
+
+    pub fn is_account_window_open(&self, account_id: &str) -> bool {
+        self.account_windows.contains_key(account_id)
+    }
+
+    /// Opens the folder that contains every account profile.
+    pub fn open_storage_folder(&self, cx: &mut Context<Self>) {
+        let path = self.paths.data_dir.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) = open::that_detached(&path) {
+                    warn!(
+                        path = %path.display(),
+                        %error,
+                        "could not open the data folder"
+                    );
+                }
+            })
+            .detach();
+    }
+
+    /// Scans every account on a worker thread. The previous snapshot stays
+    /// visible while the new one is being computed.
+    pub fn refresh_storage(&mut self, cx: &mut Context<Self>) {
+        if self.storage.scanning {
+            self.storage.refresh_pending = true;
+            return;
+        }
+        self.storage.scanning = true;
+        self.storage.refresh_pending = false;
+        let paths = self.paths.clone();
+        let account_ids: Vec<String> = self
+            .settings
+            .accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let snapshot = cx
+                .background_executor()
+                .spawn(async move { storage::scan_storage(&paths, &account_ids) })
+                .await;
+            this.update(cx, |model, cx| {
+                model.storage.scanning = false;
+                model.storage.snapshot = Some(snapshot);
+                let refresh_again = std::mem::take(&mut model.storage.refresh_pending);
+                cx.refresh_windows();
+                if refresh_again {
+                    model.refresh_storage(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Starts a storage operation. The confirmation policy is enforced by the
+    /// settings window; this method only enforces the account-level policy and
+    /// hands the request to the GTK thread, which closes the webview before the
+    /// worker deletes anything.
+    pub fn start_storage_operation(
+        &mut self,
+        account_id: &str,
+        operation: StorageOperation,
+        cx: &mut Context<Self>,
+    ) {
+        if self.storage.running.is_some() {
+            self.storage.notice = Some(StorageNotice::error(
+                "Another storage operation is already running.",
+            ));
+            cx.refresh_windows();
+            return;
+        }
+        if let Err(error) = storage::validate_operation(
+            operation,
+            self.settings.accounts.len(),
+            self.settings.account(account_id).is_some(),
+        ) {
+            self.storage.notice = Some(StorageNotice::error(error.to_string()));
+            cx.refresh_windows();
+            return;
+        }
+        self.storage.running = Some(RunningStorageOperation {
+            account_id: account_id.to_string(),
+            operation,
+        });
+        self.storage.notice = None;
+        self.gtk
+            .clear_storage(account_id, operation, self.paths.clone());
+        cx.refresh_windows();
+    }
+
+    fn handle_storage_finished(
+        &mut self,
+        account_id: String,
+        operation: StorageOperation,
+        result: Result<u64, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.storage.running = None;
+        let notice = match result {
+            Ok(freed) => {
+                self.settings.last_storage_cleanup =
+                    Some(crate::settings::format_timestamp(SystemTime::now()));
+                match operation {
+                    StorageOperation::RemoveData => {
+                        self.forget_account(&account_id, cx);
+                        StorageNotice::success(format!(
+                            "Deleted the account data and removed the account ({} freed).",
+                            storage::format_bytes(freed)
+                        ))
+                    }
+                    StorageOperation::ClearCache => {
+                        self.recreate_account_webview(&account_id);
+                        StorageNotice::success(format!(
+                            "Cache cleared ({} freed). The WhatsApp session was kept.",
+                            storage::format_bytes(freed)
+                        ))
+                    }
+                    StorageOperation::ClearSession => {
+                        self.recreate_account_webview(&account_id);
+                        StorageNotice::success(
+                            "Signed out. The account was kept; open it and scan the QR code again.",
+                        )
+                    }
+                }
+            }
+            Err(error) => {
+                self.recreate_account_webview(&account_id);
+                StorageNotice::error(format!("Could not {}: {error}", operation.label()))
+            }
+        };
+        self.storage.notice = Some(notice);
         self.save_settings(cx);
         self.sync_download_layout();
         self.update_tray();
+        self.refresh_storage(cx);
         cx.refresh_windows();
+    }
 
-        let directory = self.paths.account_dir(account_id);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
-            if let Err(error) = std::fs::remove_dir_all(&directory) {
-                warn!(path = %directory.display(), %error, "could not remove account data");
-            }
+    /// Recreates the GTK overlay after its profile was cleared. A closed GPUI
+    /// window is left alone: the next open creates a fresh webview anyway.
+    fn recreate_account_webview(&mut self, account_id: &str) {
+        if !self.account_windows.contains_key(account_id)
+            || self.settings.account(account_id).is_none()
+        {
+            return;
+        }
+        let scale = self.scales.get(account_id).copied().unwrap_or(1.0);
+        let show = !self.hidden_accounts.contains(account_id) && !self.locked;
+        let parent_xid = self.account_xids.get(account_id).copied();
+        let url = self
+            .pending_urls
+            .remove(account_id)
+            .unwrap_or_else(|| WHATSAPP_URL.to_string());
+        self.crash_recovery.remove(account_id);
+        self.gtk.send(GtkCommand::Create {
+            account_id: account_id.to_string(),
+            parent_xid,
+            data_dir: self.paths.account_data_dir(account_id),
+            cache_dir: self.paths.account_cache_dir(account_id),
+            url,
+            html: None,
+            show,
+            scale,
+            zoom: self.settings.zoom,
+            writing: self.settings.writing.clone(),
         });
     }
 

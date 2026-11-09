@@ -46,12 +46,14 @@ That split matters:
 - **Persistent login.** Scan the QR code once and stay signed in across restarts.
 - **Per-account unread counts**, notifications, and tray entries.
 - **Remembered window bounds** per account.
+- **Private on-disk data.** The settings file and each account's WebKit profile are created with `0600`/`0700` permissions. Existing installations are migrated on startup without following symlinks; the process runs with a restrictive `umask` so WebKit's cookies, local storage, IndexedDB, and caches inherit private modes.
+- **Storage manager.** Settings > Storage lists how much data and cache every account uses, the total, the free disk space, and the time of the last cleanup. Clear the cache without signing out, sign out while keeping the account, or delete an account's data after typing its name. The scan runs on a worker thread and every cleanup closes and recreates the affected webview so WebKit never writes into a directory that is being deleted.
 
 ### Native shell
 
 - **Custom GPUI titlebar** with the account name, unread badge, settings, lock, minimize, maximize, and close controls, plus drag and edge-resize support.
 - **Clipboard paste.** Copy a file, photo, video, or a screenshot/image from the clipboard and press `Ctrl+V` in a chat: OxideZap injects it into WhatsApp's attachment flow. Screenshots and image data are encoded as PNG and sent as photos, never as stickers. Files over 64 MB should use the attach button.
-- **Settings window** with Accounts, Appearance, Notifications, General, Security, and About sections.
+- **Settings window** with Accounts, Storage, Appearance, Notifications, General, Security, and About sections.
 - **Themes**: System, Light, and Dark for the native shell.
 - **WhatsApp zoom** from 80% to 150%.
 - **Composer spell checking.** Choose Automatic (desktop locale), Spanish, English, or Disabled, and toggle **Correct while I type**. WebKitGTK checks locally with the system hunspell dictionaries; no text is sent to external services.
@@ -307,6 +309,16 @@ windows: 1
 
 OxideZap follows `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_RUNTIME_DIR` when they are set. Removing an account from Settings also removes its WebKit profile directory.
 
+### Storage manager
+
+Settings -> Storage reads the account directories without following symlinks. The size scan runs on a background worker with an entry and depth limit, so the values are a lower bound while WhatsApp Web is still writing; `partial` marks a scan that hit a limit or an unreadable entry.
+
+- **Clear cache** removes `cache/` and recreates it. The WebKit data directory, and therefore the WhatsApp session, is untouched. If the account window is open, it asks first because the window has to close and reload.
+- **Sign out** removes `data/` and recreates it. The account and its cache stay configured, but WhatsApp Web asks for the QR code again.
+- **Delete account data** removes the complete account directory and the account entry. It requires typing the account name, cannot be undone, and is refused for the last remaining account.
+
+Every action first closes the account's `WebKitWebView` on the GTK thread, deletes the directory on a worker, and recreates the webview only when the account window is still open. The last successful cleanup timestamp is stored in `settings.json` as `last_storage_cleanup`. The **Open data folder** button opens the directory that contains every profile (`~/.local/share/oxidezap/` by default).
+
 ### Backup and restore
 
 Settings -> General includes **Export settings**, **Import settings**, and **Reset settings**. The export is a readable JSON document with a `version`, an `exported_at` UTC timestamp, and a `settings` object. An import validates the version and size, ignores unknown fields, normalizes out-of-range values such as zoom, shows a summary of the changes, and applies nothing until you confirm. Invalid or oversized files leave the current configuration untouched.
@@ -314,7 +326,7 @@ Settings -> General includes **Export settings**, **Import settings**, and **Res
 Exports contain preferences only:
 
 - account names and per-account notification preferences, but **not** WhatsApp sessions, cookies, WebKit storage, chats, or message history;
-- no unread counts or remembered window positions (runtime state);
+- no unread counts, remembered window positions, or the storage cleanup timestamp (runtime state);
 - **no app-lock password hash**. The lock is disabled in an export, so after importing or resetting you must set the password again in Settings -> Security.
 
 Every import and reset writes a dated backup of the current `settings.json` to `~/.config/oxidezap/backups/` **before** changing anything, with `0600` permissions. If the backup cannot be written, the operation is cancelled. A reset restores preference defaults but keeps the configured accounts and their local sessions.
@@ -349,6 +361,8 @@ GPUI window (taskbar entry)
 
 The two threads communicate over channels. The GPUI side sends commands such as create, show, hide, load, zoom, reload, cancel a download, retry a download, and quit; the WebKit side reports ready state, load state, titles (from which unread counts are derived), notifications, download started/progress/finished events, external links, and crashes.
 
+Storage cleanup uses the same channel protocol. The GPUI side asks the GTK thread to close the account webview; the GTK thread then deletes the profile on a worker and reports the freed bytes back as an event. WebKitGTK 2.0.2 does not expose `WebsiteDataManager::clear`, so a coordinated in-place wipe is not available and the close/recreate cycle is the supported path. The short delay before deletion lets the web process release its SQLite and cache handles.
+
 ## Security and privacy
 
 - OxideZap is an **unofficial client**. It is not affiliated with WhatsApp or Meta.
@@ -369,6 +383,8 @@ The two threads communicate over channels. The GPUI side sends commands such as 
 - **Calls and voice notes** depend on WebKitGTK's WebRTC support and on the desktop portal configuration. They are not guaranteed on every distribution.
 - **Notifications** require a notification daemon. **The tray** requires a StatusNotifier host; desktops without one will not show the tray icon. Notification sounds depend on the daemon and sound theme, and some hosts ignore dynamic tray pixmaps, in which case the per-account tooltip remains available.
 - **Spell checking depends on system dictionaries and WhatsApp Web.** WebKitGTK checks only languages whose hunspell dictionaries are installed, and WhatsApp Web owns the composer, so it can override spellcheck attributes or Enter-to-send behavior. Language changes apply to open accounts immediately, but the composer may need focus or a reload before it shows new underlines.
+- **Storage sizes are approximate.** The scanner skips symlinks and stops after 200,000 entries or 32 directory levels. WebKit may create, grow, or release files while a scan is running, so the reported total is a lower bound; a `partial` marker means the scan hit a limit or an unreadable entry. Clearing data closes and recreates the account webview, so an open chat reloads after the operation.
+- **Destructive storage actions are guarded.** Clearing the cache of an open account asks first, signing out asks for confirmation, deleting account data requires typing the account name, and the last account cannot be deleted. The webview is always closed before its profile is touched; OxideZap never deletes files outside `accounts/` and refuses symlinked account or profile directories.
 - **The first login requires a QR scan** from the WhatsApp mobile app.
 - **Downloads depend on WebKit's delivery mode.** Files served as ordinary HTTP(S) responses can be tracked, cancelled, and retried. `blob:`/`data:` transfers, encrypted media that never becomes a normal download, and view-once media do not appear in the Download Center; view-once downloads are deliberately unsupported.
 - **No auto-update.** Reinstall or replace the binary to update.
