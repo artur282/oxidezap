@@ -120,6 +120,145 @@ pub struct LockSettings {
     pub idle_minutes: u32,
 }
 
+/// Languages offered for the WhatsApp composer. `Automatic` delegates to the
+/// desktop locale; `Disabled` turns WebKitGTK spell checking off without
+/// discarding the other writing preferences.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SpellCheckLanguage {
+    #[default]
+    Automatic,
+    Spanish,
+    English,
+    Disabled,
+}
+
+impl SpellCheckLanguage {
+    pub fn label(self) -> &'static str {
+        match self {
+            SpellCheckLanguage::Automatic => "Automatic",
+            SpellCheckLanguage::Spanish => "Spanish",
+            SpellCheckLanguage::English => "English",
+            SpellCheckLanguage::Disabled => "Disabled",
+        }
+    }
+
+    /// Parses a persisted or locale-style identifier. Unknown values fall back
+    /// to `Automatic` instead of discarding the whole settings file.
+    pub fn parse(value: &str) -> Self {
+        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+        let language = normalized.split(['.', '_']).next().unwrap_or_default();
+        match language {
+            "es" | "spanish" => SpellCheckLanguage::Spanish,
+            "en" | "english" => SpellCheckLanguage::English,
+            "disabled" | "off" | "none" => SpellCheckLanguage::Disabled,
+            _ => SpellCheckLanguage::Automatic,
+        }
+    }
+
+    /// Locale identifiers passed to WebKitGTK. An empty list means the
+    /// desktop locale, which is resolved by `WritingSettings`.
+    pub fn codes(self) -> &'static [&'static str] {
+        match self {
+            SpellCheckLanguage::Automatic | SpellCheckLanguage::Disabled => &[],
+            SpellCheckLanguage::Spanish => &["es"],
+            SpellCheckLanguage::English => &["en"],
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SpellCheckLanguage {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::parse(&value))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WritingSettings {
+    /// The "Correct while I type" toggle. It stays independent from the
+    /// language so turning it off does not erase the selected language.
+    pub spell_check: bool,
+    pub language: SpellCheckLanguage,
+}
+
+impl Default for WritingSettings {
+    fn default() -> Self {
+        Self {
+            spell_check: true,
+            language: SpellCheckLanguage::Automatic,
+        }
+    }
+}
+
+impl WritingSettings {
+    /// Selects a language. Choosing `Disabled` turns checking off; choosing
+    /// any other language turns it back on so the two controls cannot leave
+    /// the UI in a state where the toggle looks enabled but nothing is
+    /// checked.
+    pub fn set_language(&mut self, language: SpellCheckLanguage) {
+        self.language = language;
+        self.spell_check = language != SpellCheckLanguage::Disabled;
+    }
+
+    /// Toggles checking. Turning it back on while the language is `Disabled`
+    /// falls back to `Automatic` instead of leaving checking silently off.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.spell_check = enabled;
+        if enabled && self.language == SpellCheckLanguage::Disabled {
+            self.language = SpellCheckLanguage::Automatic;
+        }
+    }
+
+    pub fn normalize(&mut self) {
+        if self.language == SpellCheckLanguage::Disabled {
+            self.spell_check = false;
+        }
+    }
+
+    pub fn spell_checking_enabled(&self) -> bool {
+        self.spell_check && self.language != SpellCheckLanguage::Disabled
+    }
+
+    /// Resolves the language list for WebKitGTK. Automatic uses the desktop
+    /// locale list, filtered to identifiers the platform spell checker can
+    /// load; explicit choices use the ISO-639 codes.
+    pub fn spell_checking_languages(&self, system_locales: &[String]) -> Vec<String> {
+        if !self.spell_checking_enabled() {
+            return Vec::new();
+        }
+        match self.language {
+            SpellCheckLanguage::Automatic => normalize_locales(system_locales),
+            language => language
+                .codes()
+                .iter()
+                .map(|code| (*code).to_string())
+                .collect(),
+        }
+    }
+}
+
+/// Converts GLib locale names such as `es_AR.UTF-8` into the `lang_COUNTRY`
+/// identifiers WebKitGTK expects, preserving preference order and dropping
+/// the placeholder `C`/`POSIX` locales.
+fn normalize_locales(locales: &[String]) -> Vec<String> {
+    let mut normalized: Vec<String> = Vec::new();
+    for locale in locales {
+        let name = locale.split(['.', '@']).next().unwrap_or_default().trim();
+        if name.is_empty() || name == "C" || name == "POSIX" {
+            continue;
+        }
+        if !normalized.iter().any(|existing| existing == name) {
+            normalized.push(name.to_string());
+        }
+    }
+    normalized
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
@@ -137,6 +276,7 @@ pub struct Settings {
     pub remember_bounds: bool,
     pub shortcut: String,
     pub lock: LockSettings,
+    pub writing: WritingSettings,
 }
 
 impl Default for Settings {
@@ -156,6 +296,7 @@ impl Default for Settings {
             remember_bounds: true,
             shortcut: DEFAULT_SHORTCUT.to_string(),
             lock: LockSettings::default(),
+            writing: WritingSettings::default(),
         }
     }
 }
@@ -230,6 +371,7 @@ impl Settings {
         if self.lock.hash.is_none() {
             self.lock.enabled = false;
         }
+        self.writing.normalize();
         self.ensure_first_account();
         if self
             .active_account
@@ -1084,6 +1226,224 @@ mod tests {
         let generation = debounce.mark_dirty().expect("a timer is scheduled");
         debounce.clear();
         assert!(!debounce.timer_fired(generation));
+    }
+
+    #[test]
+    fn spell_check_language_parses_locale_identifiers() {
+        assert_eq!(
+            SpellCheckLanguage::parse("automatic"),
+            SpellCheckLanguage::Automatic
+        );
+        assert_eq!(
+            SpellCheckLanguage::parse("auto"),
+            SpellCheckLanguage::Automatic
+        );
+        assert_eq!(SpellCheckLanguage::parse("es"), SpellCheckLanguage::Spanish);
+        assert_eq!(
+            SpellCheckLanguage::parse("es_AR"),
+            SpellCheckLanguage::Spanish
+        );
+        assert_eq!(
+            SpellCheckLanguage::parse("es-419"),
+            SpellCheckLanguage::Spanish
+        );
+        assert_eq!(
+            SpellCheckLanguage::parse("Spanish"),
+            SpellCheckLanguage::Spanish
+        );
+        assert_eq!(
+            SpellCheckLanguage::parse("en_US"),
+            SpellCheckLanguage::English
+        );
+        assert_eq!(
+            SpellCheckLanguage::parse("en-GB"),
+            SpellCheckLanguage::English
+        );
+        assert_eq!(
+            SpellCheckLanguage::parse("English"),
+            SpellCheckLanguage::English
+        );
+        assert_eq!(
+            SpellCheckLanguage::parse("disabled"),
+            SpellCheckLanguage::Disabled
+        );
+        assert_eq!(
+            SpellCheckLanguage::parse("off"),
+            SpellCheckLanguage::Disabled
+        );
+        assert_eq!(
+            SpellCheckLanguage::parse("klingon"),
+            SpellCheckLanguage::Automatic
+        );
+        assert_eq!(SpellCheckLanguage::parse(""), SpellCheckLanguage::Automatic);
+    }
+
+    #[test]
+    fn locale_normalization_strips_encodings_and_modifiers() {
+        let locales = vec![
+            "es_AR.UTF-8".to_string(),
+            "es_AR".to_string(),
+            "sr_RS@latin".to_string(),
+            "C".to_string(),
+            "POSIX".to_string(),
+            "".to_string(),
+            "es_AR".to_string(),
+        ];
+
+        assert_eq!(
+            normalize_locales(&locales),
+            vec!["es_AR".to_string(), "sr_RS".to_string()]
+        );
+    }
+
+    #[test]
+    fn spell_check_language_selection_maps_to_webkit_locales() {
+        let system = vec![
+            "es_AR.UTF-8".to_string(),
+            "es_AR".to_string(),
+            "es".to_string(),
+            "C".to_string(),
+        ];
+
+        let automatic = WritingSettings::default();
+        assert_eq!(
+            automatic.spell_checking_languages(&system),
+            vec!["es_AR".to_string(), "es".to_string()]
+        );
+
+        let spanish = WritingSettings {
+            language: SpellCheckLanguage::Spanish,
+            ..WritingSettings::default()
+        };
+        assert_eq!(
+            spanish.spell_checking_languages(&system),
+            vec!["es".to_string()]
+        );
+
+        let english = WritingSettings {
+            language: SpellCheckLanguage::English,
+            ..WritingSettings::default()
+        };
+        assert_eq!(
+            english.spell_checking_languages(&system),
+            vec!["en".to_string()]
+        );
+
+        let disabled = WritingSettings {
+            language: SpellCheckLanguage::Disabled,
+            ..WritingSettings::default()
+        };
+        assert!(!disabled.spell_checking_enabled());
+        assert!(disabled.spell_checking_languages(&system).is_empty());
+    }
+
+    #[test]
+    fn disabling_spell_check_keeps_the_selected_language() {
+        let writing = WritingSettings {
+            spell_check: false,
+            language: SpellCheckLanguage::Spanish,
+        };
+        let system = vec!["es_ES".to_string()];
+
+        assert!(!writing.spell_checking_enabled());
+        assert!(writing.spell_checking_languages(&system).is_empty());
+        assert_eq!(writing.language, SpellCheckLanguage::Spanish);
+    }
+
+    #[test]
+    fn selecting_the_disabled_language_turns_spell_check_off() {
+        let mut writing = WritingSettings::default();
+
+        writing.set_language(SpellCheckLanguage::Disabled);
+
+        assert!(!writing.spell_check);
+        assert!(!writing.spell_checking_enabled());
+
+        writing.set_enabled(true);
+
+        assert_eq!(writing.language, SpellCheckLanguage::Automatic);
+        assert!(writing.spell_checking_enabled());
+    }
+
+    #[test]
+    fn normalize_turns_off_checking_for_the_disabled_language() {
+        let mut writing = WritingSettings {
+            spell_check: true,
+            language: SpellCheckLanguage::Disabled,
+        };
+
+        writing.normalize();
+
+        assert!(!writing.spell_check);
+        assert!(!writing.spell_checking_enabled());
+    }
+
+    #[test]
+    fn legacy_settings_default_to_automatic_spell_check() {
+        let json = br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"active_account":"a"}"#;
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+
+        assert!(settings.writing.spell_check);
+        assert_eq!(settings.writing.language, SpellCheckLanguage::Automatic);
+    }
+
+    #[test]
+    fn legacy_settings_file_loads_with_default_writing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"active_account":"a"}"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(&path).unwrap();
+
+        assert!(settings.writing.spell_check);
+        assert_eq!(settings.writing.language, SpellCheckLanguage::Automatic);
+    }
+
+    #[test]
+    fn loading_normalizes_the_disabled_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"active_account":"a","writing":{"spell_check":true,"language":"disabled"}}"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(&path).unwrap();
+
+        assert!(!settings.writing.spell_check);
+        assert!(!settings.writing.spell_checking_enabled());
+    }
+
+    #[test]
+    fn unknown_spell_check_language_falls_back_to_automatic() {
+        let json =
+            br#"{"version":1,"accounts":[],"writing":{"spell_check":false,"language":"klingon"}}"#;
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+
+        assert!(!settings.writing.spell_check);
+        assert_eq!(settings.writing.language, SpellCheckLanguage::Automatic);
+    }
+
+    #[test]
+    fn writing_settings_round_trip() {
+        let settings = Settings {
+            writing: WritingSettings {
+                spell_check: false,
+                language: SpellCheckLanguage::English,
+            },
+            ..Settings::default()
+        };
+
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""language":"english""#));
+
+        let loaded: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.writing, settings.writing);
     }
 
     #[test]

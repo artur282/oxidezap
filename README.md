@@ -54,6 +54,7 @@ That split matters:
 - **Settings window** with Accounts, Appearance, Notifications, General, Security, and About sections.
 - **Themes**: System, Light, and Dark for the native shell.
 - **WhatsApp zoom** from 80% to 150%.
+- **Composer spell checking.** Choose Automatic (desktop locale), Spanish, English, or Disabled, and toggle **Correct while I type**. WebKitGTK checks locally with the system hunspell dictionaries; no text is sent to external services.
 - **Notification toggle** in Settings.
 - **Close to tray**, **launch at login**, **remember bounds**, and a **configurable global shortcut**.
 - **App lock** with an Argon2id password. Lock on launch, on hide, or after an idle timeout; lock now from the tray or Settings; reset the password from Settings. The lock window hides every account window until the password is verified.
@@ -86,6 +87,8 @@ That split matters:
 The tray requires a StatusNotifier host. Native notifications require a notification daemon. Voice and video calls, as well as voice-note recording, depend on WebKitGTK's WebRTC and portal support and may not work on every distribution.
 
 The Flatpak and AppImage artifacts do not change these requirements. The Flatpak runtime supplies WebKitGTK 2.54.1 and GTK 3; the AppImage uses the host's WebKitGTK and GTK 3 and does not bundle them.
+
+Spell checking additionally requires hunspell dictionaries for the languages you select, for example `hunspell-es` and `hunspell-en-us` on Debian-based distributions. WebKitGTK silently skips a language with no installed dictionary.
 
 ### Debian, Ubuntu, and Linux Mint
 
@@ -230,6 +233,7 @@ chmod +x oxidezap-v0.1.0-x86_64.AppImage
 | Lock the app | Tray -> **Lock now**, or Settings -> Security -> **Lock now** |
 | Back up or restore settings | Settings -> General -> **Export settings**, **Import settings**, or **Reset settings** |
 | Change WhatsApp zoom | Settings -> Appearance -> Display size |
+| Change the spell check language | Settings -> General -> Writing |
 | Quit | Tray -> **Quit**, or `oxidezap --quit` |
 | Open an account | `oxidezap --account <id\|name>` |
 | Open a chat | `oxidezap --chat <phone\|chat-id>` |
@@ -353,7 +357,8 @@ The two threads communicate over channels. The GPUI side sends commands such as 
 - **Settings exports contain no secrets.** Exported files omit the app-lock password hash and every piece of WebKit session data. Automatic backups do contain the full settings, including the hash, so they are written to a `0700` directory as `0600` files.
 - **WebKit permissions are scoped to WhatsApp.** Only `whatsapp.com`, `wa.me`, `chat.whatsapp.com`, and WhatsApp's `whatsapp.net` utility pages may request permissions. Camera and microphone access always shows a native confirmation dialog; notifications are allowed only when the Settings notification toggle is on; every other permission type and origin is denied.
 - The optional app lock hashes the password with **Argon2id** and verifies it locally. The lock protects access to the running UI; it does not encrypt the WebKit profile on disk.
-- Notifications show the sender and message preview. You can disable them in Settings.
+- **Spell checking is local.** WebKitGTK uses the system hunspell dictionaries; OxideZap never sends composed text to a translation, cloud checking, or text service.
+- Notifications show the sender and message preview. You can disable them in Settings, mute individual accounts, or enable Do Not Disturb.
 
 ## Limitations
 
@@ -361,7 +366,8 @@ The two threads communicate over channels. The GPUI side sends commands such as 
 - **The global shortcut uses X11 `XGrabKey`.** It does not work on a pure Wayland session and can conflict with shortcuts registered by the desktop environment.
 - **WhatsApp Web dominates memory use.** OxideZap keeps the native shell small, not the web content.
 - **Calls and voice notes** depend on WebKitGTK's WebRTC support and on the desktop portal configuration. They are not guaranteed on every distribution.
-- **Notifications** require a notification daemon. **The tray** requires a StatusNotifier host; desktops without one will not show the tray icon.
+- **Notifications** require a notification daemon. **The tray** requires a StatusNotifier host; desktops without one will not show the tray icon. Notification sounds depend on the daemon and sound theme, and some hosts ignore dynamic tray pixmaps, in which case the per-account tooltip remains available.
+- **Spell checking depends on system dictionaries and WhatsApp Web.** WebKitGTK checks only languages whose hunspell dictionaries are installed, and WhatsApp Web owns the composer, so it can override spellcheck attributes or Enter-to-send behavior. Language changes apply to open accounts immediately, but the composer may need focus or a reload before it shows new underlines.
 - **The first login requires a QR scan** from the WhatsApp mobile app.
 - **No auto-update.** Reinstall or replace the binary to update.
 - **The app lock does not encrypt data at rest.** It gates the UI, not the files on disk.

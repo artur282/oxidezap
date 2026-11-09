@@ -11,8 +11,8 @@ use crate::app::{AppModel, AppModelEntityExt};
 use crate::assets::{ICON_BELL, ICON_GEAR, ICON_INFO, ICON_PALETTE, ICON_SHIELD, ICON_USER};
 use crate::lock::MIN_PASSWORD_LENGTH;
 use crate::settings::{
-    ImportPreview, MAX_ZOOM, MIN_ZOOM, Settings, SettingsExport, ThemeMode, export_file_name,
-    json_path, write_settings_backup,
+    ImportPreview, MAX_ZOOM, MIN_ZOOM, Settings, SettingsExport, SpellCheckLanguage, ThemeMode,
+    export_file_name, json_path, write_settings_backup,
 };
 use crate::shortcut::Shortcut;
 use crate::theme::Theme;
@@ -1064,7 +1064,7 @@ impl SettingsWindow {
             .gap(px(18.))
             .child(section_header(
                 "General",
-                "Window behavior, startup, and the global show/hide shortcut.",
+                "Window behavior, startup, writing, and the global show/hide shortcut.",
                 theme,
             ))
             .child(
@@ -1108,6 +1108,7 @@ impl SettingsWindow {
                         }),
                     )),
             )
+            .child(writing_card(settings, theme, cx))
             .child(
                 card(theme)
                     .child(
@@ -1607,6 +1608,80 @@ impl SettingsWindow {
             )
             .into_any_element()
     }
+}
+
+fn writing_card(
+    settings: &Settings,
+    theme: Theme,
+    cx: &mut Context<SettingsWindow>,
+) -> impl IntoElement {
+    let mut language_row = div().flex().flex_wrap().gap(px(8.));
+    for language in [
+        SpellCheckLanguage::Automatic,
+        SpellCheckLanguage::Spanish,
+        SpellCheckLanguage::English,
+        SpellCheckLanguage::Disabled,
+    ] {
+        let selected = settings.writing.language == language;
+        let label = if selected {
+            format!("✓ {}", language.label())
+        } else {
+            language.label().to_string()
+        };
+        let writing = settings.writing.clone();
+        language_row = language_row.child(button(
+            SharedString::from(format!(
+                "spell-check-language-{}",
+                language.label().to_lowercase()
+            )),
+            label,
+            theme,
+            selected,
+            cx.listener(move |this, _event, _window, cx| {
+                let mut writing = writing.clone();
+                writing.set_language(language);
+                this.model
+                    .update(cx, |model, cx| model.set_writing(writing, cx));
+            }),
+        ));
+    }
+
+    let writing = settings.writing.clone();
+    card(theme)
+        .child(
+            div()
+                .text_size(px(12.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted)
+                .child("Writing"),
+        )
+        .child(
+            div()
+                .text_size(px(13.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child("Spell check language"),
+        )
+        .child(language_row)
+        .child(toggle_row(
+            "spell-check-enabled",
+            "Correct while I type",
+            "Use WebKitGTK's local spell checker in the WhatsApp composer.",
+            settings.writing.spell_check,
+            theme,
+            cx.listener(move |this, _event, _window, cx| {
+                let mut writing = writing.clone();
+                writing.set_enabled(!writing.spell_check);
+                this.model
+                    .update(cx, |model, cx| model.set_writing(writing, cx));
+            }),
+        ))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(theme.text_faint)
+                .child("Automatic follows the desktop locale. WebKitGTK only checks languages whose hunspell dictionaries are installed. Changes apply to open accounts; WhatsApp Web still controls its own composer and Enter-to-send behavior."),
+        )
 }
 
 impl Focusable for SettingsWindow {

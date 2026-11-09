@@ -19,6 +19,7 @@ use crate::notify;
 use crate::paths::{APP_ID, Paths};
 use crate::settings::{
     Account, SETTINGS_SAVE_DEBOUNCE, SaveDebounce, SavedBounds, Settings, SettingsWriter,
+    WritingSettings,
 };
 use crate::shortcut::Shortcut;
 use crate::single_instance::{
@@ -855,6 +856,7 @@ impl AppModel {
             show: !(self.start_hidden || self.locked),
             scale,
             zoom: self.settings.zoom,
+            writing: self.settings.writing.clone(),
         });
 
         self.settings.active_account = Some(account.id.clone());
@@ -1117,6 +1119,16 @@ impl AppModel {
         if self.settings.set_zoom(zoom) {
             self.apply_settings(cx);
         }
+    }
+
+    pub fn set_writing(&mut self, mut writing: WritingSettings, cx: &mut Context<Self>) {
+        writing.normalize();
+        if self.settings.writing == writing {
+            return;
+        }
+        self.settings.writing = writing;
+        self.apply_settings(cx);
+        self.gtk.set_writing(self.settings.writing.clone());
     }
 
     pub fn set_shortcut(&mut self, shortcut: Shortcut, cx: &mut Context<Self>) {

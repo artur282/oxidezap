@@ -18,6 +18,7 @@ use webkit2gtk::{
 };
 
 use crate::links::{self, LinkAction};
+use crate::settings::WritingSettings;
 use crate::unread::parse_unread;
 use crate::x11::{Geometry, X11};
 
@@ -97,6 +98,7 @@ pub enum GtkCommand {
         show: bool,
         scale: f32,
         zoom: f64,
+        writing: WritingSettings,
     },
     Show {
         account_id: String,
@@ -107,6 +109,9 @@ pub enum GtkCommand {
     SetZoom {
         account_id: String,
         zoom: f64,
+    },
+    SetWriting {
+        writing: WritingSettings,
     },
     SetScale {
         account_id: String,
@@ -152,6 +157,10 @@ impl GtkHandle {
             account_id: account_id.to_string(),
             zoom,
         });
+    }
+
+    pub fn set_writing(&self, writing: WritingSettings) {
+        self.send(GtkCommand::SetWriting { writing });
     }
 
     pub fn set_scale(&self, account_id: &str, scale: f32) {
@@ -314,6 +323,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
             show,
             scale,
             zoom,
+            writing,
         } => {
             match create_entry(
                 &account_id,
@@ -324,6 +334,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 show,
                 scale,
                 zoom,
+                &writing,
                 state.events.clone(),
                 state.downloads_dir.clone(),
                 state.notifications_enabled,
@@ -365,6 +376,13 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
             if let Some(entry) = state.entries.get_mut(&account_id) {
                 entry.zoom = zoom;
                 entry.webview.set_zoom_level(zoom);
+            }
+        }
+        GtkCommand::SetWriting { writing } => {
+            for entry in state.entries.values() {
+                if let Some(context) = entry.webview.context() {
+                    apply_spell_checking(&context, &writing);
+                }
             }
         }
         GtkCommand::SetScale { account_id, scale } => {
@@ -409,6 +427,7 @@ fn create_entry(
     show: bool,
     scale: f32,
     zoom: f64,
+    writing: &WritingSettings,
     events: Sender<GtkEvent>,
     downloads_dir: PathBuf,
     notifications_enabled: bool,
@@ -434,6 +453,7 @@ fn create_entry(
         .base_cache_directory(cache_dir.to_string_lossy().as_ref())
         .build();
     let context = webkit2gtk::WebContext::with_website_data_manager(&manager);
+    apply_spell_checking(&context, writing);
     let webview = webkit2gtk::WebView::with_context(&context);
     webview.set_hexpand(true);
     webview.set_vexpand(true);
@@ -493,6 +513,28 @@ fn create_entry(
         transient_for: None,
         last_geometry: None,
     })
+}
+
+/// Applies the composer writing preferences to a WebKit context.
+///
+/// WebKitGTK 2.0.2 exposes spell checking on `WebContext`, not on `Settings`:
+/// `set_spell_checking_enabled` and `set_spell_checking_languages`. The
+/// language list is kept globally in the UI process, so the same call reaches
+/// every open account while a new context also receives it before its first
+/// page load.
+fn apply_spell_checking(context: &webkit2gtk::WebContext, writing: &WritingSettings) {
+    let enabled = writing.spell_checking_enabled();
+    context.set_spell_checking_enabled(enabled);
+    if !enabled {
+        return;
+    }
+    let locales: Vec<String> = glib::language_names()
+        .iter()
+        .map(|locale| locale.to_string())
+        .collect();
+    let languages = writing.spell_checking_languages(&locales);
+    let languages: Vec<&str> = languages.iter().map(String::as_str).collect();
+    context.set_spell_checking_languages(&languages);
 }
 
 fn connect_webview_signals(
