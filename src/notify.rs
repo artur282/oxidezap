@@ -1,13 +1,29 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use crossbeam_channel::{Sender, unbounded};
 use notify_rust::Hint;
 use tracing::warn;
 
+use crate::settings::Settings;
+
 /// A themeable named sound from the freedesktop.org sound naming specification.
 /// The notification server decides whether it exists and whether to play it.
 pub const SYSTEM_SOUND: &str = "message-new-instant";
+
+/// Central Do Not Disturb gate shared by every native notification call site.
+/// Message and connection notifications additionally apply per-account mute and
+/// sound preferences in [`Settings`].
+pub fn do_not_disturb_suppressed(settings: &Settings, now: SystemTime) -> bool {
+    settings.do_not_disturb.is_active(now)
+}
+
+/// Gate for notifications that already honor the global switch, such as
+/// downloads, connection events, and message events.
+pub fn notifications_allowed(settings: &Settings, now: SystemTime) -> bool {
+    settings.native_notifications_enabled_at(now)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DesktopNotification {
@@ -131,12 +147,33 @@ pub fn notify_download(filename: &str, destination: &Path, icon: Option<&Path>) 
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     use super::*;
+    use crate::settings::{DoNotDisturbMode, DoNotDisturbSettings, Settings};
 
     fn notification(summary: &str) -> DesktopNotification {
         DesktopNotification::new(summary, "body", None, None)
+    }
+
+    #[test]
+    fn do_not_disturb_and_the_global_switch_gate_native_notifications() {
+        let now = SystemTime::now();
+        let mut settings = Settings::default();
+        assert!(notifications_allowed(&settings, now));
+        assert!(!do_not_disturb_suppressed(&settings, now));
+
+        settings.notifications = false;
+        assert!(!notifications_allowed(&settings, now));
+        assert!(!do_not_disturb_suppressed(&settings, now));
+
+        settings.notifications = true;
+        settings.do_not_disturb = DoNotDisturbSettings {
+            mode: DoNotDisturbMode::On,
+            ..DoNotDisturbSettings::default()
+        };
+        assert!(!notifications_allowed(&settings, now));
+        assert!(do_not_disturb_suppressed(&settings, now));
     }
 
     #[test]

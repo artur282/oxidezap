@@ -258,7 +258,6 @@ fn main() -> Result<()> {
         Ok(message) => message,
         Err(error) => fail(error),
     };
-    warn_scheduled_dnd(&message);
 
     if !smoke && message.is_query() {
         return print_query(&paths, &message);
@@ -309,12 +308,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let settings_existed = paths.settings_file.exists();
     let settings = if smoke {
         smoke_settings()
     } else {
         Settings::load_or_default(&paths.settings_file)
     };
     let start_hidden = autostart && settings.start_at_login;
+    let first_run = !smoke && !settings_existed;
 
     let (gtk_events_tx, gtk_events_rx) = unbounded();
     let gtk: GtkHandle = webview::spawn(
@@ -391,6 +392,7 @@ fn main() -> Result<()> {
                 startup_url,
                 initial_action,
                 start_hidden,
+                first_run,
             )
         });
         model.update(cx, |model, cx| {
@@ -401,17 +403,6 @@ fn main() -> Result<()> {
     });
 
     Ok(())
-}
-
-fn warn_scheduled_dnd(message: &InstanceMessage) {
-    if let InstanceMessage::SetDoNotDisturb(mode) = message {
-        if mode.is_scheduled() {
-            eprintln!(
-                "oxidezap: scheduled Do Not Disturb is not available yet; \
-                 Do Not Disturb will stay on until you turn it off"
-            );
-        }
-    }
 }
 
 fn print_query(paths: &Paths, message: &InstanceMessage) -> Result<()> {
@@ -562,8 +553,8 @@ fn print_help() {
            -h, --help              Print this help\n\
            -V, --version           Print the version\n\
          \n\
-         --dnd 1h and --dnd tomorrow currently enable Do Not Disturb until it is\n\
-         turned off; scheduling arrives with the Do Not Disturb feature.\n\
+         --dnd 1h enables Do Not Disturb for one hour and --dnd tomorrow until\n\
+         the next local midnight. Use Settings or the tray for recurring quiet hours.\n\
          --chat accepts a phone number or <number>@c.us and never sends a message.\n\
          URLs: whatsapp://send?phone=..., https://wa.me/..., https://chat.whatsapp.com/...\n\
          The application requires WebKitGTK 4.1 and an X11 or XWayland session.",

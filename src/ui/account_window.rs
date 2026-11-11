@@ -1,11 +1,12 @@
 use gpui::{
-    App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render,
-    ResizeEdge, SharedString, Subscription, Window, div, prelude::*, px, rgb,
+    App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    MouseButton, Render, ResizeEdge, SharedString, Subscription, Window, div, prelude::*, px, rgb,
 };
 
-use crate::app::{AppModel, ConnectionState};
-use crate::assets::{ICON_GEAR, ICON_LOCK, ICON_MINUS, ICON_SQUARE, ICON_X};
+use crate::app::{AccountViewState, AppModel, ConnectionState};
+use crate::assets::{ICON_GEAR, ICON_LOCK, ICON_MINUS, ICON_PALETTE, ICON_SQUARE, ICON_X};
 use crate::theme::Theme;
+use crate::ui::command_palette::digit_account_index;
 use crate::ui::components::{
     app_icon, button, handle_focus_traversal, titlebar_button, unread_badge,
 };
@@ -51,6 +52,43 @@ impl AccountWindow {
         self.model
             .update(cx, |model, cx| model.retry_account(&account_id, cx));
     }
+
+    fn open_palette(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let account_id = self.account_id.clone();
+        let bounds = window.bounds();
+        self.model.update(cx, |model, cx| {
+            model.open_command_palette(Some(account_id), Some(bounds), cx);
+        });
+    }
+
+    /// Ctrl+K opens the palette and Ctrl+1..9 switches accounts while the
+    /// native window owns the keyboard. All other keys fall through to the
+    /// existing tab traversal.
+    fn handle_shortcut(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if !keystroke.modifiers.control
+            || keystroke.modifiers.alt
+            || keystroke.modifiers.shift
+            || keystroke.modifiers.platform
+        {
+            return;
+        }
+        if keystroke.key == "k" {
+            self.open_palette(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(index) = digit_account_index(&keystroke.key) {
+            self.model
+                .update(cx, |model, cx| model.activate_account_at(index, cx));
+            cx.stop_propagation();
+        }
+    }
 }
 
 impl Focusable for AccountWindow {
@@ -73,7 +111,7 @@ impl Render for AccountWindow {
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
         }
 
-        let (theme, name, unread, crash_failed, connection) = {
+        let (theme, name, unread, crash_failed, connection, view_state) = {
             let model = self.model.read(cx);
             (
                 model.theme(window),
@@ -81,6 +119,7 @@ impl Render for AccountWindow {
                 model.account_unread(&self.account_id),
                 model.account_crash_failed(&self.account_id),
                 model.account_connection(&self.account_id),
+                model.account_view_state(&self.account_id),
             )
         };
 
@@ -140,6 +179,7 @@ impl Render for AccountWindow {
             .flex_col()
             .bg(theme.bg)
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::handle_shortcut))
             .on_key_down(handle_focus_traversal)
             .child(
                 div()
@@ -157,17 +197,20 @@ impl Render for AccountWindow {
                             .items_center()
                             .h_full()
                             .gap(px(4.))
-                            .child(connection_badge(connection, theme))
-                            .when(connection.retry_available(), |element| {
-                                element.child(button(
-                                    "account-connection-retry",
-                                    "Retry now",
-                                    theme,
-                                    false,
-                                    cx.listener(|this, _event, _window, cx| {
-                                        this.retry(cx);
-                                    }),
-                                ))
+                            .when(view_state.is_loaded(), |element| {
+                                element
+                                    .child(connection_badge(connection, theme))
+                                    .when(connection.retry_available(), |element| {
+                                        element.child(button(
+                                            "account-connection-retry",
+                                            "Retry now",
+                                            theme,
+                                            false,
+                                            cx.listener(|this, _event, _window, cx| {
+                                                this.retry(cx);
+                                            }),
+                                        ))
+                                    })
                             }),
                     )
                     .child(
@@ -175,6 +218,16 @@ impl Render for AccountWindow {
                             .flex()
                             .items_center()
                             .h_full()
+                            .child(titlebar_button(
+                                "account-command-palette",
+                                ICON_PALETTE,
+                                "Command palette (Ctrl+K)",
+                                theme,
+                                false,
+                                cx.listener(|this, _event, window, cx| {
+                                    this.open_palette(window, cx);
+                                }),
+                            ))
                             .child(titlebar_button(
                                 "account-settings",
                                 ICON_GEAR,
@@ -242,7 +295,69 @@ impl Render for AccountWindow {
                             .items_center()
                             .gap(px(14.))
                             .child(app_icon(64.0))
-                            .when(!crash_failed, |element| {
+                            .when(view_state == AccountViewState::Suspended, |element| {
+                                element
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(theme.text)
+                                            .child("Account suspended"),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(440.))
+                                            .text_center()
+                                            .text_size(px(13.))
+                                            .text_color(theme.text_muted)
+                                            .child(
+                                                "WhatsApp Web is not running, so its memory was released. Your login, chats, and settings stay on disk.",
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(440.))
+                                            .text_center()
+                                            .text_size(px(12.))
+                                            .text_color(theme.text_faint)
+                                            .child(
+                                                "Reactivating reloads WhatsApp Web and can take a few seconds. The current scroll position or an unsent draft may be lost.",
+                                            ),
+                                    )
+                                    .child(button(
+                                        "account-reactivate",
+                                        "Reactivate",
+                                        theme,
+                                        true,
+                                        cx.listener(|this, _event, _window, cx| {
+                                            let account_id = this.account_id.clone();
+                                            this.model.update(cx, |model, cx| {
+                                                model.resume_account(&account_id, cx);
+                                            });
+                                        }),
+                                    ))
+                            })
+                            .when(view_state == AccountViewState::Resuming, |element| {
+                                element
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(theme.text)
+                                            .child("Restoring WhatsApp Web…"),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(440.))
+                                            .text_center()
+                                            .text_size(px(13.))
+                                            .text_color(theme.text_muted)
+                                            .child(
+                                                "Creating a fresh WebKit view. Your session is kept and the page will reconnect automatically.",
+                                            ),
+                                    )
+                            })
+                            .when(view_state.is_loaded() && !crash_failed, |element| {
                                 element
                                     .child(
                                         div()
@@ -273,7 +388,7 @@ impl Render for AccountWindow {
                                         },
                                     )
                             })
-                            .when(crash_failed, |element| {
+                            .when(view_state.is_loaded() && crash_failed, |element| {
                                 element
                                     .child(
                                         div()

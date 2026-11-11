@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crossbeam_channel::Sender;
 use image::{Rgba, RgbaImage};
 use ksni::menu::{MenuItem, StandardItem, SubMenu};
@@ -41,11 +43,43 @@ const PLUS_GLYPH: [&str; 5] = ["000", "010", "111", "010", "000"];
 pub enum TrayAction {
     ShowHide,
     OpenAccount(String),
+    ResumeAll,
     AddAccount,
     Downloads,
     Settings,
     Lock,
+    DoNotDisturbOff,
+    DoNotDisturbOneHour,
+    DoNotDisturbTomorrow,
+    DoNotDisturbIndefinite,
+    DoNotDisturbSchedule,
+    DoNotDisturbSkip,
     Quit,
+}
+
+/// Effective Do Not Disturb presentation for the tray. `status` is the compact
+/// text from the settings model, for example `Quiet hours until 07:00 (6h 20m
+/// left)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrayDndState {
+    pub active: bool,
+    pub status: String,
+    pub follows_schedule: bool,
+    pub schedule_active: bool,
+    pub wake_time: String,
+}
+
+impl TrayDndState {
+    fn tooltip_line(&self) -> Option<String> {
+        if !self.active {
+            return None;
+        }
+        if self.status.is_empty() {
+            Some("Do not disturb".to_string())
+        } else {
+            Some(format!("Do not disturb: {}", self.status))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +109,7 @@ struct TrayAccount {
     id: String,
     name: String,
     unread: u32,
+    suspended: bool,
 }
 
 pub struct OxideTray {
@@ -82,7 +117,7 @@ pub struct OxideTray {
     accounts: Vec<TrayAccount>,
     unread: u32,
     visible: bool,
-    do_not_disturb: bool,
+    dnd: TrayDndState,
     icons: IconCache,
 }
 
@@ -95,7 +130,7 @@ impl OxideTray {
             accounts: Vec::new(),
             unread: 0,
             visible: true,
-            do_not_disturb: false,
+            dnd: TrayDndState::default(),
             icons,
         }
     }
@@ -123,7 +158,11 @@ impl ksni::Tray for OxideTray {
             icon_name: String::new(),
             icon_pixmap: self.icons.icons(),
             title: "OxideZap".to_string(),
-            description: tooltip_description(&self.accounts, self.unread, self.do_not_disturb),
+            description: tooltip_description(
+                &self.accounts,
+                self.unread,
+                self.dnd.tooltip_line().as_deref(),
+            ),
         }
     }
 
@@ -170,14 +209,21 @@ impl ksni::Tray for OxideTray {
             .iter()
             .map(|account| {
                 let id = account.id.clone();
-                let label = if account.unread > 0 {
+                let mut label = if account.unread > 0 {
                     format!("{} ({})", account.name, account.unread)
                 } else {
                     account.name.clone()
                 };
+                if account.suspended {
+                    label.push_str(" (suspended)");
+                }
                 StandardItem {
                     label,
-                    icon_name: "user-available".to_string(),
+                    icon_name: if account.suspended {
+                        "user-away".to_string()
+                    } else {
+                        "user-available".to_string()
+                    },
                     activate: Box::new(move |tray: &mut Self| {
                         let _ = tray.tx.try_send(TrayAction::OpenAccount(id.clone()));
                     }),
@@ -195,6 +241,19 @@ impl ksni::Tray for OxideTray {
             }
             .into(),
         );
+        if self.accounts.iter().any(|account| account.suspended) {
+            items.push(
+                StandardItem {
+                    label: "Resume all suspended accounts".to_string(),
+                    icon_name: "view-restore".to_string(),
+                    activate: Box::new(|tray: &mut Self| {
+                        let _ = tray.tx.try_send(TrayAction::ResumeAll);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         items.push(
             StandardItem {
                 label: "Add account…".to_string(),
@@ -217,6 +276,7 @@ impl ksni::Tray for OxideTray {
             }
             .into(),
         );
+        items.push(self.dnd_menu().into());
         items.push(
             StandardItem {
                 label: "Settings…".to_string(),
@@ -244,6 +304,102 @@ impl ksni::Tray for OxideTray {
     }
 }
 
+impl OxideTray {
+    fn dnd_menu(&self) -> SubMenu<Self> {
+        let label = if self.dnd.active {
+            format!("Do not disturb: {}", self.dnd.status)
+        } else {
+            "Do not disturb".to_string()
+        };
+        let wake = if self.dnd.wake_time.is_empty() {
+            "07:00"
+        } else {
+            self.dnd.wake_time.as_str()
+        };
+        let schedule_label = if self.dnd.follows_schedule {
+            "✓ Follow quiet hours".to_string()
+        } else {
+            "Follow quiet hours".to_string()
+        };
+        let mut items: Vec<MenuItem<Self>> = Vec::new();
+        items.push(
+            StandardItem {
+                label: "Off".to_string(),
+                icon_name: "notifications-disabled".to_string(),
+                enabled: self.dnd.active,
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.try_send(TrayAction::DoNotDisturbOff);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "On for 1 hour".to_string(),
+                icon_name: "notifications-disabled".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.try_send(TrayAction::DoNotDisturbOneHour);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: format!("Until tomorrow ({wake})"),
+                icon_name: "notifications-disabled".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.try_send(TrayAction::DoNotDisturbTomorrow);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Until I turn it off".to_string(),
+                icon_name: "notifications-disabled".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.try_send(TrayAction::DoNotDisturbIndefinite);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(MenuItem::Separator);
+        items.push(
+            StandardItem {
+                label: schedule_label,
+                icon_name: "alarm-symbolic".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.try_send(TrayAction::DoNotDisturbSchedule);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Skip this quiet period".to_string(),
+                icon_name: "alarm-symbolic".to_string(),
+                enabled: self.dnd.schedule_active,
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.try_send(TrayAction::DoNotDisturbSkip);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        SubMenu {
+            label,
+            icon_name: "notifications-disabled".to_string(),
+            submenu: items,
+            ..Default::default()
+        }
+    }
+}
+
 pub struct TrayHandle {
     handle: ksni::blocking::Handle<OxideTray>,
 }
@@ -264,22 +420,31 @@ impl TrayHandle {
         }
     }
 
-    pub fn update(&self, accounts: &[Account], unread: u32, visible: bool, do_not_disturb: bool) {
+    pub fn update(
+        &self,
+        accounts: &[Account],
+        unread: u32,
+        visible: bool,
+        dnd: TrayDndState,
+        suspended: &HashSet<String>,
+    ) {
         let accounts = accounts
             .iter()
             .map(|account| TrayAccount {
                 id: account.id.clone(),
                 name: account.name.clone(),
                 unread: account.unread,
+                suspended: suspended.contains(&account.id),
             })
             .collect();
+        let active = dnd.active;
         let _ = self.handle.update(move |tray| {
             tray.accounts = accounts;
             tray.unread = unread;
             tray.visible = visible;
-            tray.do_not_disturb = do_not_disturb;
+            tray.dnd = dnd;
             tray.icons
-                .refresh(TrayIconState::for_unread(unread, do_not_disturb));
+                .refresh(TrayIconState::for_unread(unread, active));
         });
     }
 
@@ -288,24 +453,32 @@ impl TrayHandle {
     }
 }
 
-fn tooltip_description(accounts: &[TrayAccount], unread: u32, do_not_disturb: bool) -> String {
+fn tooltip_description(accounts: &[TrayAccount], unread: u32, dnd_status: Option<&str>) -> String {
     let mut lines = Vec::new();
-    if do_not_disturb {
-        lines.push("Do not disturb".to_string());
+    if let Some(status) = dnd_status {
+        lines.push(status.to_string());
     }
     if unread == 0 {
-        lines.push(if do_not_disturb {
+        lines.push(if dnd_status.is_some() {
             "No unread messages".to_string()
         } else {
             "WhatsApp Web for Linux".to_string()
         });
-        return lines.join("\n");
+    } else {
+        let noun = if unread == 1 { "message" } else { "messages" };
+        lines.push(format!("{unread} unread {noun}"));
+        for account in accounts.iter().filter(|account| account.unread > 0) {
+            lines.push(format!("{}: {}", account.name, account.unread));
+        }
     }
-
-    let noun = if unread == 1 { "message" } else { "messages" };
-    lines.push(format!("{unread} unread {noun}"));
-    for account in accounts.iter().filter(|account| account.unread > 0) {
-        lines.push(format!("{}: {}", account.name, account.unread));
+    let suspended = accounts.iter().filter(|account| account.suspended).count();
+    if suspended > 0 {
+        let noun = if suspended == 1 {
+            "account"
+        } else {
+            "accounts"
+        };
+        lines.push(format!("{suspended} suspended {noun}"));
     }
     lines.join("\n")
 }
@@ -503,16 +676,19 @@ mod tests {
                 id: "a".to_string(),
                 name: "Work".to_string(),
                 unread: 3,
+                suspended: false,
             },
             TrayAccount {
                 id: "b".to_string(),
                 name: "Personal".to_string(),
                 unread: 2,
+                suspended: false,
             },
             TrayAccount {
                 id: "c".to_string(),
                 name: "Empty".to_string(),
                 unread: 0,
+                suspended: false,
             },
         ]
     }
@@ -587,30 +763,55 @@ mod tests {
         let accounts = accounts();
 
         assert_eq!(
-            tooltip_description(&accounts, 5, false),
+            tooltip_description(&accounts, 5, None),
             "5 unread messages\nWork: 3\nPersonal: 2"
         );
         assert_eq!(
-            tooltip_description(&accounts, 1, false),
+            tooltip_description(&accounts, 1, None),
             "1 unread message\nWork: 3\nPersonal: 2"
         );
         assert_eq!(
-            tooltip_description(&accounts, 0, false),
+            tooltip_description(&accounts, 0, None),
             "WhatsApp Web for Linux"
         );
     }
 
     #[test]
-    fn tooltip_marks_do_not_disturb() {
+    fn tooltip_marks_do_not_disturb_and_shows_the_remaining_time() {
         let accounts = accounts();
+        let status = TrayDndState {
+            active: true,
+            status: "Quiet hours until 07:00 (6h 20m left)".to_string(),
+            follows_schedule: true,
+            schedule_active: true,
+            wake_time: "07:00".to_string(),
+        };
+        let line = status.tooltip_line().expect("an active DND line");
 
         assert_eq!(
-            tooltip_description(&accounts, 5, true),
-            "Do not disturb\n5 unread messages\nWork: 3\nPersonal: 2"
+            tooltip_description(&accounts, 5, Some(&line)),
+            "Do not disturb: Quiet hours until 07:00 (6h 20m left)\n5 unread messages\nWork: 3\nPersonal: 2"
         );
         assert_eq!(
-            tooltip_description(&accounts, 0, true),
-            "Do not disturb\nNo unread messages"
+            tooltip_description(&accounts, 0, Some(&line)),
+            "Do not disturb: Quiet hours until 07:00 (6h 20m left)\nNo unread messages"
+        );
+        assert!(TrayDndState::default().tooltip_line().is_none());
+    }
+
+    #[test]
+    fn tooltip_reports_suspended_accounts() {
+        let mut accounts = accounts();
+        accounts[0].suspended = true;
+        accounts[2].suspended = true;
+
+        assert_eq!(
+            tooltip_description(&accounts, 3, None),
+            "3 unread messages\nWork: 3\nPersonal: 2\n2 suspended accounts"
+        );
+        assert_eq!(
+            tooltip_description(&accounts, 0, None),
+            "WhatsApp Web for Linux\n2 suspended accounts"
         );
     }
 }

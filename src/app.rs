@@ -11,7 +11,7 @@ pub mod downloads;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::{
-    App, Bounds, Context, Entity, SharedString, Timer, TitlebarOptions, Window,
+    App, Bounds, Context, Entity, Pixels, SharedString, Timer, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
     WindowOptions, point, prelude::*, px, size,
 };
@@ -29,18 +29,24 @@ use crate::notify;
 use crate::paths::{APP_ID, Paths};
 use crate::settings::storage::{self, StorageOperation, StorageSnapshot};
 use crate::settings::{
-    Account, LockSettings, ProxySettings, SETTINGS_SAVE_DEBOUNCE, SaveDebounce, SavedBounds,
-    Settings, SettingsWriter, WritingSettings,
+    Account, AppearanceSettings, DoNotDisturbSettings, LockSettings, MemorySettings,
+    ONBOARDING_VERSION, ProxySettings, SETTINGS_SAVE_DEBOUNCE, SaveDebounce, SavedBounds, Settings,
+    SettingsWriter, WritingSettings, should_show_onboarding, validate_custom_css,
 };
 use crate::shortcut::Shortcut;
 use crate::single_instance::{
     ChatTarget, DndMode, InstanceListener, InstanceMessage, InstanceReply, InstanceRequest,
 };
 use crate::theme::Theme;
-use crate::tray::{TrayAction, TrayHandle};
+use crate::tray::{TrayAction, TrayDndState, TrayHandle};
 use crate::ui::account_window::AccountWindow;
+use crate::ui::command_palette::{
+    COMMAND_PALETTE_HEIGHT, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH, CommandAccount,
+    CommandAction, CommandContext, CommandPalette, account_at, zoom_after,
+};
 use crate::ui::downloads_window::DownloadsWindow;
 use crate::ui::lock_window::LockWindow;
+use crate::ui::onboarding_window::OnboardingWindow;
 use crate::ui::settings_window::SettingsWindow;
 use crate::updates::{self, UpdateState};
 use crate::webview::{
@@ -136,8 +142,12 @@ fn unlock_is_authorized(hash: Option<&str>, password: &str) -> bool {
     hash.is_some_and(|hash| lock::verify_password(hash, password))
 }
 
-fn hotkey_bindings(toggle: Shortcut, boss_key: &str) -> HotkeyBindings {
-    HotkeyBindings::new(toggle, Shortcut::parse(boss_key).ok())
+fn hotkey_bindings(toggle: Shortcut, boss_key: &str, command_palette: &str) -> HotkeyBindings {
+    HotkeyBindings::new(
+        toggle,
+        Shortcut::parse(boss_key).ok(),
+        Shortcut::parse(command_palette).ok(),
+    )
 }
 
 fn logind_event(sleeping: bool) -> SystemLockEvent {
@@ -342,6 +352,231 @@ fn crash_decision(quitting: bool, recovery: &mut CrashRecovery, now: Instant) ->
         return CrashDecision::Ignored;
     }
     recovery.on_crash(now)
+}
+
+/// How often the automatic low-memory sweep runs. Hiding an account does not
+/// start a dedicated timer; the sweep uses the recorded hide time instead, so a
+/// restart or a burst of hide/show events cannot postpone or duplicate it.
+const MEMORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Conservative estimate of the memory a single suspended WebKit web process
+/// releases. WebKit does not expose per-view RSS, so the Settings window labels
+/// this as an estimate instead of pretending it is a measurement.
+pub const ESTIMATED_SUSPENDED_MEMORY_BYTES: u64 = 150 * 1024 * 1024;
+
+/// Whether an account currently has a live WebKit view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccountViewState {
+    #[default]
+    Loaded,
+    Suspended,
+    Resuming,
+}
+
+impl AccountViewState {
+    pub fn is_suspended(self) -> bool {
+        self == AccountViewState::Suspended
+    }
+
+    pub fn is_loaded(self) -> bool {
+        self == AccountViewState::Loaded
+    }
+}
+
+/// Per-account view lifecycle. A missing entry is `Loaded`, which matches the
+/// state of an account whose window has just been opened and whose `Create`
+/// command is still in flight.
+#[derive(Default)]
+struct ViewLifecycle {
+    states: HashMap<String, AccountViewState>,
+}
+
+impl ViewLifecycle {
+    fn state(&self, account_id: &str) -> AccountViewState {
+        self.states.get(account_id).copied().unwrap_or_default()
+    }
+
+    /// Marks a loaded view as suspended. Returns `false` when the account is
+    /// already suspended or is mid-restore, so a sweep cannot queue a second
+    /// `Suspend` command for the same account.
+    fn begin_suspend(&mut self, account_id: &str) -> bool {
+        if self.state(account_id) != AccountViewState::Loaded {
+            return false;
+        }
+        self.states
+            .insert(account_id.to_string(), AccountViewState::Suspended);
+        true
+    }
+
+    /// Starts a restore. Returns `false` when there is nothing to restore or a
+    /// restore is already in flight, which keeps a double click from creating a
+    /// duplicate WebKit view.
+    fn begin_resume(&mut self, account_id: &str) -> bool {
+        if self.state(account_id) != AccountViewState::Suspended {
+            return false;
+        }
+        self.states
+            .insert(account_id.to_string(), AccountViewState::Resuming);
+        true
+    }
+
+    /// The GTK thread created the view (or finished loading it). Only a
+    /// pending restore changes state; a stale `Ready`/`Finished` event for a
+    /// view that was already suspended must not revive it.
+    fn mark_loaded(&mut self, account_id: &str) {
+        if self.state(account_id) == AccountViewState::Resuming {
+            self.states.remove(account_id);
+        }
+    }
+
+    /// The view is known to be alive even though the application marked it
+    /// suspended (for example after a refused suspend command).
+    fn mark_active(&mut self, account_id: &str) {
+        self.states.remove(account_id);
+    }
+
+    /// The view could not be recreated. Return to the suspended placeholder so
+    /// the user can retry instead of being stuck in a loading state.
+    fn mark_failed(&mut self, account_id: &str) {
+        if self.state(account_id) == AccountViewState::Resuming {
+            self.states
+                .insert(account_id.to_string(), AccountViewState::Suspended);
+        }
+    }
+
+    fn forget(&mut self, account_id: &str) {
+        self.states.remove(account_id);
+    }
+
+    fn suspended_ids(&self) -> Vec<String> {
+        self.states
+            .iter()
+            .filter(|(_, state)| **state == AccountViewState::Suspended)
+            .map(|(account_id, _)| account_id.clone())
+            .collect()
+    }
+
+    fn suspended_count(&self) -> usize {
+        self.states
+            .values()
+            .filter(|state| **state == AccountViewState::Suspended)
+            .count()
+    }
+}
+
+/// When each account was hidden. Re-hiding an already hidden account keeps the
+/// original timestamp so the lock screen, a tray toggle, or a repeated hide-all
+/// does not restart the idle period.
+#[derive(Default)]
+struct HiddenSince {
+    since: HashMap<String, Instant>,
+}
+
+impl HiddenSince {
+    fn mark_hidden(&mut self, account_id: &str, now: Instant) {
+        self.since.entry(account_id.to_string()).or_insert(now);
+    }
+
+    fn mark_visible(&mut self, account_id: &str) {
+        self.since.remove(account_id);
+    }
+
+    fn forget(&mut self, account_id: &str) {
+        self.since.remove(account_id);
+    }
+
+    fn hidden_for(&self, account_id: &str, now: Instant) -> Option<Duration> {
+        self.since
+            .get(account_id)
+            .map(|since| now.saturating_duration_since(*since))
+    }
+}
+
+fn memory_sweep_due(last_sweep: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_sweep) >= MEMORY_SWEEP_INTERVAL
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SuspendBlocker {
+    Quitting,
+    Locked,
+    Disabled,
+    AlreadySuspended,
+    Resuming,
+    NoView,
+    Visible,
+    ActiveAccount,
+    DownloadActive,
+    CaptureActive,
+    NotIdle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SuspendDecision {
+    Suspend,
+    Keep(SuspendBlocker),
+}
+
+#[derive(Clone, Copy)]
+struct SuspendContext<'a> {
+    memory: &'a MemorySettings,
+    state: AccountViewState,
+    hidden: bool,
+    active_account: bool,
+    idle: Duration,
+    downloads_active: bool,
+    capture_active: bool,
+    locked: bool,
+    quitting: bool,
+    view_open: bool,
+    /// A manual "Release hidden accounts now" bypasses the automatic switch and
+    /// the delay, but never the safety guards.
+    manual: bool,
+}
+
+/// The low-memory policy. It is pure so every guard can be tested without a
+/// GTK display, a WebKit process, or a running GPUI application.
+fn suspend_decision(context: &SuspendContext) -> SuspendDecision {
+    if context.quitting {
+        return SuspendDecision::Keep(SuspendBlocker::Quitting);
+    }
+    if context.locked {
+        return SuspendDecision::Keep(SuspendBlocker::Locked);
+    }
+    let required = context.memory.suspend_after();
+    if !context.manual && required.is_none() {
+        return SuspendDecision::Keep(SuspendBlocker::Disabled);
+    }
+    match context.state {
+        AccountViewState::Suspended => {
+            return SuspendDecision::Keep(SuspendBlocker::AlreadySuspended);
+        }
+        AccountViewState::Resuming => {
+            return SuspendDecision::Keep(SuspendBlocker::Resuming);
+        }
+        AccountViewState::Loaded => {}
+    }
+    if !context.view_open {
+        return SuspendDecision::Keep(SuspendBlocker::NoView);
+    }
+    // A visible account is the one the user is looking at, including the last
+    // visible/active account. It is never released.
+    if !context.hidden {
+        return SuspendDecision::Keep(SuspendBlocker::Visible);
+    }
+    if context.active_account && context.memory.keep_active_account {
+        return SuspendDecision::Keep(SuspendBlocker::ActiveAccount);
+    }
+    if context.downloads_active {
+        return SuspendDecision::Keep(SuspendBlocker::DownloadActive);
+    }
+    if context.capture_active {
+        return SuspendDecision::Keep(SuspendBlocker::CaptureActive);
+    }
+    if !context.manual && required.is_some_and(|required| context.idle < required) {
+        return SuspendDecision::Keep(SuspendBlocker::NotIdle);
+    }
+    SuspendDecision::Suspend
 }
 
 /// Maximum number of automatic connection reloads. The browser's own
@@ -716,21 +951,32 @@ pub struct AppModel {
     active_downloads: HashMap<String, u32>,
     scales: HashMap<String, f32>,
     settings_window: Option<WindowHandle<SettingsWindow>>,
+    onboarding_window: Option<WindowHandle<OnboardingWindow>>,
     lock_window: Option<WindowHandle<LockWindow>>,
     downloads_window: Option<WindowHandle<DownloadsWindow>>,
+    command_palette: Option<WindowHandle<CommandPalette>>,
     downloads: DownloadManager,
     downloads_writer: DownloadWriter,
     pending_downloads: bool,
+    pending_command_palette: bool,
+    /// Webview to focus once the palette window is gone. The X11 destroy and
+    /// WM focus changes are asynchronous, so the next poll tick applies it.
+    pending_focus: Option<String>,
     smoke: Option<SmokeState>,
     startup_html: Option<String>,
     startup_url: Option<String>,
     initial_action: Option<InstanceMessage>,
     pending_urls: HashMap<String, String>,
     start_hidden: bool,
+    first_run: bool,
     pending_accounts: HashSet<String>,
     pending_settings: bool,
+    pending_onboarding: bool,
     pending_lock: bool,
     hidden_accounts: HashSet<String>,
+    views: ViewLifecycle,
+    hidden_since: HiddenSince,
+    capture_active: HashSet<String>,
     settings_writer: SettingsWriter,
     save_debounce: SaveDebounce,
     pub update_state: UpdateState,
@@ -740,10 +986,15 @@ pub struct AppModel {
     update_check_running: bool,
     last_idle_check: Instant,
     last_scale_check: Instant,
+    last_dnd_check: Instant,
+    last_dnd_active: bool,
+    last_dnd_status: String,
+    last_memory_sweep: Instant,
     last_notifications: Vec<(String, Instant)>,
     lock_events: Receiver<SystemLockEvent>,
     boss_hidden: Option<HashSet<String>>,
     boss_settings_hidden: bool,
+    boss_onboarding_hidden: bool,
 }
 
 impl AppModel {
@@ -767,6 +1018,7 @@ impl AppModel {
         startup_url: Option<String>,
         initial_action: Option<InstanceMessage>,
         start_hidden: bool,
+        first_run: bool,
     ) -> Self {
         let _ = cx;
         let (update_tx, update_rx) = unbounded();
@@ -782,6 +1034,7 @@ impl AppModel {
         if smoke.is_none() {
             start_system_lock_watchers(lock_event_tx);
         }
+        let last_dnd_active = settings.do_not_disturb.is_active(SystemTime::now());
         Self {
             paths,
             settings,
@@ -804,21 +1057,30 @@ impl AppModel {
             active_downloads: HashMap::new(),
             scales: HashMap::new(),
             settings_window: None,
+            onboarding_window: None,
             lock_window: None,
             downloads_window: None,
+            command_palette: None,
             downloads,
             downloads_writer: DownloadWriter::start(),
             pending_downloads: false,
+            pending_command_palette: false,
+            pending_focus: None,
             smoke,
             startup_html,
             startup_url,
             initial_action,
             pending_urls: HashMap::new(),
             start_hidden,
+            first_run,
             pending_accounts: HashSet::new(),
             pending_settings: false,
+            pending_onboarding: false,
             pending_lock: false,
             hidden_accounts: HashSet::new(),
+            views: ViewLifecycle::default(),
+            hidden_since: HiddenSince::default(),
+            capture_active: HashSet::new(),
             settings_writer: SettingsWriter::start(),
             save_debounce: SaveDebounce::default(),
             update_state,
@@ -828,10 +1090,15 @@ impl AppModel {
             update_check_running: false,
             last_idle_check: Instant::now(),
             last_scale_check: Instant::now(),
+            last_dnd_check: Instant::now(),
+            last_dnd_active,
+            last_dnd_status: String::new(),
+            last_memory_sweep: Instant::now(),
             last_notifications: Vec::new(),
             lock_events: lock_event_rx,
             boss_hidden: None,
             boss_settings_hidden: false,
+            boss_onboarding_hidden: false,
         }
     }
 
@@ -854,6 +1121,14 @@ impl AppModel {
             self.open_account_window(&account_id, cx);
             return;
         }
+
+        // A timer may have expired while the app was closed or the machine was
+        // suspended. Re-evaluate before opening windows so the tray never shows
+        // a stale DND indicator.
+        if self.settings.do_not_disturb.expire(SystemTime::now()) {
+            self.save_settings(cx);
+        }
+        self.update_tray();
 
         self.sync_download_layout();
 
@@ -901,6 +1176,16 @@ impl AppModel {
             Some(InstanceMessage::Lock) => self.lock(cx),
             Some(InstanceMessage::OpenDownloads) => self.open_downloads(cx),
             _ => {}
+        }
+        // The guide is a separate, non-modal window. The account window opens
+        // first so its QR/login page is already loading behind it, and closing
+        // the guide never leaves the user without a window. Autostart launches
+        // and locked sessions skip it: both are explicitly "start quietly".
+        if !self.start_hidden
+            && !self.locked
+            && should_show_onboarding(&self.settings, self.first_run)
+        {
+            self.open_onboarding_window(cx);
         }
         cx.activate(true);
         self.start_update_check();
@@ -969,6 +1254,7 @@ impl AppModel {
             match action {
                 HotkeyAction::Toggle => self.toggle_visibility(cx),
                 HotkeyAction::BossKey => self.boss_toggle(cx),
+                HotkeyAction::CommandPalette => self.open_palette_from_hotkey(cx),
             }
         }
         while let Ok(event) = self.lock_events.try_recv() {
@@ -983,6 +1269,11 @@ impl AppModel {
         }
         while let Ok(action) = self.tray_actions.try_recv() {
             self.handle_tray_action(action, cx);
+        }
+
+        if memory_sweep_due(self.last_memory_sweep, Instant::now()) {
+            self.last_memory_sweep = Instant::now();
+            self.suspend_idle_accounts(false, cx);
         }
 
         if self.settings.lock.enabled
@@ -1023,8 +1314,45 @@ impl AppModel {
             }
         }
 
+        if let Some(account_id) = self.pending_focus.take() {
+            self.focus_account_content(&account_id);
+        }
+
         if self.smoke.is_some() {
             self.poll_smoke(cx);
+        }
+
+        if self.last_dnd_check.elapsed() >= Duration::from_secs(1) {
+            self.last_dnd_check = Instant::now();
+            self.refresh_do_not_disturb(cx);
+        }
+    }
+
+    /// Re-evaluates the DND schedule at least once per second. The pump also
+    /// runs after resume from suspend, so a long wall-clock jump cannot leave
+    /// the mode stuck or the tray stale.
+    fn refresh_do_not_disturb(&mut self, cx: &mut Context<Self>) {
+        let now = SystemTime::now();
+        let expired = self.settings.do_not_disturb.expire(now);
+        if expired {
+            self.save_settings(cx);
+        }
+        let active = self.settings.do_not_disturb.is_active(now);
+        let status = self.settings.do_not_disturb.status_text(now);
+        let active_changed = expired || active != self.last_dnd_active;
+        if active_changed || status != self.last_dnd_status {
+            debug!(
+                active,
+                next_transition = ?self.settings.do_not_disturb.next_transition(now),
+                "Do not Disturb state changed"
+            );
+            self.update_tray();
+            if let Some(handle) = self.settings_window {
+                let _ = handle.update(cx, |_, _, cx| cx.notify());
+            }
+            if active_changed {
+                cx.refresh_windows();
+            }
         }
     }
 
@@ -1055,6 +1383,9 @@ impl AppModel {
                 self.crash_recovery.remove(&account_id);
                 continue;
             }
+            if !self.views.state(&account_id).is_loaded() {
+                continue;
+            }
             info!(account_id = %account_id, "reloading WhatsApp Web after a crash");
             self.gtk.reload(&account_id);
         }
@@ -1077,6 +1408,114 @@ impl AppModel {
         self.active_downloads.get(account_id).copied().unwrap_or(0) > 0
     }
 
+    /// Whether a download is still streaming for this account. The persisted
+    /// download history is authoritative; the live counter catches a start
+    /// event that arrived before the record was written.
+    fn account_downloads_active(&self, account_id: &str) -> bool {
+        self.downloads_active(account_id)
+            || self
+                .downloads
+                .records()
+                .iter()
+                .any(|record| record.account_id == account_id && record.is_active())
+    }
+
+    pub fn account_view_state(&self, account_id: &str) -> AccountViewState {
+        self.views.state(account_id)
+    }
+
+    pub fn suspended_account_count(&self) -> usize {
+        self.views.suspended_count()
+    }
+
+    /// Accounts whose WebKit view is currently loaded and has a GPUI shell.
+    pub fn active_webview_count(&self) -> usize {
+        self.account_windows
+            .keys()
+            .filter(|account_id| self.views.state(account_id.as_str()).is_loaded())
+            .count()
+    }
+
+    /// Applies the automatic policy. Returns the number of accounts that were
+    /// suspended, which the manual action reports back to the settings window.
+    fn suspend_idle_accounts(&mut self, manual: bool, cx: &mut Context<Self>) -> usize {
+        if self.quitting {
+            return 0;
+        }
+        let now = Instant::now();
+        let active_account = self.settings.active_account_id();
+        let account_ids: Vec<String> = self.account_windows.keys().cloned().collect();
+        let mut suspended = 0;
+        for account_id in account_ids {
+            let context = SuspendContext {
+                memory: &self.settings.memory,
+                state: self.views.state(&account_id),
+                hidden: self.hidden_accounts.contains(&account_id),
+                active_account: active_account.as_deref() == Some(account_id.as_str()),
+                idle: self
+                    .hidden_since
+                    .hidden_for(&account_id, now)
+                    .unwrap_or_default(),
+                downloads_active: self.account_downloads_active(&account_id),
+                capture_active: self.capture_active.contains(&account_id),
+                locked: self.locked,
+                quitting: self.quitting,
+                view_open: true,
+                manual,
+            };
+            if suspend_decision(&context) != SuspendDecision::Suspend {
+                continue;
+            }
+            if self.suspend_account(&account_id, cx) {
+                suspended += 1;
+            }
+        }
+        suspended
+    }
+
+    /// Releases a hidden account's WebKit view. The GPUI shell stays alive so
+    /// the placeholder can offer Reactivate; the profile and session on disk
+    /// are untouched.
+    fn suspend_account(&mut self, account_id: &str, cx: &mut Context<Self>) -> bool {
+        if !self.views.begin_suspend(account_id) {
+            return false;
+        }
+        self.connection.remove(account_id);
+        self.crash_recovery.remove(account_id);
+        self.active_downloads.remove(account_id);
+        self.capture_active.remove(account_id);
+        self.gtk.suspend(account_id);
+        info!(account_id = %account_id, "releasing the WebKit view of a hidden account");
+        self.refresh_account_window(account_id, cx);
+        self.update_tray();
+        cx.refresh_windows();
+        true
+    }
+
+    /// Manual "Release hidden accounts now". It ignores the delay and the
+    /// master switch, but keeps every safety guard: the visible and active
+    /// accounts, active downloads, calls/recordings, the app lock, and quit.
+    pub fn release_hidden_accounts_now(&mut self, cx: &mut Context<Self>) -> usize {
+        let released = self.suspend_idle_accounts(true, cx);
+        self.last_memory_sweep = Instant::now();
+        self.update_tray();
+        released
+    }
+
+    pub fn resume_account(&mut self, account_id: &str, cx: &mut Context<Self>) {
+        if !self.account_windows.contains_key(account_id) {
+            self.open_account_window(account_id, cx);
+            return;
+        }
+        self.show_account_window(account_id, cx);
+    }
+
+    pub fn resume_all_suspended(&mut self, cx: &mut Context<Self>) {
+        for account_id in self.views.suspended_ids() {
+            self.resume_account(&account_id, cx);
+        }
+    }
+
     fn poll_connection_recovery(&mut self, cx: &mut Context<Self>) {
         if self.quitting {
             self.connection.clear();
@@ -1089,6 +1528,12 @@ impl AppModel {
             if !self.account_windows.contains_key(&account_id) {
                 self.connection.remove(&account_id);
                 self.active_downloads.remove(&account_id);
+                continue;
+            }
+            // A suspended or restoring account has no live page to time out or
+            // reconnect. Its tracker was cleared on suspend and is recreated by
+            // the load events of the new view.
+            if !self.views.state(&account_id).is_loaded() {
                 continue;
             }
             // Crash recovery owns the retry schedule while it is active. An
@@ -1182,13 +1627,15 @@ impl AppModel {
                 }
             }
             ConnectionDecision::Exhausted => {
-                notify::notify(
-                    "Could not reconnect WhatsApp Web",
-                    &format!(
-                        "OxideZap stopped automatic reconnects for {name} after {MAX_RECONNECT_ATTEMPTS} attempts. Use Retry now in the account window."
-                    ),
-                    Some(&icon),
-                );
+                if !notify::do_not_disturb_suppressed(&self.settings, SystemTime::now()) {
+                    notify::notify(
+                        "Could not reconnect WhatsApp Web",
+                        &format!(
+                            "OxideZap stopped automatic reconnects for {name} after {MAX_RECONNECT_ATTEMPTS} attempts. Use Retry now in the account window."
+                        ),
+                        Some(&icon),
+                    );
+                }
             }
         }
     }
@@ -1197,12 +1644,12 @@ impl AppModel {
         if self.quitting {
             return;
         }
-        if self.downloads_active(account_id) {
+        if self.account_downloads_active(account_id) {
             warn!(
                 account_id = %account_id,
                 "manual WhatsApp Web reload skipped while a download is active"
             );
-            if self.settings.notifications {
+            if notify::notifications_allowed(&self.settings, SystemTime::now()) {
                 notify::notify(
                     "Download in progress",
                     "OxideZap did not reload WhatsApp Web while a download is active. Retry when the download finishes.",
@@ -1235,11 +1682,13 @@ impl AppModel {
     fn handle_gtk_event(&mut self, event: GtkEvent, cx: &mut Context<Self>) {
         match event {
             GtkEvent::Ready { account_id, xid } => {
+                self.views.mark_loaded(&account_id);
                 if let Some(smoke) = &mut self.smoke {
                     if smoke.account_id == account_id {
                         smoke.gtk_xid = Some(xid);
                     }
                 }
+                self.refresh_account_window(&account_id, cx);
             }
             GtkEvent::LoadState { account_id, state } => match state {
                 LoadState::Started => {
@@ -1250,6 +1699,7 @@ impl AppModel {
                     self.refresh_account_window(&account_id, cx);
                 }
                 LoadState::Finished => {
+                    self.views.mark_loaded(&account_id);
                     let recovered = self
                         .crash_recovery
                         .remove(&account_id)
@@ -1315,7 +1765,7 @@ impl AppModel {
                 if let Some(tracker) = self.connection.get_mut(&account_id) {
                     tracker.on_reload_blocked();
                 }
-                if self.settings.notifications {
+                if notify::notifications_allowed(&self.settings, SystemTime::now()) {
                     notify::notify(
                         "Download in progress",
                         "OxideZap did not reload WhatsApp Web while a download is active.",
@@ -1364,6 +1814,7 @@ impl AppModel {
                 total_bytes,
             } => {
                 debug!(%account_id, %filename, path = %path.display(), "download started");
+                *self.active_downloads.entry(account_id.clone()).or_default() += 1;
                 let account_name = self.account_name(&account_id);
                 let record = DownloadRecord {
                     id,
@@ -1381,7 +1832,7 @@ impl AppModel {
                 if self.downloads.start(record) {
                     self.save_downloads();
                 }
-                if self.settings.notifications {
+                if notify::notifications_allowed(&self.settings, SystemTime::now()) {
                     let folder = path
                         .parent()
                         .map(|parent| parent.display().to_string())
@@ -1410,6 +1861,12 @@ impl AppModel {
             } => {
                 let record = self.downloads.get(&id).cloned();
                 if let Some(record) = record {
+                    if let Some(count) = self.active_downloads.get_mut(&record.account_id) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            self.active_downloads.remove(&record.account_id);
+                        }
+                    }
                     debug!(
                         %id,
                         filename = %record.filename,
@@ -1417,9 +1874,15 @@ impl AppModel {
                         cancelled,
                         "download finished"
                     );
-                    if self.downloads.finish(&id, success, cancelled, now_millis()) {
+                    // A media writer may finish after the user already
+                    // cancelled the row. Keep the explicit cancellation
+                    // instead of flipping it back to completed.
+                    let late_cancel = success && record.status == DownloadStatus::Cancelled;
+                    if late_cancel {
+                        debug!(%id, "ignored a late completion for a cancelled download");
+                    } else if self.downloads.finish(&id, success, cancelled, now_millis()) {
                         self.save_downloads();
-                        if self.settings.notifications {
+                        if notify::notifications_allowed(&self.settings, SystemTime::now()) {
                             self.notify_download_outcome(&record, success, cancelled);
                         }
                     }
@@ -1434,7 +1897,7 @@ impl AppModel {
                 reason,
             } => {
                 warn!(%account_id, %filename, %reason, "download could not start");
-                if self.settings.notifications {
+                if notify::notifications_allowed(&self.settings, SystemTime::now()) {
                     notify::notify(
                         "Download could not start",
                         &format!("{filename}\n{reason}"),
@@ -1444,10 +1907,33 @@ impl AppModel {
             }
             GtkEvent::DownloadRetryFailed { id, message } => {
                 debug!(%id, %message, "download retry failed");
-                if self.settings.notifications {
+                if notify::notifications_allowed(&self.settings, SystemTime::now()) {
                     notify::notify(
                         "Download could not be retried",
                         &message,
+                        Some(&self.paths.runtime_icon()),
+                    );
+                }
+            }
+            GtkEvent::MediaFailed {
+                account_id,
+                message,
+            } => {
+                warn!(%account_id, %message, "a media action failed");
+                if self.settings.notifications {
+                    notify::notify(
+                        "Media action failed",
+                        &message,
+                        Some(&self.paths.runtime_icon()),
+                    );
+                }
+            }
+            GtkEvent::MediaCopied { account_id } => {
+                debug!(%account_id, "copied a WhatsApp image to the clipboard");
+                if self.settings.notifications {
+                    notify::notify(
+                        "Image copied",
+                        "The image is on the clipboard.",
                         Some(&self.paths.runtime_icon()),
                     );
                 }
@@ -1477,28 +1963,65 @@ impl AppModel {
                     CrashDecision::Exhausted => {
                         error!(account_id = %account_id, "WebKit crash recovery exhausted");
                         self.gtk.hide(&account_id);
-                        notify::notify(
-                            "WhatsApp Web crashed",
-                            &format!(
-                                "Automatic recovery failed after {MAX_CRASH_ATTEMPTS} attempts. Use \"Retry now\" in the account window."
-                            ),
-                            Some(&self.paths.runtime_icon()),
-                        );
+                        if !notify::do_not_disturb_suppressed(&self.settings, SystemTime::now()) {
+                            notify::notify(
+                                "WhatsApp Web crashed",
+                                &format!(
+                                    "Automatic recovery failed after {MAX_CRASH_ATTEMPTS} attempts. Use \"Retry now\" in the account window."
+                                ),
+                                Some(&self.paths.runtime_icon()),
+                            );
+                        }
                         self.refresh_account_window(&account_id, cx);
                     }
                     CrashDecision::Ignored => {}
                 }
             }
+            GtkEvent::CaptureState { account_id, active } => {
+                if self.account_windows.contains_key(&account_id) {
+                    if active {
+                        self.capture_active.insert(account_id.clone());
+                    } else {
+                        self.capture_active.remove(&account_id);
+                    }
+                    debug!(%account_id, active, "media capture state changed");
+                }
+            }
+            GtkEvent::Suspended { account_id } => {
+                // The command path already marked the account suspended. A
+                // newer resume may have been queued after the suspend command,
+                // so only refresh the placeholder instead of overwriting the
+                // lifecycle state here.
+                if self.account_windows.contains_key(&account_id) {
+                    self.refresh_account_window(&account_id, cx);
+                }
+            }
+            GtkEvent::SuspendRefused { account_id, reason } => {
+                warn!(
+                    %account_id,
+                    reason = reason.label(),
+                    "kept a WebKit view that could not be suspended safely"
+                );
+                self.views.mark_active(&account_id);
+                self.refresh_account_window(&account_id, cx);
+                self.update_tray();
+                cx.refresh_windows();
+            }
             GtkEvent::Error {
                 account_id,
                 message,
             } => {
+                self.views.mark_failed(&account_id);
                 error!(account_id = %account_id, message = %message, "WebKit error");
-                notify::notify(
-                    "WhatsApp Web could not start",
-                    &message,
-                    Some(&self.paths.runtime_icon()),
-                );
+                if !notify::do_not_disturb_suppressed(&self.settings, SystemTime::now()) {
+                    notify::notify(
+                        "WhatsApp Web could not start",
+                        &message,
+                        Some(&self.paths.runtime_icon()),
+                    );
+                }
+                self.refresh_account_window(&account_id, cx);
+                self.update_tray();
             }
             GtkEvent::StorageFinished {
                 account_id,
@@ -1673,11 +2196,13 @@ impl AppModel {
             return;
         };
         let Some(url) = record.retry_url().map(str::to_string) else {
-            notify::notify(
-                "Retry unavailable",
-                "This download has no reusable source URL. Start it again from WhatsApp Web.",
-                Some(&self.paths.runtime_icon()),
-            );
+            if !notify::do_not_disturb_suppressed(&self.settings, SystemTime::now()) {
+                notify::notify(
+                    "Retry unavailable",
+                    "This download has no reusable source URL. Start it again from WhatsApp Web.",
+                    Some(&self.paths.runtime_icon()),
+                );
+            }
             return;
         };
         let account_id = record.account_id.clone();
@@ -1737,9 +2262,14 @@ impl AppModel {
         } else if cancelled {
             notify::notify("Download cancelled", &record.filename, Some(&icon));
         } else {
+            let hint = if record.retry_url().is_some() {
+                "Open the Download Center to retry."
+            } else {
+                "Reopen the media and use the save action to retry."
+            };
             notify::notify(
                 "Download failed",
-                &format!("{}\nOpen the Download Center to retry.", record.filename),
+                &format!("{}\n{hint}", record.filename),
                 Some(&icon),
             );
         }
@@ -1777,21 +2307,91 @@ impl AppModel {
     }
 
     fn apply_do_not_disturb(&mut self, mode: DndMode, cx: &mut Context<Self>) {
-        if self.settings.set_do_not_disturb(mode.is_enabled()) {
-            self.save_settings(cx);
-            self.update_tray();
-            cx.refresh_windows();
+        if !mode.is_enabled() {
+            self.update_do_not_disturb(cx, |dnd| {
+                dnd.set_off();
+            });
+            return;
         }
+        let now = SystemTime::now();
+        self.update_do_not_disturb(cx, |dnd| match mode {
+            DndMode::Off => {
+                dnd.set_off();
+            }
+            DndMode::On => {
+                dnd.set_indefinite();
+            }
+            DndMode::OneHour => {
+                dnd.set_until(now + Duration::from_secs(60 * 60));
+            }
+            DndMode::Tomorrow => {
+                let until = dnd.until_tomorrow(now);
+                dnd.set_until(until);
+            }
+        });
+    }
+
+    /// Applies a DND change and persists it only when something actually
+    /// changed. Every settings surface (tray, CLI, and Settings window) uses
+    /// this path so saving, tray refresh, and window redraws stay consistent.
+    fn update_do_not_disturb(
+        &mut self,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut DoNotDisturbSettings),
+    ) -> bool {
+        let mut next = self.settings.do_not_disturb.clone();
+        update(&mut next);
+        next.normalize();
+        if next == self.settings.do_not_disturb {
+            return false;
+        }
+        self.update_settings(cx, |settings| settings.do_not_disturb = next);
+        true
     }
 
     fn handle_tray_action(&mut self, action: TrayAction, cx: &mut Context<Self>) {
         match action {
             TrayAction::ShowHide => self.toggle_visibility(cx),
             TrayAction::OpenAccount(id) => self.open_account_window(&id, cx),
+            TrayAction::ResumeAll => self.resume_all_suspended(cx),
             TrayAction::AddAccount => self.add_account(cx),
             TrayAction::Settings => self.open_settings_window(cx),
             TrayAction::Downloads => self.open_downloads_window(cx),
             TrayAction::Lock => self.lock(cx),
+            TrayAction::DoNotDisturbOff => {
+                self.update_do_not_disturb(cx, |dnd| {
+                    dnd.set_off();
+                });
+            }
+            TrayAction::DoNotDisturbOneHour => {
+                let until = SystemTime::now() + Duration::from_secs(60 * 60);
+                self.update_do_not_disturb(cx, |dnd| {
+                    dnd.set_until(until);
+                });
+            }
+            TrayAction::DoNotDisturbTomorrow => {
+                let now = SystemTime::now();
+                self.update_do_not_disturb(cx, |dnd| {
+                    let until = dnd.until_tomorrow(now);
+                    dnd.set_until(until);
+                });
+            }
+            TrayAction::DoNotDisturbIndefinite => {
+                self.update_do_not_disturb(cx, |dnd| {
+                    dnd.set_indefinite();
+                });
+            }
+            TrayAction::DoNotDisturbSchedule => {
+                self.update_do_not_disturb(cx, |dnd| {
+                    dnd.set_scheduled();
+                });
+            }
+            TrayAction::DoNotDisturbSkip => {
+                let now = SystemTime::now();
+                self.update_do_not_disturb(cx, |dnd| {
+                    dnd.override_current_period(now);
+                });
+            }
             TrayAction::Quit => self.quit(cx),
         }
     }
@@ -1854,24 +2454,24 @@ impl AppModel {
     ) {
         self.account_windows.insert(account.id.clone(), handle);
         self.hidden_accounts.remove(&account.id);
+        self.views.mark_active(&account.id);
+        self.hidden_since.mark_visible(&account.id);
         let scale = handle
             .update(cx, |_, window, _| window.scale_factor())
             .unwrap_or(1.0);
         self.scales.insert(account.id.clone(), scale);
 
         let title = account_window_title(&account.name);
-        let parent_xid = match self.try_tag_account(&account.id, &title, &known_windows) {
-            Ok(AccountTag::Tagged) => self.account_xids.get(&account.id).copied(),
-            Ok(AccountTag::Closed) => None,
+        match self.try_tag_account(&account.id, &title, &known_windows) {
+            Ok(AccountTag::Tagged) => {}
+            Ok(AccountTag::Closed) => {}
             Ok(AccountTag::Pending) => {
                 self.schedule_account_tag(&account.id, &title, &known_windows, cx);
-                None
             }
             Err(error) => {
                 warn!(account_id = %account.id, %error, "could not tag the GPUI window");
-                None
             }
-        };
+        }
 
         self.startup_html = None;
         let startup_url = self
@@ -1887,19 +2487,8 @@ impl AppModel {
             }
             None => WHATSAPP_URL.to_string(),
         };
-        self.gtk.send(GtkCommand::Create {
-            account_id: account.id.clone(),
-            parent_xid,
-            data_dir: self.paths.account_data_dir(&account.id),
-            cache_dir: self.paths.account_cache_dir(&account.id),
-            url,
-            html,
-            show: !(self.start_hidden || self.locked),
-            scale,
-            zoom: self.settings.zoom,
-            writing: self.settings.writing.clone(),
-            proxy: self.settings.network.proxy.clone(),
-        });
+        let show = !(self.start_hidden || self.locked);
+        self.send_create(&account.id, url, html, show);
 
         self.settings.active_account = Some(account.id.clone());
         self.save_settings(cx);
@@ -1909,6 +2498,29 @@ impl AppModel {
         if self.start_hidden || self.locked {
             self.hide_account_window(&account.id, cx);
         }
+    }
+
+    /// Sends one `Create` command with the account's persisted profile and the
+    /// current preferences. Every call replaces a stale WebKit entry on the GTK
+    /// thread, so a resume can never leave two views for the same account.
+    fn send_create(&self, account_id: &str, url: String, html: Option<String>, show: bool) {
+        let scale = self.scales.get(account_id).copied().unwrap_or(1.0);
+        let parent_xid = self.account_xids.get(account_id).copied();
+        self.gtk.send(GtkCommand::Create {
+            account_id: account_id.to_string(),
+            parent_xid,
+            data_dir: self.paths.account_data_dir(account_id),
+            cache_dir: self.paths.account_cache_dir(account_id),
+            url,
+            html,
+            show,
+            scale,
+            zoom: self.settings.zoom,
+            writing: self.settings.writing.clone(),
+            proxy: self.settings.network.proxy.clone(),
+            appearance: self.settings.appearance.clone(),
+            media_actions: self.settings.media_actions,
+        });
     }
 
     pub fn open_settings_window(&mut self, cx: &mut Context<Self>) {
@@ -1931,6 +2543,289 @@ impl AppModel {
         self.pending_settings = true;
         let model = cx.entity().clone();
         cx.defer(move |cx| open_settings_window_deferred(model, cx));
+    }
+
+    /// Opens the first-run guide as its own window. It is never modal, so the
+    /// settings window, the tray, and the account window stay usable while it
+    /// is open. Reopening focuses the existing guide instead of stacking a
+    /// second one.
+    pub fn open_onboarding_window(&mut self, cx: &mut Context<Self>) {
+        if self.locked {
+            self.open_lock_window(cx);
+            return;
+        }
+        if let Some(handle) = self.onboarding_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.onboarding_window = None;
+        }
+        if self.pending_onboarding {
+            return;
+        }
+        self.pending_onboarding = true;
+        let model = cx.entity().clone();
+        cx.defer(move |cx| open_onboarding_window_deferred(model, cx));
+    }
+
+    /// Ends the guide from its final "Open WhatsApp Web" button. Records
+    /// completion and returns focus to the account window.
+    pub fn finish_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_onboarding(cx);
+        if let Some(account_id) = self.settings.active_account_id() {
+            self.open_account_window(&account_id, cx);
+        }
+    }
+
+    /// Ends the guide from Skip or Escape without pulling the account window
+    /// forward; the user may have opened the guide from Settings.
+    pub fn skip_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_onboarding(cx);
+    }
+
+    fn dismiss_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.record_onboarding_completed(cx);
+        self.close_onboarding_window(cx);
+    }
+
+    /// Called from the guide's window-close hook. Closing it with the titlebar
+    /// button counts as "seen"; the user can still reopen it from Settings.
+    /// Programmatic removals (lock, boss key, Skip) clear the field first, so
+    /// this hook only records completion for a user-initiated close.
+    pub fn onboarding_closed(&mut self, cx: &mut Context<Self>) {
+        self.pending_onboarding = false;
+        if self.onboarding_window.take().is_none() {
+            return;
+        }
+        self.record_onboarding_completed(cx);
+    }
+
+    fn record_onboarding_completed(&mut self, cx: &mut Context<Self>) {
+        if self.settings.onboarding_completed
+            && self.settings.onboarding_version == ONBOARDING_VERSION
+        {
+            return;
+        }
+        self.settings.mark_onboarding_completed();
+        self.save_settings(cx);
+    }
+
+    fn close_onboarding_window(&mut self, cx: &mut Context<Self>) {
+        self.pending_onboarding = false;
+        if let Some(handle) = self.onboarding_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
+    pub fn command_palette_context(&self, account_id: &str) -> CommandContext {
+        CommandContext {
+            accounts: self.palette_accounts(),
+            active_account: self.settings.active_account_id(),
+            lock_available: lock_is_configured(&self.settings.lock),
+            do_not_disturb: self.settings.do_not_disturb.is_active(SystemTime::now()),
+            theme: self.settings.theme,
+            zoom: self.settings.zoom,
+            retry_account: self
+                .settings
+                .account(account_id)
+                .map(|account| account.id.clone()),
+            retry_available: self.settings.account(account_id).is_some()
+                && self.account_connection(account_id).retry_available(),
+        }
+    }
+
+    fn palette_accounts(&self) -> Vec<CommandAccount> {
+        self.settings
+            .accounts
+            .iter()
+            .map(|account| CommandAccount {
+                id: account.id.clone(),
+                name: account.name.clone(),
+            })
+            .collect()
+    }
+
+    pub fn open_command_palette(
+        &mut self,
+        account_id: Option<String>,
+        anchor: Option<Bounds<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.quitting {
+            return;
+        }
+        if self.locked {
+            self.open_lock_window(cx);
+            return;
+        }
+        if let Some(handle) = self.command_palette {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.command_palette = None;
+        }
+        if self.pending_command_palette {
+            return;
+        }
+        let Some(account_id) = account_id.or_else(|| self.settings.active_account_id()) else {
+            return;
+        };
+        self.pending_command_palette = true;
+        let model = cx.entity().clone();
+        cx.defer(move |cx| {
+            open_command_palette_deferred(model, account_id, anchor, cx);
+        });
+    }
+
+    fn open_palette_from_hotkey(&mut self, cx: &mut Context<Self>) {
+        let account_id = self.settings.active_account_id();
+        let anchor = account_id.as_ref().and_then(|account_id| {
+            self.account_windows
+                .get(account_id)
+                .copied()
+                .and_then(|handle| handle.update(cx, |_, window, _| window.bounds()).ok())
+        });
+        self.open_command_palette(account_id, anchor, cx);
+    }
+
+    pub fn activate_account_at(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        if self.quitting {
+            return false;
+        }
+        let accounts = self.palette_accounts();
+        let Some(account) = account_at(&accounts, index) else {
+            return false;
+        };
+        let account_id = account.id.clone();
+        self.open_account_window(&account_id, cx);
+        true
+    }
+
+    pub fn execute_command(&mut self, action: CommandAction, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.pending_command_palette = false;
+        match &action {
+            CommandAction::ToggleVisibility => self.toggle_visibility(cx),
+            CommandAction::ShowAll => self.show_all(cx),
+            CommandAction::HideAll => self.hide_all(cx),
+            CommandAction::OpenSettings => self.open_settings_window(cx),
+            CommandAction::AddAccount => self.add_account(cx),
+            CommandAction::OpenAccount { index, account_id } => {
+                debug!(
+                    index,
+                    account_id = %account_id,
+                    "switching accounts from the command palette"
+                );
+                self.open_account_window(account_id, cx);
+            }
+            CommandAction::OpenDownloadsWindow => self.open_downloads_window(cx),
+            CommandAction::OpenDownloadsFolder => self.open_downloads_folder(cx),
+            CommandAction::OpenStorageFolder => self.open_storage_folder(cx),
+            CommandAction::Lock => self.lock(cx),
+            CommandAction::SetDoNotDisturb(enabled) => {
+                let mode = if *enabled { DndMode::On } else { DndMode::Off };
+                self.apply_do_not_disturb(mode, cx);
+            }
+            CommandAction::SetTheme(theme) => self.set_theme(*theme, cx),
+            CommandAction::ZoomIn => {
+                let zoom = zoom_after(self.settings.zoom, 1);
+                self.set_zoom(zoom, cx);
+            }
+            CommandAction::ZoomOut => {
+                let zoom = zoom_after(self.settings.zoom, -1);
+                self.set_zoom(zoom, cx);
+            }
+            CommandAction::ZoomReset => self.set_zoom(1.0, cx),
+            CommandAction::RetryConnection { account_id } => self.retry_account(account_id, cx),
+            CommandAction::Quit => self.quit(cx),
+        }
+        if let Some(account_id) = action.focus_account_after(self.settings.active_account_id()) {
+            self.pending_focus = Some(account_id);
+        }
+    }
+
+    pub fn command_palette_dismissed(&mut self, account_id: &str) {
+        let was_open = self.command_palette.take().is_some();
+        self.pending_command_palette = false;
+        if was_open {
+            self.pending_focus = Some(account_id.to_string());
+        }
+    }
+
+    /// Returns keyboard focus to the WebKit overlay that sits above the account
+    /// window. The overlay is a separate top-level X11 window, so activating the
+    /// GPUI wrapper alone would leave typing in the native shell.
+    fn focus_account_content(&self, account_id: &str) {
+        if self.hidden_accounts.contains(account_id) {
+            return;
+        }
+        let Some(parent) = self.account_xids.get(account_id).copied() else {
+            return;
+        };
+        let Some(content) = self.find_account_content(parent) else {
+            let _ = self.x11.activate(parent);
+            return;
+        };
+        let _ = self.x11.activate(content);
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::{ConnectionExt as _, InputFocus};
+        let _ = self
+            .x11
+            .conn
+            .set_input_focus(InputFocus::PARENT, content, x11rb::CURRENT_TIME);
+        let _ = self.x11.conn.flush();
+    }
+
+    fn find_account_content(&self, parent: u32) -> Option<u32> {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        let tree = self.x11.conn.query_tree(self.x11.root).ok()?.reply().ok()?;
+        if let Some(window) = tree
+            .children
+            .iter()
+            .copied()
+            .find_map(|window| self.content_window(window, parent))
+        {
+            return Some(window);
+        }
+        if self.account_windows.len() == 1 {
+            let pid = std::process::id();
+            return tree.children.iter().copied().find(|window| {
+                self.x11.pid_of(*window) == Some(pid)
+                    && self.x11.title_of(*window).as_deref() == Some("OxideZap content")
+            });
+        }
+        None
+    }
+
+    /// Finds the WebKit overlay for a parent window. Reparenting window managers
+    /// keep the client under a frame, so the transient hint is checked on the
+    /// root child and on one level of children.
+    fn content_window(&self, window: u32, parent: u32) -> Option<u32> {
+        if self.x11.transient_for(window) == Some(parent)
+            && self.x11.title_of(window).as_deref() == Some("OxideZap content")
+        {
+            return Some(window);
+        }
+        self.direct_children(window)
+            .into_iter()
+            .find(|child| self.x11.transient_for(*child) == Some(parent))
+    }
+
+    fn direct_children(&self, window: u32) -> Vec<u32> {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        self.x11
+            .conn
+            .query_tree(window)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.children)
+            .unwrap_or_default()
     }
 
     fn open_lock_window(&mut self, cx: &mut Context<Self>) {
@@ -1958,10 +2853,15 @@ impl AppModel {
         self.locked = true;
         self.boss_hidden = None;
         self.boss_settings_hidden = false;
+        self.boss_onboarding_hidden = false;
         self.pending_settings = false;
+        self.pending_onboarding = false;
         // The privacy screen shows only the lock window. Closing the settings
         // window does not discard preferences: every change is already saved.
         if let Some(handle) = self.settings_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+        if let Some(handle) = self.onboarding_window.take() {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
         let ids: Vec<String> = self.account_windows.keys().cloned().collect();
@@ -2018,6 +2918,9 @@ impl AppModel {
             if std::mem::take(&mut self.boss_settings_hidden) {
                 self.open_settings_window(cx);
             }
+            if std::mem::take(&mut self.boss_onboarding_hidden) {
+                self.open_onboarding_window(cx);
+            }
             self.update_tray();
             return;
         }
@@ -2037,6 +2940,14 @@ impl AppModel {
             self.pending_settings = false;
             pending
         };
+        self.boss_onboarding_hidden = if let Some(handle) = self.onboarding_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+            true
+        } else {
+            let pending = self.pending_onboarding;
+            self.pending_onboarding = false;
+            pending
+        };
         let ids: Vec<String> = self.account_windows.keys().cloned().collect();
         for id in ids {
             self.hide_account_window(&id, cx);
@@ -2047,6 +2958,7 @@ impl AppModel {
     pub fn hide_all(&mut self, cx: &mut Context<Self>) {
         self.boss_hidden = None;
         self.boss_settings_hidden = false;
+        self.boss_onboarding_hidden = false;
         let ids: Vec<String> = self.account_windows.keys().cloned().collect();
         for id in ids {
             self.hide_account_window(&id, cx);
@@ -2057,6 +2969,7 @@ impl AppModel {
     pub fn show_all(&mut self, cx: &mut Context<Self>) {
         self.boss_hidden = None;
         self.boss_settings_hidden = false;
+        self.boss_onboarding_hidden = false;
         if self.locked {
             self.open_lock_window(cx);
             return;
@@ -2070,6 +2983,7 @@ impl AppModel {
 
     fn hide_account_window(&mut self, account_id: &str, cx: &mut Context<Self>) {
         self.hidden_accounts.insert(account_id.to_string());
+        self.hidden_since.mark_hidden(account_id, Instant::now());
         if let Some(xid) = self.account_xids.get(account_id).copied() {
             if let Err(error) = self.x11.unmap(xid) {
                 warn!(%error, "could not hide the GPUI window");
@@ -2087,17 +3001,55 @@ impl AppModel {
             return;
         }
         self.hidden_accounts.remove(account_id);
+        self.hidden_since.mark_visible(account_id);
         if let Some(xid) = self.account_xids.get(account_id).copied() {
             let _ = self.x11.map(xid);
             let _ = self.x11.activate(xid);
         }
-        if !self.account_crash_failed(account_id) {
-            self.gtk.show(account_id);
+        match self.views.state(account_id) {
+            AccountViewState::Suspended => self.begin_resume(account_id, cx),
+            AccountViewState::Resuming => {}
+            AccountViewState::Loaded => {
+                if !self.account_crash_failed(account_id) {
+                    self.gtk.show(account_id);
+                }
+            }
         }
         if let Some(handle) = self.account_windows.get(account_id).copied() {
             let _ = handle.update(cx, |_, window, _| window.activate_window());
         }
         self.update_tray();
+    }
+
+    /// Recreates the WebKit view of a suspended account. The same profile
+    /// directories and therefore the same WhatsApp login are reused.
+    fn begin_resume(&mut self, account_id: &str, cx: &mut Context<Self>) {
+        // A storage worker is rewriting this profile. Creating a view now would
+        // race the deletion, so the account stays suspended until the operation
+        // finishes and can be reactivated from the placeholder.
+        if self
+            .storage
+            .running
+            .as_ref()
+            .is_some_and(|running| running.account_id == account_id)
+        {
+            warn!(
+                account_id = %account_id,
+                "postponed a resume while a storage operation is running"
+            );
+            return;
+        }
+        if !self.views.begin_resume(account_id) {
+            return;
+        }
+        let url = self
+            .pending_urls
+            .remove(account_id)
+            .unwrap_or_else(|| WHATSAPP_URL.to_string());
+        self.send_create(account_id, url, None, true);
+        self.refresh_account_window(account_id, cx);
+        self.update_tray();
+        cx.refresh_windows();
     }
 
     fn any_account_visible(&self) -> bool {
@@ -2158,6 +3110,9 @@ impl AppModel {
         self.connection.remove(account_id);
         self.active_downloads.remove(account_id);
         self.hidden_accounts.remove(account_id);
+        self.views.forget(account_id);
+        self.hidden_since.forget(account_id);
+        self.capture_active.remove(account_id);
         self.scales.remove(account_id);
         self.gtk.close(account_id);
         window.remove_window();
@@ -2218,6 +3173,9 @@ impl AppModel {
         self.connection.remove(account_id);
         self.active_downloads.remove(account_id);
         self.hidden_accounts.remove(account_id);
+        self.views.forget(account_id);
+        self.hidden_since.forget(account_id);
+        self.capture_active.remove(account_id);
         self.scales.remove(account_id);
         self.gtk.close(account_id);
         self.settings.remove_account(account_id);
@@ -2356,34 +3314,27 @@ impl AppModel {
     }
 
     /// Recreates the GTK overlay after its profile was cleared. A closed GPUI
-    /// window is left alone: the next open creates a fresh webview anyway.
+    /// window is left alone: the next open creates a fresh webview anyway. A
+    /// suspended account stays suspended; its next Reactivate creates the fresh
+    /// view from the cleared profile.
     fn recreate_account_webview(&mut self, account_id: &str) {
         if !self.account_windows.contains_key(account_id)
             || self.settings.account(account_id).is_none()
         {
             return;
         }
-        let scale = self.scales.get(account_id).copied().unwrap_or(1.0);
+        if self.views.state(account_id).is_suspended() {
+            return;
+        }
+        self.views.forget(account_id);
         let show = !self.hidden_accounts.contains(account_id) && !self.locked;
-        let parent_xid = self.account_xids.get(account_id).copied();
         let url = self
             .pending_urls
             .remove(account_id)
             .unwrap_or_else(|| WHATSAPP_URL.to_string());
         self.crash_recovery.remove(account_id);
-        self.gtk.send(GtkCommand::Create {
-            account_id: account_id.to_string(),
-            parent_xid,
-            data_dir: self.paths.account_data_dir(account_id),
-            cache_dir: self.paths.account_cache_dir(account_id),
-            url,
-            html: None,
-            show,
-            scale,
-            zoom: self.settings.zoom,
-            writing: self.settings.writing.clone(),
-            proxy: self.settings.network.proxy.clone(),
-        });
+        self.connection.remove(account_id);
+        self.send_create(account_id, url, None, show);
     }
 
     pub fn set_theme(&mut self, theme: crate::settings::ThemeMode, cx: &mut Context<Self>) {
@@ -2408,6 +3359,44 @@ impl AppModel {
         self.gtk.set_writing(self.settings.writing.clone());
     }
 
+    /// Stores a validated experimental stylesheet. It is applied immediately
+    /// when the global toggle is on; otherwise it waits for the toggle.
+    pub fn set_custom_css(&mut self, css: String, cx: &mut Context<Self>) -> Result<(), String> {
+        validate_custom_css(&css)?;
+        if self.settings.appearance.custom_css == css {
+            return Ok(());
+        }
+        self.settings.appearance.custom_css = css;
+        self.apply_settings(cx);
+        Ok(())
+    }
+
+    /// Enables or disables experimental CSS. Enabling requires a valid
+    /// stylesheet so the toggle can never claim to apply an empty file.
+    pub fn set_custom_css_enabled(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if enabled {
+            validate_custom_css(&self.settings.appearance.custom_css)?;
+        }
+        if self.settings.appearance.experimental_css == enabled {
+            return Ok(());
+        }
+        self.settings.appearance.experimental_css = enabled;
+        self.apply_settings(cx);
+        Ok(())
+    }
+
+    pub fn reset_custom_css(&mut self, cx: &mut Context<Self>) {
+        if self.settings.appearance == AppearanceSettings::default() {
+            return;
+        }
+        self.settings.appearance = AppearanceSettings::default();
+        self.apply_settings(cx);
+    }
+
     pub fn set_network_proxy(&mut self, proxy: ProxySettings, cx: &mut Context<Self>) {
         if self.settings.network.proxy == proxy {
             return;
@@ -2424,6 +3413,15 @@ impl AppModel {
         if Shortcut::parse(&self.settings.boss_key).ok().as_ref() == Some(&shortcut) {
             return Err("The show/hide shortcut must differ from the boss key.".to_string());
         }
+        if Shortcut::parse(&self.settings.command_palette_shortcut)
+            .ok()
+            .as_ref()
+            == Some(&shortcut)
+        {
+            return Err(
+                "The show/hide shortcut must differ from the command palette shortcut.".to_string(),
+            );
+        }
         self.settings.shortcut = shortcut.to_string();
         self.apply_settings(cx);
         Ok(())
@@ -2437,7 +3435,39 @@ impl AppModel {
         if Shortcut::parse(&self.settings.shortcut).ok().as_ref() == Some(&shortcut) {
             return Err("The boss key must differ from the show/hide shortcut.".to_string());
         }
+        if Shortcut::parse(&self.settings.command_palette_shortcut)
+            .ok()
+            .as_ref()
+            == Some(&shortcut)
+        {
+            return Err("The boss key must differ from the command palette shortcut.".to_string());
+        }
         self.settings.boss_key = shortcut.to_string();
+        self.apply_settings(cx);
+        Ok(())
+    }
+
+    pub fn set_command_palette_shortcut(
+        &mut self,
+        shortcut: Option<Shortcut>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if let Some(shortcut) = shortcut {
+            if Shortcut::parse(&self.settings.shortcut).ok().as_ref() == Some(&shortcut) {
+                return Err(
+                    "The command palette shortcut must differ from the show/hide shortcut."
+                        .to_string(),
+                );
+            }
+            if Shortcut::parse(&self.settings.boss_key).ok().as_ref() == Some(&shortcut) {
+                return Err(
+                    "The command palette shortcut must differ from the boss key.".to_string(),
+                );
+            }
+            self.settings.command_palette_shortcut = shortcut.to_string();
+        } else {
+            self.settings.command_palette_shortcut.clear();
+        }
         self.apply_settings(cx);
         Ok(())
     }
@@ -2523,6 +3553,9 @@ impl AppModel {
             self.account_xids.remove(&account_id);
             self.crash_recovery.remove(&account_id);
             self.hidden_accounts.remove(&account_id);
+            self.views.forget(&account_id);
+            self.hidden_since.forget(&account_id);
+            self.capture_active.remove(&account_id);
             self.scales.remove(&account_id);
             self.gtk.close(&account_id);
         }
@@ -2541,6 +3574,9 @@ impl AppModel {
         self.settings = settings;
         self.release_lock_without_password(cx);
         self.apply_settings(cx);
+        // Defaults include an uncompleted guide, so a preferences reset makes
+        // the first-run tour available again and opens it for review.
+        self.open_onboarding_window(cx);
     }
 
     /// Importing or resetting may remove the lock password while the app is
@@ -2571,14 +3607,25 @@ impl AppModel {
         }
         self.apply_hotkeys();
         self.gtk.set_proxy(self.settings.network.proxy.clone());
+        self.gtk.set_appearance(self.settings.appearance.clone());
+        self.gtk.set_media_actions(self.settings.media_actions);
+        // Turning low-memory mode off must not strand accounts in the
+        // suspended placeholder. Re-enabling it never suspends immediately:
+        // each account has to stay hidden for the configured delay first.
+        if !self.settings.memory.suspend_hidden {
+            self.resume_all_suspended(cx);
+        }
         self.update_tray();
         cx.refresh_windows();
     }
 
     fn apply_hotkeys(&self) {
         if let Ok(shortcut) = Shortcut::parse(&self.settings.shortcut) {
-            self.hotkey
-                .set(hotkey_bindings(shortcut, &self.settings.boss_key));
+            self.hotkey.set(hotkey_bindings(
+                shortcut,
+                &self.settings.boss_key,
+                &self.settings.command_palette_shortcut,
+            ));
         }
     }
 
@@ -2637,16 +3684,22 @@ impl AppModel {
         }
     }
 
-    fn update_tray(&self) {
+    fn update_tray(&mut self) {
+        let now = SystemTime::now();
+        let dnd = TrayDndState {
+            active: self.settings.do_not_disturb.is_active(now),
+            status: self.settings.do_not_disturb.status_text(now),
+            follows_schedule: self.settings.do_not_disturb.follows_schedule(),
+            schedule_active: self.settings.do_not_disturb.schedule_is_active(now),
+            wake_time: self.settings.do_not_disturb.wake_time().to_string(),
+        };
+        self.last_dnd_active = dnd.active;
+        self.last_dnd_status = dnd.status.clone();
         let unread = self.settings.total_unread();
         let visible = self.any_account_visible();
         if let Some(tray) = &self.tray {
-            tray.update(
-                &self.settings.accounts,
-                unread,
-                visible,
-                self.settings.do_not_disturb,
-            );
+            let suspended: HashSet<String> = self.views.suspended_ids().into_iter().collect();
+            tray.update(&self.settings.accounts, unread, visible, dnd, &suspended);
         }
         self.badge.set(unread);
     }
@@ -2896,6 +3949,80 @@ fn account_window_title(name: &str) -> String {
     format!("OxideZap — {name}")
 }
 
+fn open_command_palette_deferred(
+    model: Entity<AppModel>,
+    account_id: String,
+    anchor: Option<Bounds<Pixels>>,
+    cx: &mut App,
+) {
+    if model.read(cx).locked {
+        model.update(cx, |model, _| model.pending_command_palette = false);
+        return;
+    }
+
+    let window_bounds = match anchor {
+        Some(anchor) => {
+            let width = f32::from(anchor.size.width);
+            let x = f32::from(anchor.origin.x) + (width - COMMAND_PALETTE_WIDTH) / 2.0;
+            let y = f32::from(anchor.origin.y) + COMMAND_PALETTE_TOP_OFFSET;
+            WindowBounds::Windowed(Bounds::new(
+                point(px(x.max(0.0)), px(y.max(0.0))),
+                size(px(COMMAND_PALETTE_WIDTH), px(COMMAND_PALETTE_HEIGHT)),
+            ))
+        }
+        None => WindowBounds::centered(
+            size(px(COMMAND_PALETTE_WIDTH), px(COMMAND_PALETTE_HEIGHT)),
+            cx,
+        ),
+    };
+
+    let options = WindowOptions {
+        window_bounds: Some(window_bounds),
+        titlebar: None,
+        focus: true,
+        show: true,
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        display_id: None,
+        window_background: WindowBackgroundAppearance::Opaque,
+        app_id: Some("oxidezap-palette".to_string()),
+        window_min_size: None,
+        window_decorations: Some(WindowDecorations::Server),
+        tabbing_identifier: None,
+    };
+
+    let model_for_view = model.clone();
+    let account_for_view = account_id.clone();
+    let model_for_close = model.clone();
+    let account_for_close = account_id.clone();
+    match cx.open_window(options, move |window, cx| {
+        window.set_app_id("oxidezap-palette");
+        let palette =
+            cx.new(|cx| CommandPalette::new(model_for_view.clone(), account_for_view.clone(), cx));
+        window.on_window_should_close(cx, move |window, cx| {
+            model_for_close.update(cx, |model, _| {
+                model.command_palette_dismissed(&account_for_close);
+            });
+            window.remove_window();
+            false
+        });
+        palette
+    }) {
+        Ok(handle) => {
+            model.update(cx, |model, _| {
+                model.pending_command_palette = false;
+                model.command_palette = Some(handle);
+            });
+        }
+        Err(error) => {
+            error!(%error, "could not open the command palette");
+            model.update(cx, |model, _| model.pending_command_palette = false);
+        }
+    }
+}
+
 fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx: &mut App) {
     let data = {
         let model_ref = model.read(cx);
@@ -2991,11 +4118,17 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
         Err(error) => {
             error!(%error, "could not open an account window");
             let icon = model.read(cx).paths.runtime_icon();
-            notify::notify(
-                "Could not open the account window",
-                &error.to_string(),
-                Some(&icon),
-            );
+            let notify_allowed = {
+                let model = model.read(cx);
+                !notify::do_not_disturb_suppressed(&model.settings, SystemTime::now())
+            };
+            if notify_allowed {
+                notify::notify(
+                    "Could not open the account window",
+                    &error.to_string(),
+                    Some(&icon),
+                );
+            }
             model.update(cx, |model, _| {
                 model.pending_accounts.remove(&account_id);
             });
@@ -3056,6 +4189,62 @@ fn open_settings_window_deferred(model: Entity<AppModel>, cx: &mut App) {
         Err(error) => {
             error!(%error, "could not open the settings window");
             model.update(cx, |model, _| model.pending_settings = false);
+        }
+    }
+}
+
+fn open_onboarding_window_deferred(model: Entity<AppModel>, cx: &mut App) {
+    let hidden_or_locked = {
+        let model = model.read(cx);
+        model.locked || model.boss_hidden.is_some()
+    };
+    if hidden_or_locked {
+        model.update(cx, |model, _| model.pending_onboarding = false);
+        return;
+    }
+    info!("opening first-run guide");
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(700.0), px(620.0)), cx)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(SharedString::from("Welcome to OxideZap")),
+            appears_transparent: false,
+            traffic_light_position: None,
+        }),
+        focus: true,
+        show: true,
+        kind: WindowKind::Normal,
+        is_movable: true,
+        is_resizable: true,
+        is_minimizable: true,
+        display_id: None,
+        window_background: WindowBackgroundAppearance::Opaque,
+        app_id: Some("oxidezap-onboarding".to_string()),
+        window_min_size: Some(size(px(620.0), px(520.0))),
+        window_decorations: Some(WindowDecorations::Client),
+        tabbing_identifier: None,
+    };
+
+    let model_for_view = model.clone();
+    let model_for_close = model.clone();
+    match cx.open_window(options, move |window, cx| {
+        window.request_decorations(WindowDecorations::Client);
+        window.set_app_id("oxidezap-onboarding");
+        window.on_window_should_close(cx, move |window, cx| {
+            model_for_close.update(cx, |model, cx| model.onboarding_closed(cx));
+            window.remove_window();
+            false
+        });
+        cx.new(|cx| OnboardingWindow::new(model_for_view.clone(), cx))
+    }) {
+        Ok(handle) => {
+            model.update(cx, |model, _| {
+                model.pending_onboarding = false;
+                model.onboarding_window = Some(handle);
+            });
+        }
+        Err(error) => {
+            error!(%error, "could not open the first-run guide");
+            model.update(cx, |model, _| model.pending_onboarding = false);
         }
     }
 }
@@ -3209,7 +4398,8 @@ fn ambiguous_account_message(query: &str, accounts: &[&Account]) -> String {
 }
 
 /// Stable `key: value` output for `--status`. Every line has the same order so
-/// scripts can read it with `sed`, `grep`, or `cut`.
+/// scripts can read it with `sed`, `grep`, or `cut`. `dnd` reports the effective
+/// state, so an active quiet-hours window prints `on` too.
 pub fn status_text(settings: &Settings, running: bool, windows: usize) -> String {
     let active = settings
         .active_account_id()
@@ -3221,7 +4411,11 @@ pub fn status_text(settings: &Settings, running: bool, windows: usize) -> String
         if running { "true" } else { "false" },
         settings.accounts.len(),
         active,
-        if settings.do_not_disturb { "on" } else { "off" },
+        if settings.do_not_disturb.is_active(SystemTime::now()) {
+            "on"
+        } else {
+            "off"
+        },
         windows
     )
 }
@@ -3264,6 +4458,277 @@ fn single_line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn memory_mode() -> MemorySettings {
+        MemorySettings {
+            suspend_hidden: true,
+            suspend_after_minutes: 30,
+            keep_active_account: true,
+        }
+    }
+
+    fn suspend_context(memory: &MemorySettings) -> SuspendContext<'_> {
+        SuspendContext {
+            memory,
+            state: AccountViewState::Loaded,
+            hidden: true,
+            active_account: false,
+            idle: Duration::from_secs(30 * 60),
+            downloads_active: false,
+            capture_active: false,
+            locked: false,
+            quitting: false,
+            view_open: true,
+            manual: false,
+        }
+    }
+
+    #[test]
+    fn low_memory_policy_requires_a_hidden_idle_loaded_view() {
+        let memory = memory_mode();
+        assert_eq!(
+            suspend_decision(&suspend_context(&memory)),
+            SuspendDecision::Suspend
+        );
+
+        let mut visible = suspend_context(&memory);
+        visible.hidden = false;
+        assert_eq!(
+            suspend_decision(&visible),
+            SuspendDecision::Keep(SuspendBlocker::Visible)
+        );
+
+        let mut early = suspend_context(&memory);
+        early.idle = Duration::from_secs(30 * 60 - 1);
+        assert_eq!(
+            suspend_decision(&early),
+            SuspendDecision::Keep(SuspendBlocker::NotIdle)
+        );
+
+        let mut missing_view = suspend_context(&memory);
+        missing_view.view_open = false;
+        assert_eq!(
+            suspend_decision(&missing_view),
+            SuspendDecision::Keep(SuspendBlocker::NoView)
+        );
+
+        let mut disabled = memory_mode();
+        disabled.suspend_hidden = false;
+        assert_eq!(
+            suspend_decision(&suspend_context(&disabled)),
+            SuspendDecision::Keep(SuspendBlocker::Disabled)
+        );
+
+        let mut already = suspend_context(&memory);
+        already.state = AccountViewState::Suspended;
+        assert_eq!(
+            suspend_decision(&already),
+            SuspendDecision::Keep(SuspendBlocker::AlreadySuspended)
+        );
+
+        let mut resuming = suspend_context(&memory);
+        resuming.state = AccountViewState::Resuming;
+        assert_eq!(
+            suspend_decision(&resuming),
+            SuspendDecision::Keep(SuspendBlocker::Resuming)
+        );
+    }
+
+    #[test]
+    fn low_memory_policy_never_interrupts_busy_locked_or_quitting_accounts() {
+        let memory = memory_mode();
+
+        let mut downloading = suspend_context(&memory);
+        downloading.downloads_active = true;
+        assert_eq!(
+            suspend_decision(&downloading),
+            SuspendDecision::Keep(SuspendBlocker::DownloadActive)
+        );
+
+        let mut recording = suspend_context(&memory);
+        recording.capture_active = true;
+        assert_eq!(
+            suspend_decision(&recording),
+            SuspendDecision::Keep(SuspendBlocker::CaptureActive)
+        );
+
+        let mut locked = suspend_context(&memory);
+        locked.locked = true;
+        assert_eq!(
+            suspend_decision(&locked),
+            SuspendDecision::Keep(SuspendBlocker::Locked)
+        );
+
+        let mut quitting = suspend_context(&memory);
+        quitting.quitting = true;
+        assert_eq!(
+            suspend_decision(&quitting),
+            SuspendDecision::Keep(SuspendBlocker::Quitting)
+        );
+    }
+
+    #[test]
+    fn an_active_download_blocks_low_memory_suspension() {
+        let memory = memory_mode();
+        let mut context = suspend_context(&memory);
+        context.downloads_active = true;
+        assert_eq!(
+            suspend_decision(&context),
+            SuspendDecision::Keep(SuspendBlocker::DownloadActive)
+        );
+
+        context.manual = true;
+        assert_eq!(
+            suspend_decision(&context),
+            SuspendDecision::Keep(SuspendBlocker::DownloadActive)
+        );
+    }
+
+    #[test]
+    fn low_memory_policy_keeps_the_active_account_only_when_configured() {
+        let memory = memory_mode();
+        let mut active = suspend_context(&memory);
+        active.active_account = true;
+        assert_eq!(
+            suspend_decision(&active),
+            SuspendDecision::Keep(SuspendBlocker::ActiveAccount)
+        );
+
+        let mut release_active = memory_mode();
+        release_active.keep_active_account = false;
+        assert_eq!(
+            suspend_decision(&SuspendContext {
+                memory: &release_active,
+                ..active
+            }),
+            SuspendDecision::Suspend
+        );
+    }
+
+    #[test]
+    fn manual_release_ignores_the_delay_but_keeps_the_safety_guards() {
+        let mut disabled = memory_mode();
+        disabled.suspend_hidden = false;
+        let mut manual = suspend_context(&disabled);
+        manual.manual = true;
+        manual.idle = Duration::ZERO;
+        assert_eq!(suspend_decision(&manual), SuspendDecision::Suspend);
+
+        let mut downloading = manual;
+        downloading.downloads_active = true;
+        assert_eq!(
+            suspend_decision(&downloading),
+            SuspendDecision::Keep(SuspendBlocker::DownloadActive)
+        );
+
+        let mut recording = manual;
+        recording.capture_active = true;
+        assert_eq!(
+            suspend_decision(&recording),
+            SuspendDecision::Keep(SuspendBlocker::CaptureActive)
+        );
+
+        let mut locked = manual;
+        locked.locked = true;
+        assert_eq!(
+            suspend_decision(&locked),
+            SuspendDecision::Keep(SuspendBlocker::Locked)
+        );
+
+        let mut active = manual;
+        active.active_account = true;
+        assert_eq!(
+            suspend_decision(&active),
+            SuspendDecision::Keep(SuspendBlocker::ActiveAccount)
+        );
+    }
+
+    #[test]
+    fn the_sweep_runs_at_most_once_per_interval() {
+        let start = Instant::now();
+        assert!(!memory_sweep_due(start, start));
+        assert!(!memory_sweep_due(
+            start,
+            start + MEMORY_SWEEP_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(memory_sweep_due(start, start + MEMORY_SWEEP_INTERVAL));
+        assert!(memory_sweep_due(
+            start,
+            start + MEMORY_SWEEP_INTERVAL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn repeated_hides_keep_the_original_idle_start() {
+        let start = Instant::now();
+        let mut hidden = HiddenSince::default();
+
+        hidden.mark_hidden("a", start);
+        hidden.mark_hidden("a", start + Duration::from_secs(50));
+
+        assert_eq!(
+            hidden.hidden_for("a", start + Duration::from_secs(60)),
+            Some(Duration::from_secs(60))
+        );
+
+        hidden.mark_visible("a");
+        assert_eq!(
+            hidden.hidden_for("a", start + Duration::from_secs(90)),
+            None
+        );
+
+        hidden.mark_hidden("a", start + Duration::from_secs(90));
+        assert_eq!(
+            hidden.hidden_for("a", start + Duration::from_secs(100)),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn view_lifecycle_maps_suspend_and_resume_without_duplicates() {
+        let mut views = ViewLifecycle::default();
+        assert_eq!(views.state("a"), AccountViewState::Loaded);
+
+        assert!(views.begin_suspend("a"));
+        assert!(!views.begin_suspend("a"));
+        assert_eq!(views.state("a"), AccountViewState::Suspended);
+        assert_eq!(views.suspended_ids(), vec!["a".to_string()]);
+
+        assert!(views.begin_resume("a"));
+        assert!(!views.begin_resume("a"));
+        assert_eq!(views.state("a"), AccountViewState::Resuming);
+        views.mark_loaded("a");
+        assert_eq!(views.state("a"), AccountViewState::Loaded);
+
+        assert!(views.begin_suspend("a"));
+        views.forget("a");
+        assert_eq!(views.state("a"), AccountViewState::Loaded);
+        assert_eq!(views.suspended_count(), 0);
+    }
+
+    #[test]
+    fn stale_view_events_do_not_revive_a_suspended_account() {
+        let mut views = ViewLifecycle::default();
+        assert!(views.begin_suspend("a"));
+
+        views.mark_loaded("a");
+        assert_eq!(views.state("a"), AccountViewState::Suspended);
+
+        views.mark_active("a");
+        assert_eq!(views.state("a"), AccountViewState::Loaded);
+    }
+
+    #[test]
+    fn a_failed_resume_returns_to_the_suspended_placeholder() {
+        let mut views = ViewLifecycle::default();
+        assert!(views.begin_suspend("a"));
+        assert!(views.begin_resume("a"));
+
+        views.mark_failed("a");
+
+        assert_eq!(views.state("a"), AccountViewState::Suspended);
+        assert!(views.begin_resume("a"));
+    }
 
     #[test]
     fn crash_retries_back_off_then_stop() {
@@ -3657,7 +5122,10 @@ mod tests {
         let settings = Settings {
             accounts: vec![Account::with_id("a", "Work"), Account::with_id("b", "Home")],
             active_account: Some("a".to_string()),
-            do_not_disturb: true,
+            do_not_disturb: DoNotDisturbSettings {
+                mode: crate::settings::DoNotDisturbMode::On,
+                ..DoNotDisturbSettings::default()
+            },
             ..Settings::default()
         };
         assert_eq!(
@@ -3673,6 +5141,15 @@ mod tests {
                 "version: {}\nrunning: false\naccounts: 2\nactive_account: a\ndnd: on\nwindows: 0\n",
                 env!("CARGO_PKG_VERSION")
             )
+        );
+    }
+
+    #[test]
+    fn status_output_reports_off_by_default() {
+        let settings = Settings::default();
+        assert!(
+            status_text(&settings, false, 0).contains("dnd: off"),
+            "the existing status format must keep reporting an inactive DND"
         );
     }
 

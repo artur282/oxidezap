@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
@@ -13,9 +13,11 @@ use crate::assets::{ICON_BELL, ICON_GEAR, ICON_INFO, ICON_PALETTE, ICON_SHIELD, 
 use crate::lock::MIN_PASSWORD_LENGTH;
 use crate::settings::storage::{self, ConfirmationLevel, StorageOperation};
 use crate::settings::{
-    ImportPreview, MAX_ZOOM, MIN_ZOOM, ManualProxy, ProxyMode, ProxyProtocol, ProxySettings,
-    Settings, SettingsExport, SpellCheckLanguage, ThemeMode, export_file_name, json_path,
-    test_proxy_connection, write_settings_backup,
+    DoNotDisturbMode, EVERY_DAY, ImportPreview, MAX_CUSTOM_CSS_BYTES, MAX_ZOOM, MIN_ZOOM,
+    ManualProxy, ProxyMode, ProxyProtocol, ProxySettings, SUSPEND_DELAY_OPTIONS, Settings,
+    SettingsExport, SpellCheckLanguage, ThemeMode, WEEKDAYS, WEEKENDS, ZOOM_LEVELS,
+    export_file_name, format_time_of_day, json_path, parse_time_of_day, test_proxy_connection,
+    validate_custom_css, write_settings_backup,
 };
 use crate::shortcut::Shortcut;
 use crate::theme::Theme;
@@ -33,6 +35,7 @@ enum FileChooserMode {
     Open,
     Save,
     Folder,
+    Css,
 }
 
 /// A storage operation waiting for the user to confirm it.
@@ -90,6 +93,7 @@ pub enum SettingsSection {
     Notifications,
     Network,
     General,
+    Performance,
     Security,
     About,
 }
@@ -103,6 +107,7 @@ impl SettingsSection {
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Network => "Network",
             SettingsSection::General => "General",
+            SettingsSection::Performance => "Performance",
             SettingsSection::Security => "Security",
             SettingsSection::About => "About",
         }
@@ -116,6 +121,7 @@ impl SettingsSection {
             SettingsSection::Notifications => ICON_BELL,
             SettingsSection::Network => ICON_INFO,
             SettingsSection::General => ICON_GEAR,
+            SettingsSection::Performance => ICON_INFO,
             SettingsSection::Security => ICON_SHIELD,
             SettingsSection::About => ICON_INFO,
         }
@@ -132,6 +138,10 @@ pub struct SettingsWindow {
     confirm_field: Entity<TextField>,
     shortcut_field: Entity<TextField>,
     boss_key_field: Entity<TextField>,
+    palette_shortcut_field: Entity<TextField>,
+    dnd_start_field: Entity<TextField>,
+    dnd_end_field: Entity<TextField>,
+    dnd_error: Option<String>,
     downloads_dir_field: Entity<TextField>,
     downloads_error: Option<String>,
     proxy_mode: ProxyMode,
@@ -142,15 +152,18 @@ pub struct SettingsWindow {
     proxy_password_field: Entity<TextField>,
     proxy_feedback: Option<Notice>,
     proxy_test_running: bool,
+    css_feedback: Option<Notice>,
     security_error: Option<String>,
     shortcut_error: Option<String>,
     boss_key_error: Option<String>,
+    palette_shortcut_error: Option<String>,
     remove_password_confirm: bool,
     pending_import: Option<ImportPreview>,
     reset_confirm: bool,
     storage_confirm: Option<StorageConfirm>,
     storage_confirm_error: Option<String>,
     feedback: Option<Notice>,
+    memory_feedback: Option<Notice>,
     file_dialog_open: bool,
     operation_running: bool,
     appearance_subscription: Option<Subscription>,
@@ -163,8 +176,17 @@ impl SettingsWindow {
         let confirm_field = cx.new(|cx| TextField::new("Confirm password", cx).masked(true));
         let shortcut = model.read(cx).settings.shortcut.clone();
         let boss_key = model.read(cx).settings.boss_key.clone();
+        let palette_shortcut = model.read(cx).settings.command_palette_shortcut.clone();
         let shortcut_field = cx.new(|cx| TextField::new("Ctrl+Shift+W", cx).with_content(shortcut));
         let boss_key_field = cx.new(|cx| TextField::new("Ctrl+Shift+H", cx).with_content(boss_key));
+        let palette_shortcut_field = cx.new(|cx| {
+            TextField::new("Optional, e.g. Ctrl+Shift+K", cx).with_content(palette_shortcut)
+        });
+        let quiet_hours = model.read(cx).settings.do_not_disturb.schedule.clone();
+        let dnd_start_field =
+            cx.new(|cx| TextField::new("22:00", cx).with_content(quiet_hours.start.clone()));
+        let dnd_end_field =
+            cx.new(|cx| TextField::new("07:00", cx).with_content(quiet_hours.end.clone()));
         let downloads_dir = model
             .read(cx)
             .settings
@@ -198,6 +220,9 @@ impl SettingsWindow {
         register_field_tab_stop(&confirm_field, cx);
         register_field_tab_stop(&shortcut_field, cx);
         register_field_tab_stop(&boss_key_field, cx);
+        register_field_tab_stop(&palette_shortcut_field, cx);
+        register_field_tab_stop(&dnd_start_field, cx);
+        register_field_tab_stop(&dnd_end_field, cx);
         register_field_tab_stop(&downloads_dir_field, cx);
         register_field_tab_stop(&proxy_host_field, cx);
         register_field_tab_stop(&proxy_port_field, cx);
@@ -213,6 +238,10 @@ impl SettingsWindow {
             confirm_field,
             shortcut_field,
             boss_key_field,
+            palette_shortcut_field,
+            dnd_start_field,
+            dnd_end_field,
+            dnd_error: None,
             downloads_dir_field,
             downloads_error: None,
             proxy_mode,
@@ -223,15 +252,18 @@ impl SettingsWindow {
             proxy_password_field,
             proxy_feedback: None,
             proxy_test_running: false,
+            css_feedback: None,
             security_error: None,
             shortcut_error: None,
             boss_key_error: None,
+            palette_shortcut_error: None,
             remove_password_confirm: false,
             pending_import: None,
             reset_confirm: false,
             storage_confirm: None,
             storage_confirm_error: None,
             feedback: None,
+            memory_feedback: None,
             file_dialog_open: false,
             operation_running: false,
             appearance_subscription: None,
@@ -1023,24 +1055,18 @@ impl SettingsWindow {
             );
         }
 
-        let zooms = [
-            (0.8, "80%"),
-            (0.9, "90%"),
-            (1.0, "100%"),
-            (1.1, "110%"),
-            (1.25, "125%"),
-            (1.5, "150%"),
-        ];
         let mut zoom_row = div().flex().flex_wrap().gap(px(8.));
-        for (zoom, label) in zooms {
+        for zoom in ZOOM_LEVELS {
+            let label = format!("{}%", (zoom * 100.0).round() as u32);
+            let id = format!("zoom-{label}");
             let selected = (settings.zoom - zoom).abs() < 0.001;
             let text = if selected {
                 format!("✓ {label}")
             } else {
-                label.to_string()
+                label
             };
             zoom_row = zoom_row.child(button(
-                SharedString::from(format!("zoom-{label}")),
+                SharedString::from(id),
                 text,
                 theme,
                 selected,
@@ -1099,7 +1125,163 @@ impl SettingsWindow {
                             )),
                     ),
             )
+            .child(self.render_experimental_css(settings, theme, cx))
             .into_any_element()
+    }
+
+    fn render_experimental_css(
+        &mut self,
+        settings: &Settings,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let appearance = &settings.appearance;
+        let css_size = appearance.custom_css.trim().len();
+        let status = if css_size == 0 {
+            "No stylesheet loaded.".to_string()
+        } else {
+            format!(
+                "{} · {}",
+                css_size_label(css_size),
+                if appearance.experimental_css {
+                    "applied"
+                } else {
+                    "not applied"
+                }
+            )
+        };
+        let preview = css_preview(&appearance.custom_css);
+        let enabled = appearance.experimental_css;
+        let busy = self.file_dialog_open || self.operation_running;
+        let feedback = self.css_feedback.clone();
+
+        let mut card = card(theme)
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child("Experimental CSS"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.danger)
+                            .child("Unsupported and experimental"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "WhatsApp Web changes its DOM without notice. A stylesheet can break the QR login, calls, dialogs, or the chat view, and may stop working after any WhatsApp update. Do not hide security, privacy, or abuse-reporting controls. OxideZap injects CSS only: it never runs JavaScript from this file and never downloads remote themes.",
+                            ),
+                    ),
+            )
+            .child(toggle_row(
+                "experimental-css-enabled",
+                "Apply experimental CSS",
+                "Enable the loaded stylesheet on every open WhatsApp Web account.",
+                enabled,
+                theme,
+                cx.listener(move |this, _event, _window, cx| {
+                    let result = this
+                        .model
+                        .update(cx, |model, cx| model.set_custom_css_enabled(!enabled, cx));
+                    this.css_feedback = Some(match result {
+                        Ok(()) if enabled => Notice::success("Experimental CSS disabled."),
+                        Ok(()) => Notice::success("Experimental CSS enabled."),
+                        Err(error) => Notice::error(error),
+                    });
+                    cx.notify();
+                }),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .when(!busy, |row| {
+                        row.child(button(
+                            "load-custom-css",
+                            "Load CSS file\u{2026}",
+                            theme,
+                            false,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.start_load_css(cx);
+                            }),
+                        ))
+                    })
+                    .child(button(
+                        "reset-custom-css",
+                        "Reset",
+                        theme,
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.reset_custom_css(cx);
+                        }),
+                    ))
+                    .when(busy, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.text_muted)
+                                .child("Waiting for the file dialog\u{2026}"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .p(px(10.))
+                    .rounded_md()
+                    .bg(theme.surface_alt)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(status),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_muted)
+                            .child(preview),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(
+                        "Restricted to https://web.whatsapp.com · 64 KiB limit · CSS only · excluded from settings exports.",
+                    ),
+            );
+
+        if let Some(notice) = feedback {
+            card = card.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(if notice.error {
+                        theme.danger
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(notice.text),
+            );
+        }
+
+        card.into_any_element()
     }
 
     fn render_notifications(
@@ -1180,6 +1362,212 @@ impl SettingsWindow {
                 ));
         }
 
+        let dnd = &settings.do_not_disturb;
+        let now = SystemTime::now();
+        let dnd_active = dnd.is_active(now);
+        let dnd_status = dnd.status_text(now);
+        let dnd_mode = dnd.mode.label();
+        let schedule_days = dnd.schedule.days;
+        let wake_time = dnd.schedule.end.clone();
+        let scheduled_active = dnd.schedule_is_active(now);
+        let start_field = self.dnd_start_field.clone();
+        let end_field = self.dnd_end_field.clone();
+
+        let mut dnd_presets = div().flex().flex_wrap().gap(px(8.));
+        dnd_presets = dnd_presets
+            .child(button(
+                "dnd-one-hour",
+                "For 1 hour",
+                theme,
+                false,
+                cx.listener(|this, _event, _window, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.update_settings(cx, |settings| {
+                            settings
+                                .do_not_disturb
+                                .set_until(SystemTime::now() + Duration::from_secs(60 * 60));
+                        });
+                    });
+                }),
+            ))
+            .child(button(
+                "dnd-tomorrow",
+                format!("Until tomorrow ({wake_time})"),
+                theme,
+                false,
+                cx.listener(|this, _event, _window, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.update_settings(cx, |settings| {
+                            let now = SystemTime::now();
+                            let until = settings.do_not_disturb.until_tomorrow(now);
+                            settings.do_not_disturb.set_until(until);
+                        });
+                    });
+                }),
+            ))
+            .child(button(
+                "dnd-indefinite",
+                "Indefinitely",
+                theme,
+                false,
+                cx.listener(|this, _event, _window, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.update_settings(cx, |settings| {
+                            settings.do_not_disturb.set_indefinite();
+                        });
+                    });
+                }),
+            ))
+            .child(button(
+                "dnd-use-quiet-hours",
+                if dnd.mode == DoNotDisturbMode::Scheduled {
+                    "✓ Quiet hours"
+                } else {
+                    "Quiet hours"
+                },
+                theme,
+                dnd.mode == DoNotDisturbMode::Scheduled,
+                cx.listener(|this, _event, _window, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.update_settings(cx, |settings| {
+                            settings.do_not_disturb.set_scheduled();
+                        });
+                    });
+                }),
+            ));
+
+        let mut days_row = div().flex().flex_wrap().gap(px(8.));
+        for (id, label, days) in [
+            ("dnd-days-every", "Every day", EVERY_DAY),
+            ("dnd-days-weekdays", "Weekdays", WEEKDAYS),
+            ("dnd-days-weekends", "Weekends", WEEKENDS),
+        ] {
+            let selected = schedule_days == days;
+            let text = if selected {
+                format!("✓ {label}")
+            } else {
+                label.to_string()
+            };
+            days_row = days_row.child(button(
+                id,
+                text,
+                theme,
+                selected,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.update_settings(cx, |settings| {
+                            settings.do_not_disturb.schedule.days = days;
+                            settings.do_not_disturb.set_scheduled();
+                        });
+                    });
+                }),
+            ));
+        }
+
+        let mut quiet_actions = div().flex().flex_wrap().gap(px(8.)).child(button(
+            "dnd-apply-quiet-hours",
+            "Apply quiet hours",
+            theme,
+            true,
+            cx.listener(|this, _event, _window, cx| this.apply_quiet_hours(cx)),
+        ));
+        if scheduled_active {
+            quiet_actions = quiet_actions.child(button(
+                "dnd-skip-quiet-hours",
+                "Skip this quiet period",
+                theme,
+                false,
+                cx.listener(|this, _event, _window, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.update_settings(cx, |settings| {
+                            let now = SystemTime::now();
+                            settings.do_not_disturb.override_current_period(now);
+                        });
+                    });
+                }),
+            ));
+        }
+
+        let dnd_card = card(theme)
+            .child(toggle_row(
+                "do-not-disturb",
+                "Do not disturb",
+                "Pause native notifications and sounds from every account. Unread counts, window titles, and the tray badge keep updating.",
+                dnd_active,
+                theme,
+                cx.listener(move |this, _event, _window, cx| {
+                    let enable = !dnd_active;
+                    this.model.update(cx, |model, cx| {
+                        model.update_settings(cx, |settings| {
+                            settings.set_do_not_disturb(enable);
+                        });
+                    });
+                }),
+            ))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(theme.text_muted)
+                    .child(format!("Mode: {dnd_mode} · Status: {dnd_status}")),
+            )
+            .child(dnd_presets)
+            .child(divider(theme))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child("Quiet hours"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(format!(
+                        "Recurring window: {}.",
+                        dnd.schedule.summary()
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(12.))
+                    .child(div().w(px(150.)).child(labeled_field(
+                        "Start",
+                        Some(SharedString::from("HH:MM, local time")),
+                        theme,
+                        start_field,
+                    )))
+                    .child(div().w(px(150.)).child(labeled_field(
+                        "End",
+                        Some(SharedString::from("HH:MM, may cross midnight")),
+                        theme,
+                        end_field,
+                    ))),
+            )
+            .child(days_row)
+            .when_some(self.dnd_error.clone(), |card, error| {
+                card.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.danger)
+                        .child(error),
+                )
+            })
+            .child(quiet_actions)
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child("Quiet hours use the desktop's local time. Overnight ranges such as 22:00-07:00 are supported; each period belongs to the day it starts. Times are re-evaluated when the clock changes or the machine resumes, and daylight-saving transitions follow the desktop timezone."),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child("'Until tomorrow' uses the quiet-hours end time as its wake hour. Changing the times requires Apply; toggles and presets apply immediately."),
+            );
+
         div()
             .flex()
             .flex_col()
@@ -1216,21 +1604,9 @@ impl SettingsWindow {
                                     !settings.connection_notifications;
                             });
                         }),
-                    ))
-                    .child(divider(theme))
-                    .child(toggle_row(
-                        "do-not-disturb",
-                        "Do not disturb",
-                        "Pause message notifications and sounds from every account. Unread counts keep updating.",
-                        settings.do_not_disturb,
-                        theme,
-                        cx.listener(|this, _event, _window, cx| {
-                            this.model.update_settings(cx, |settings| {
-                                settings.set_do_not_disturb(!settings.do_not_disturb);
-                            });
-                        }),
                     )),
             )
+            .child(dnd_card)
             .child(writing_card(settings, theme, cx))
             .child(
                 card(theme)
@@ -1351,6 +1727,36 @@ impl SettingsWindow {
         .detach();
     }
 
+    fn apply_quiet_hours(&mut self, cx: &mut Context<Self>) {
+        let start = self.dnd_start_field.read(cx).content().trim().to_string();
+        let end = self.dnd_end_field.read(cx).content().trim().to_string();
+        let (Some(start_minutes), Some(end_minutes)) =
+            (parse_time_of_day(&start), parse_time_of_day(&end))
+        else {
+            self.dnd_error = Some("Enter both quiet-hours times as HH:MM.".to_string());
+            cx.notify();
+            return;
+        };
+        if start_minutes == end_minutes {
+            self.dnd_error = Some("The quiet-hours start and end times must differ.".to_string());
+            cx.notify();
+            return;
+        }
+        let start = format_time_of_day(start_minutes);
+        let end = format_time_of_day(end_minutes);
+        self.dnd_error = None;
+        self.dnd_start_field.update(cx, |field, cx| {
+            field.set_content(start.clone(), cx);
+        });
+        self.dnd_end_field
+            .update(cx, |field, cx| field.set_content(end.clone(), cx));
+        self.model.update_settings(cx, |settings| {
+            settings.do_not_disturb.schedule.start = start;
+            settings.do_not_disturb.schedule.end = end;
+        });
+        cx.notify();
+    }
+
     fn apply_downloads_directory(&mut self, cx: &mut Context<Self>) {
         let default_dir = self.model.read(cx).paths.downloads_dir.clone();
         let value = self
@@ -1410,6 +1816,60 @@ impl SettingsWindow {
             .ok();
         })
         .detach();
+    }
+
+    fn start_load_css(&mut self, cx: &mut Context<Self>) {
+        if self.file_dialog_open || self.operation_running {
+            return;
+        }
+        self.file_dialog_open = true;
+        self.css_feedback = None;
+        let (sender, receiver) = bounded(1);
+        request_file_chooser(FileChooserMode::Css, String::new(), sender);
+        cx.spawn(async move |this, cx| {
+            let Some(path) = wait_for_file_choice(receiver).await else {
+                this.update(cx, |this, cx| {
+                    this.file_dialog_open = false;
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { read_custom_css_file(&path) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.file_dialog_open = false;
+                let result = result.and_then(|css| {
+                    this.model
+                        .update(cx, |model, cx| model.set_custom_css(css, cx))
+                });
+                this.css_feedback = Some(match result {
+                    Ok(()) => {
+                        let enabled = this.model.read(cx).settings.appearance.experimental_css;
+                        if enabled {
+                            Notice::success("CSS loaded and applied to open accounts.")
+                        } else {
+                            Notice::success("CSS loaded. Use the toggle above to apply it.")
+                        }
+                    }
+                    Err(error) => Notice::error(error),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn reset_custom_css(&mut self, cx: &mut Context<Self>) {
+        self.model
+            .update(cx, |model, cx| model.reset_custom_css(cx));
+        self.css_feedback = Some(Notice::success(
+            "Experimental CSS removed. WhatsApp Web uses its own styles again.",
+        ));
+        cx.notify();
     }
 
     fn apply_pending_import(&mut self, cx: &mut Context<Self>) {
@@ -1647,7 +2107,7 @@ impl SettingsWindow {
                         .text_size(px(11.))
                         .text_color(theme.text_faint)
                         .child(
-                            "Theme, zoom, notifications, startup, the global shortcut, and the app-lock password are reset. Accounts and their WhatsApp sessions are kept. A dated backup is written first.",
+                            "Theme, zoom, notifications, startup, the global shortcut, the app-lock password, and the first-run guide status are reset. Accounts and their WhatsApp sessions are kept, and the first-run guide opens again. A dated backup is written first.",
                         ),
                 )
                 .child(
@@ -1977,11 +2437,21 @@ impl SettingsWindow {
     ) -> AnyElement {
         let shortcut_field = self.shortcut_field.clone();
         let boss_key_field = self.boss_key_field.clone();
+        let palette_shortcut_field = self.palette_shortcut_field.clone();
         let error = self.shortcut_error.clone();
         let boss_error = self.boss_key_error.clone();
+        let palette_error = self.palette_shortcut_error.clone();
         let downloads_dir_field = self.downloads_dir_field.clone();
         let downloads_error = self.downloads_error.clone();
         let backup_card = self.backup_card(theme, cx);
+        let onboarding_status = if settings.onboarding_completed {
+            format!(
+                "Completed (guide version {}). Reopening it here never marks it uncompleted.",
+                settings.onboarding_version
+            )
+        } else {
+            "Not completed. It opens automatically only on a new installation.".to_string()
+        };
 
         div()
             .flex()
@@ -1989,7 +2459,7 @@ impl SettingsWindow {
             .gap(px(18.))
             .child(section_header(
                 "General",
-                "Window behavior, startup, writing, and the global show/hide shortcut.",
+                "Window behavior, startup, writing, downloads, media actions, and the global show/hide shortcut.",
                 theme,
             ))
             .child(
@@ -2143,6 +2613,75 @@ impl SettingsWindow {
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
                             .child("The boss key uses the same X11/XWayland grab and can conflict with desktop shortcuts."),
+                    )
+                    .child(divider(theme))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child("Command palette"),
+                    )
+                    .child(labeled_field(
+                        "Optional global shortcut",
+                        Some(SharedString::from(
+                            "Opens the command palette while any application is focused. Leave empty to use Ctrl+K only inside the native window.",
+                        )),
+                        theme,
+                        palette_shortcut_field,
+                    ))
+                    .when_some(palette_error, |style, error| {
+                        style.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.danger)
+                                .child(error),
+                        )
+                    })
+                    .child(div().flex().gap(px(8.)).child(button(
+                        "apply-palette-shortcut",
+                        "Apply palette shortcut",
+                        theme,
+                        true,
+                        cx.listener(|this, _event, _window, cx| {
+                            let value = this
+                                .palette_shortcut_field
+                                .read(cx)
+                                .content()
+                                .to_string();
+                            if value.trim().is_empty() {
+                                let _ = this.model.update(cx, |model, cx| {
+                                    model.set_command_palette_shortcut(None, cx)
+                                });
+                                this.palette_shortcut_error = None;
+                                cx.notify();
+                                return;
+                            }
+                            match Shortcut::parse(&value) {
+                                Ok(shortcut) => {
+                                    let result = this.model.update(cx, |model, cx| {
+                                        model.set_command_palette_shortcut(Some(shortcut), cx)
+                                    });
+                                    match result {
+                                        Ok(()) => this.palette_shortcut_error = None,
+                                        Err(error) => {
+                                            this.palette_shortcut_error = Some(error)
+                                        }
+                                    }
+                                    cx.notify();
+                                }
+                                Err(error) => {
+                                    this.palette_shortcut_error = Some(error.to_string());
+                                    cx.notify();
+                                }
+                            }
+                        }),
+                    )))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child("A global palette shortcut takes precedence over WhatsApp Web's own Ctrl+K chat search."),
                     ),
             )
             .child(
@@ -2242,6 +2781,19 @@ impl SettingsWindow {
                             });
                         }),
                     ))
+                    .child(divider(theme))
+                    .child(toggle_row(
+                        "media-actions",
+                        "Media action menu",
+                        "Right-click normal media to save it, open it, or copy an image. View-once and protected media are never offered.",
+                        settings.media_actions,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.media_actions = !settings.media_actions;
+                            });
+                        }),
+                    ))
                     .child(
                         div()
                             .text_size(px(11.))
@@ -2251,7 +2803,220 @@ impl SettingsWindow {
                             )),
                     ),
             )
+            .child(
+                card(theme)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child("First-run guide"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "Review the WhatsApp Web login, the QR steps, account isolation, tray and close behavior, notifications, the app lock, and where OxideZap stores data.",
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(onboarding_status),
+                    )
+                    .child(div().flex().gap(px(8.)).child(button(
+                        "replay-onboarding",
+                        "Show the first-run guide again",
+                        theme,
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update(cx, |model, cx| {
+                                model.open_onboarding_window(cx);
+                            });
+                        }),
+                    ))),
+            )
             .child(backup_card)
+            .into_any_element()
+    }
+
+    fn render_performance(
+        &mut self,
+        settings: &Settings,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (suspended, active_views, total_accounts) = {
+            let model = self.model.read(cx);
+            (
+                model.suspended_account_count(),
+                model.active_webview_count(),
+                model.settings.accounts.len(),
+            )
+        };
+        let estimate = suspended as u64 * crate::app::ESTIMATED_SUSPENDED_MEMORY_BYTES;
+        let feedback = self.memory_feedback.clone();
+
+        let mut delay_row = div().flex().flex_wrap().gap(px(8.));
+        for minutes in SUSPEND_DELAY_OPTIONS {
+            delay_row = delay_row.child(suspend_delay_button(minutes, settings, theme, cx));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .child(section_header(
+                "Performance",
+                "Reduce memory by releasing accounts you are not using. Off by default.",
+                theme,
+            ))
+            .child(
+                card(theme)
+                    .child(toggle_row(
+                        "low-memory-mode",
+                        "Low-memory mode",
+                        "Destroy the WebKit view of an account that stayed hidden for the delay below. The account and its WhatsApp session stay on disk.",
+                        settings.memory.suspend_hidden,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.memory.suspend_hidden = !settings.memory.suspend_hidden;
+                            });
+                        }),
+                    ))
+                    .child(divider(theme))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child("Release hidden accounts after"),
+                    )
+                    .child(delay_row)
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(
+                                "Reactivating reloads WhatsApp Web, which takes a few seconds. The current scroll position or an unsent draft may be lost.",
+                            ),
+                    )
+                    .child(divider(theme))
+                    .child(toggle_row(
+                        "keep-active-loaded",
+                        "Keep the active account loaded",
+                        "Never release the account you opened most recently, even when every window is hidden.",
+                        settings.memory.keep_active_account,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.memory.keep_active_account =
+                                    !settings.memory.keep_active_account;
+                            });
+                        }),
+                    )),
+            )
+            .child(
+                card(theme)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child("Status"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(28.))
+                            .child(storage_stat(
+                                "Active views",
+                                format!("{active_views} of {total_accounts}"),
+                                theme,
+                            ))
+                            .child(storage_stat(
+                                "Suspended accounts",
+                                suspended.to_string(),
+                                theme,
+                            ))
+                            .child(storage_stat(
+                                "Estimated memory released",
+                                storage::format_bytes(estimate),
+                                theme,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(format!(
+                                "The estimate assumes about {} per released WebKit web process. WebKit does not expose per-view memory, so this is not a measurement.",
+                                storage::format_bytes(crate::app::ESTIMATED_SUSPENDED_MEMORY_BYTES)
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .child(button(
+                                "release-hidden-accounts",
+                                "Release hidden accounts now",
+                                theme,
+                                false,
+                                cx.listener(|this, _event, _window, cx| {
+                                    let released = this.model.update(cx, |model, cx| {
+                                        model.release_hidden_accounts_now(cx)
+                                    });
+                                    this.memory_feedback = Some(if released == 0 {
+                                        Notice::success(
+                                            "No hidden account could be released right now. Downloads, calls or recordings, the active account, the app lock, and quitting all block suspension.",
+                                        )
+                                    } else {
+                                        Notice::success(format!(
+                                            "Released {released} hidden account{}. Open the account to restore it.",
+                                            if released == 1 { "" } else { "s" }
+                                        ))
+                                    });
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .when_some(feedback, |style, notice| {
+                        style.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(if notice.error {
+                                    theme.danger
+                                } else {
+                                    theme.text_muted
+                                })
+                                .child(notice.text),
+                        )
+                    }),
+            )
+            .child(
+                card(theme)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child("What suspension keeps"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "Suspending never deletes the account, its WebKit profile, cookies, local storage, or the WhatsApp login. It only destroys the running view, which lets WebKit terminate that account's web process. Downloads, calls, and recordings always block suspension, and nothing is released while the app is locked or quitting.",
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -2836,6 +3601,7 @@ impl Render for SettingsWindow {
             SettingsSection::Notifications => self.render_notifications(&settings, theme, cx),
             SettingsSection::Network => self.render_network(&settings, theme, cx),
             SettingsSection::General => self.render_general(&settings, theme, cx),
+            SettingsSection::Performance => self.render_performance(&settings, theme, cx),
             SettingsSection::Security => self.render_security(&settings, theme, cx),
             SettingsSection::About => self.render_about(&settings, &update, theme, cx),
         };
@@ -2886,6 +3652,7 @@ impl Render for SettingsWindow {
             SettingsSection::Notifications,
             SettingsSection::Network,
             SettingsSection::General,
+            SettingsSection::Performance,
             SettingsSection::Security,
             SettingsSection::About,
         ] {
@@ -2977,6 +3744,31 @@ fn avatar(initial: &str, theme: Theme) -> impl IntoElement {
         .child(initial.to_uppercase())
 }
 
+fn suspend_delay_button(
+    minutes: u32,
+    settings: &Settings,
+    theme: Theme,
+    cx: &mut Context<SettingsWindow>,
+) -> impl IntoElement {
+    let selected = settings.memory.suspend_after_minutes == minutes;
+    let text = if selected {
+        format!("✓ {minutes} min")
+    } else {
+        format!("{minutes} min")
+    };
+    button(
+        SharedString::from(format!("suspend-after-{minutes}")),
+        text,
+        theme,
+        selected,
+        cx.listener(move |this, _event, _window, cx| {
+            this.model.update_settings(cx, |settings| {
+                settings.memory.suspend_after_minutes = minutes;
+            });
+        }),
+    )
+}
+
 fn idle_button(
     minutes: u32,
     settings: &Settings,
@@ -3007,6 +3799,50 @@ fn idle_button(
     )
 }
 
+fn css_size_label(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
+const CSS_PREVIEW_CHARS: usize = 1200;
+
+fn css_preview(css: &str) -> String {
+    let css = css.trim();
+    if css.is_empty() {
+        return "Choose a local .css file to load a stylesheet.".to_string();
+    }
+    let mut chars = css.chars();
+    let mut preview: String = chars.by_ref().take(CSS_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        preview.push_str("\n…");
+    }
+    preview
+}
+
+/// Reads and validates a stylesheet chosen by the user. The metadata check
+/// rejects an oversized file before allocating its contents; validation runs
+/// before the CSS reaches settings or WebKit.
+fn read_custom_css_file(path: &Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    if metadata.len() > MAX_CUSTOM_CSS_BYTES as u64 {
+        return Err(format!(
+            "The CSS file is too large ({} bytes; the limit is {} KiB).",
+            metadata.len(),
+            MAX_CUSTOM_CSS_BYTES / 1024
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    let css =
+        String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8.", path.display()))?;
+    validate_custom_css(&css)?;
+    Ok(css)
+}
+
 /// Schedules a native GTK file chooser on the GTK/WebKit thread. This function
 /// is called from the GPUI thread and never blocks it: the dialog runs on the
 /// GTK main context, and the caller polls `result` from a GPUI task.
@@ -3030,6 +3866,12 @@ fn request_file_chooser(
                 gtk::FileChooserAction::SelectFolder,
                 "Select",
             )
+        } else if mode == FileChooserMode::Css {
+            (
+                "Load experimental WhatsApp CSS",
+                gtk::FileChooserAction::Open,
+                "Load",
+            )
         } else {
             (
                 "Import OxideZap settings",
@@ -3050,8 +3892,13 @@ fn request_file_chooser(
         }
         if !folder {
             let filter = gtk::FileFilter::new();
-            filter.set_name(Some("OxideZap settings (*.json)"));
-            filter.add_pattern("*.json");
+            if mode == FileChooserMode::Css {
+                filter.set_name(Some("CSS files (*.css)"));
+                filter.add_pattern("*.css");
+            } else {
+                filter.set_name(Some("OxideZap settings (*.json)"));
+                filter.add_pattern("*.json");
+            }
             dialog.add_filter(filter);
         }
 

@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
@@ -11,12 +11,13 @@ use gtk::prelude::*;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use webkit2gtk::{
-    DownloadExt, NavigationPolicyDecision, NavigationPolicyDecisionExt, NetworkError,
-    NetworkProxyMode, NetworkProxySettings, NotificationExt, NotificationPermissionRequest,
-    PermissionRequest, PermissionRequestExt, PolicyDecisionExt, PolicyDecisionType, PolicyError,
-    SettingsExt, URIRequestExt, URIResponseExt, UserContentInjectedFrames, UserContentManager,
-    UserContentManagerExt, UserMediaPermissionRequest, UserMediaPermissionRequestExt, UserScript,
-    UserScriptInjectionTime, WebContextExt, WebProcessTerminationReason, WebViewExt,
+    DownloadExt, MediaCaptureState, NavigationPolicyDecision, NavigationPolicyDecisionExt,
+    NetworkError, NetworkProxyMode, NetworkProxySettings, NotificationExt,
+    NotificationPermissionRequest, PermissionRequest, PermissionRequestExt, PolicyDecisionExt,
+    PolicyDecisionType, PolicyError, SettingsExt, URIRequestExt, URIResponseExt,
+    UserContentInjectedFrames, UserContentManager, UserContentManagerExt,
+    UserMediaPermissionRequest, UserMediaPermissionRequestExt, UserScript, UserScriptInjectionTime,
+    UserStyleLevel, UserStyleSheet, WebContextExt, WebProcessTerminationReason, WebViewExt,
     WebViewExtManual, WebsiteDataManagerExt,
 };
 
@@ -26,7 +27,9 @@ use crate::app::downloads::{
 use crate::links::{self, LinkAction};
 use crate::paths::Paths;
 use crate::settings::storage::{self, StorageOperation};
-use crate::settings::{ProxyMode, ProxySettings, WritingSettings};
+use crate::settings::{
+    AppearanceSettings, ProxyMode, ProxySettings, WritingSettings, validate_custom_css,
+};
 use crate::unread::parse_unread;
 use crate::x11::{Geometry, X11};
 
@@ -37,6 +40,10 @@ pub const TITLEBAR_HEIGHT: f32 = 42.0;
 /// handles remain reachable instead of being covered by the GTK window.
 pub const OVERLAY_MARGIN: f32 = 4.0;
 pub const WHATSAPP_URL: &str = "https://web.whatsapp.com/";
+/// URL patterns passed to WebKit's user stylesheet allow list. WebKit applies
+/// the stylesheet only when the committed document URL matches one of them,
+/// so non-WhatsApp pages never receive the experimental CSS.
+const CUSTOM_CSS_ALLOW_PATTERNS: &[&str] = &["https://web.whatsapp.com/*"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadState {
@@ -130,6 +137,23 @@ pub enum GtkEvent {
     Crashed {
         account_id: String,
     },
+    /// Any of the camera, microphone, or display capture states changed. A
+    /// muted stream still counts as an active call or recording.
+    CaptureState {
+        account_id: String,
+        active: bool,
+    },
+    /// The GTK thread confirmed that the view was destroyed and its web process
+    /// released.
+    Suspended {
+        account_id: String,
+    },
+    /// The GTK thread refused to release a view that started a download or a
+    /// call between the policy check and the command.
+    SuspendRefused {
+        account_id: String,
+        reason: SuspendRefusal,
+    },
     Error {
         account_id: String,
         message: String,
@@ -141,6 +165,31 @@ pub enum GtkEvent {
         operation: StorageOperation,
         result: Result<u64, String>,
     },
+    /// An explicit media action could not be completed. `message` is a short,
+    /// user-facing explanation; the media URL and payload are never included.
+    MediaFailed {
+        account_id: String,
+        message: String,
+    },
+    /// An image was placed on the clipboard after an explicit copy action.
+    MediaCopied {
+        account_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuspendRefusal {
+    DownloadActive,
+    CaptureActive,
+}
+
+impl SuspendRefusal {
+    pub fn label(self) -> &'static str {
+        match self {
+            SuspendRefusal::DownloadActive => "a download is active",
+            SuspendRefusal::CaptureActive => "a call or recording is active",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +208,9 @@ pub enum GtkCommand {
         zoom: f64,
         writing: WritingSettings,
         proxy: ProxySettings,
+        appearance: AppearanceSettings,
+        /// Whether the injected media action menu is enabled for this account.
+        media_actions: bool,
     },
     Show {
         account_id: String,
@@ -175,6 +227,13 @@ pub enum GtkCommand {
     },
     SetProxy {
         proxy: ProxySettings,
+    },
+    SetAppearance {
+        appearance: AppearanceSettings,
+    },
+    /// Enables or disables the injected media action menu in every open page.
+    SetMediaActions {
+        enabled: bool,
     },
     SetDownloadLayout(DownloadLayout),
     CancelDownload {
@@ -202,6 +261,11 @@ pub enum GtkCommand {
         account_id: String,
         operation: StorageOperation,
         paths: Paths,
+    },
+    /// Destroys the account's GTK window and WebKit view, releasing the web
+    /// process. The profile directories and the WhatsApp session stay on disk.
+    Suspend {
+        account_id: String,
     },
     Close {
         account_id: String,
@@ -244,6 +308,14 @@ impl GtkHandle {
 
     pub fn set_proxy(&self, proxy: ProxySettings) {
         self.send(GtkCommand::SetProxy { proxy });
+    }
+
+    pub fn set_appearance(&self, appearance: AppearanceSettings) {
+        self.send(GtkCommand::SetAppearance { appearance });
+    }
+
+    pub fn set_media_actions(&self, enabled: bool) {
+        self.send(GtkCommand::SetMediaActions { enabled });
     }
 
     pub fn set_download_layout(&self, layout: DownloadLayout) {
@@ -296,6 +368,12 @@ impl GtkHandle {
         });
     }
 
+    pub fn suspend(&self, account_id: &str) {
+        self.send(GtkCommand::Suspend {
+            account_id: account_id.to_string(),
+        });
+    }
+
     pub fn quit(&self) {
         self.send(GtkCommand::Quit);
     }
@@ -335,6 +413,9 @@ pub fn spawn(
                 x11,
                 paste: paste.clone(),
                 proxy: ProxySettings::default(),
+                appearance: AppearanceSettings::default(),
+                media_actions: true,
+                media_transfers: Rc::new(RefCell::new(HashMap::new())),
             }));
 
             let command_state = state.clone();
@@ -387,6 +468,15 @@ struct GtkState {
     /// Proxy settings already applied to every open account. Reapplying them
     /// on unrelated settings changes would reset live connections.
     proxy: ProxySettings,
+    /// Experimental stylesheet already applied to every open account. The
+    /// command handler ignores redundant updates, so unrelated settings
+    /// changes do not remove and re-add the user stylesheet.
+    appearance: AppearanceSettings,
+    /// Whether the injected media action menu is enabled for new accounts.
+    media_actions: bool,
+    /// Media transfers currently streaming from a page into the download
+    /// pipeline. Keyed by the page-generated transfer id.
+    media_transfers: Rc<RefCell<HashMap<String, MediaTransfer>>>,
 }
 
 struct WebEntry {
@@ -405,6 +495,10 @@ struct WebEntry {
     /// page while a download is streaming would cancel it, so the command
     /// handler refuses to do that.
     downloads: Rc<Cell<u32>>,
+    /// The media action setting for the current page. The injected script is
+    /// re-evaluated after every full load so a setting change survives a
+    /// reload, not only the live document.
+    media_enabled: Rc<Cell<bool>>,
 }
 
 impl WebEntry {
@@ -428,6 +522,53 @@ impl WebEntry {
         self.transient_for = None;
         self.last_geometry = None;
     }
+
+    /// A muted microphone or camera is still an active call or recording, so
+    /// only `MediaCaptureState::None` counts as idle.
+    fn is_capturing(&self) -> bool {
+        capture_state_is_active((
+            self.webview.camera_capture_state(),
+            self.webview.microphone_capture_state(),
+            self.webview.display_capture_state(),
+        ))
+    }
+}
+
+fn capture_state_is_active(
+    (camera, microphone, display): (MediaCaptureState, MediaCaptureState, MediaCaptureState),
+) -> bool {
+    [camera, microphone, display]
+        .into_iter()
+        .any(|state| !matches!(state, MediaCaptureState::None))
+}
+
+fn report_capture_state(
+    webview: &webkit2gtk::WebView,
+    account_id: &str,
+    events: &Sender<GtkEvent>,
+) {
+    let active = capture_state_is_active((
+        webview.camera_capture_state(),
+        webview.microphone_capture_state(),
+        webview.display_capture_state(),
+    ));
+    let _ = events.send(GtkEvent::CaptureState {
+        account_id: account_id.to_string(),
+        active,
+    });
+}
+
+/// The GTK thread rechecks the two conditions that can change between the
+/// GPUI policy decision and command handling. A download or a call always wins
+/// over a suspend request.
+fn suspend_refusal(downloads: u32, capture_active: bool) -> Option<SuspendRefusal> {
+    if downloads > 0 {
+        Some(SuspendRefusal::DownloadActive)
+    } else if capture_active {
+        Some(SuspendRefusal::CaptureActive)
+    } else {
+        None
+    }
 }
 
 fn handle_command(command: GtkCommand, state: &mut GtkState) {
@@ -444,6 +585,8 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
             zoom,
             writing,
             proxy,
+            appearance,
+            media_actions,
         } => {
             match create_entry(
                 &account_id,
@@ -456,12 +599,15 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 zoom,
                 &writing,
                 &proxy,
+                &appearance,
                 state.events.clone(),
                 state.download_layout.clone(),
                 state.downloads.clone(),
                 state.cancelled_downloads.clone(),
                 state.notifications_enabled,
                 state.paste.clone(),
+                media_actions,
+                state.media_transfers.clone(),
             ) {
                 Ok(mut entry) => {
                     if let Some(parent_xid) = parent_xid {
@@ -473,6 +619,8 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                     let xid = entry.xid;
                     state.entries.insert(account_id.clone(), entry);
                     state.proxy = proxy;
+                    state.appearance = appearance;
+                    state.media_actions = media_actions;
                     let _ = state.events.send(GtkEvent::Ready { account_id, xid });
                 }
                 Err(error) => {
@@ -520,10 +668,56 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
             }
             state.proxy = proxy;
         }
+        GtkCommand::SetAppearance { appearance } => {
+            if state.appearance == appearance {
+                return;
+            }
+            for entry in state.entries.values() {
+                if let Some(manager) = entry.webview.user_content_manager() {
+                    apply_custom_css(&manager, &appearance);
+                }
+            }
+            state.appearance = appearance;
+        }
+        GtkCommand::SetMediaActions { enabled } => {
+            if state.media_actions == enabled {
+                return;
+            }
+            state.media_actions = enabled;
+            let script = media_toggle_script(enabled);
+            for entry in state.entries.values() {
+                entry.media_enabled.set(enabled);
+                entry.webview.evaluate_javascript(
+                    &script,
+                    None,
+                    None,
+                    None::<&gtk::gio::Cancellable>,
+                    |_result| {},
+                );
+            }
+        }
         GtkCommand::SetDownloadLayout(layout) => {
             *state.download_layout.borrow_mut() = layout;
         }
         GtkCommand::CancelDownload { id } => {
+            // Media actions write their own bytes, so the WebKit download
+            // registry does not know their ids. Cancel the in-memory transfer
+            // first and remove its empty reservation; the page stops sending
+            // when its `fetch` is rejected or the transfer is dropped.
+            if let Some(transfer) = state.media_transfers.borrow_mut().remove(&id) {
+                transfer
+                    .active_downloads
+                    .set(transfer.active_downloads.get().saturating_sub(1));
+                if let Some(path) = &transfer.path {
+                    discard_empty_reservation(path);
+                }
+                let _ = state.events.send(GtkEvent::DownloadFinished {
+                    id,
+                    success: false,
+                    cancelled: true,
+                });
+                return;
+            }
             let download = state.downloads.borrow().get(&id).cloned();
             if let Some(download) = download {
                 state.cancelled_downloads.borrow_mut().insert(id);
@@ -626,6 +820,31 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 entry.window.close();
             }
         }
+        GtkCommand::Suspend { account_id } => {
+            let refusal = state
+                .entries
+                .get(&account_id)
+                .and_then(|entry| suspend_refusal(entry.downloads.get(), entry.is_capturing()));
+            match refusal {
+                Some(reason) => {
+                    warn!(%account_id, reason = reason.label(), "refused to suspend an account");
+                    let _ = state
+                        .events
+                        .send(GtkEvent::SuspendRefused { account_id, reason });
+                }
+                None => {
+                    // Destroying the GTK window destroys the WebView and lets
+                    // WebKit terminate the web process, which is what releases
+                    // the memory. The WebsiteDataManager profile stays on disk
+                    // and a later Create command reuses it.
+                    if let Some(entry) = state.entries.remove(&account_id) {
+                        entry.window.close();
+                    }
+                    info!(%account_id, "suspended the WebKit view");
+                    let _ = state.events.send(GtkEvent::Suspended { account_id });
+                }
+            }
+        }
         GtkCommand::Quit => {
             for (_, entry) in state.entries.drain() {
                 entry.window.close();
@@ -647,12 +866,15 @@ fn create_entry(
     zoom: f64,
     writing: &WritingSettings,
     proxy: &ProxySettings,
+    appearance: &AppearanceSettings,
     events: Sender<GtkEvent>,
     download_layout: Rc<RefCell<DownloadLayout>>,
     download_registry: Rc<RefCell<HashMap<String, webkit2gtk::Download>>>,
     cancelled_downloads: Rc<RefCell<HashSet<String>>>,
     notifications_enabled: bool,
     paste: Rc<RefCell<PasteQueue>>,
+    media_actions: bool,
+    media_transfers: Rc<RefCell<HashMap<String, MediaTransfer>>>,
 ) -> Result<WebEntry> {
     crate::paths::create_private_dir(data_dir)?;
     crate::paths::create_private_dir(cache_dir)?;
@@ -678,6 +900,18 @@ fn create_entry(
     apply_spell_checking(&context, writing);
     let user_content = UserContentManager::new();
     connect_connection_script(&user_content, account_id, events.clone());
+    apply_custom_css(&user_content, appearance);
+    let downloads = Rc::new(Cell::new(0));
+    let media_enabled = Rc::new(Cell::new(media_actions));
+    connect_media_script(
+        &user_content,
+        account_id,
+        events.clone(),
+        download_layout.clone(),
+        media_transfers,
+        downloads.clone(),
+        media_actions,
+    );
     let webview =
         webkit2gtk::WebView::new_with_context_and_user_content_manager(&context, &user_content);
     webview.set_hexpand(true);
@@ -699,8 +933,8 @@ fn create_entry(
         events.clone(),
         notifications_enabled,
         window.clone(),
+        media_enabled.clone(),
     );
-    let downloads = Rc::new(Cell::new(0));
     connect_downloads(
         &context,
         account_id,
@@ -747,7 +981,34 @@ fn create_entry(
         transient_for: None,
         last_geometry: None,
         downloads,
+        media_enabled,
     })
+}
+
+/// Replaces the experimental stylesheet on a user content manager.
+///
+/// WebKit injects user stylesheets at document start and keeps them attached
+/// to the manager, so they survive WhatsApp Web's in-page SPA navigation. The
+/// allow list is the origin gate: WebKit never applies the CSS to a document
+/// outside `https://web.whatsapp.com`. Stylesheets are CSS only; this function
+/// never evaluates the file as JavaScript.
+fn apply_custom_css(manager: &UserContentManager, appearance: &AppearanceSettings) {
+    manager.remove_all_style_sheets();
+    let Some(css) = appearance.active_css() else {
+        return;
+    };
+    if let Err(error) = validate_custom_css(css) {
+        warn!(%error, "refusing to inject invalid experimental CSS");
+        return;
+    }
+    manager.add_style_sheet(&UserStyleSheet::new(
+        css,
+        UserContentInjectedFrames::TopFrame,
+        UserStyleLevel::User,
+        CUSTOM_CSS_ALLOW_PATTERNS,
+        &[],
+    ));
+    info!(bytes = css.len(), "applied experimental custom CSS");
 }
 
 const CONNECTION_MESSAGE_HANDLER: &str = "oxidezapConnection";
@@ -860,6 +1121,1079 @@ fn parse_connection_report(message: &str) -> Option<ConnectionReport> {
     })
 }
 
+const MEDIA_MESSAGE_HANDLER: &str = "oxidezapMedia";
+const MEDIA_ENABLED_PLACEHOLDER: &str = "__OXIDEZAP_MEDIA_ENABLED__";
+/// Media actions are explicit and bounded: a user-initiated save or copy is
+/// transferred through the page, where WhatsApp has already decrypted the
+/// bytes for the signed-in account. The cap keeps a single IPC transfer from
+/// pinning hundreds of megabytes; larger media must use WhatsApp's own
+/// download control.
+const MEDIA_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MEDIA_CHUNK_BYTES: usize = 384 * 1024;
+/// Base64 expands three bytes to four characters and adds padding.
+const MEDIA_MAX_CHUNK_BASE64: usize = MEDIA_CHUNK_BYTES.div_ceil(3) * 4 + 8;
+const MEDIA_MESSAGE_MAX_BYTES: usize = MEDIA_MAX_CHUNK_BASE64 + 4096;
+const MEDIA_TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaKind {
+    Image,
+    Video,
+    Audio,
+    Document,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaAction {
+    Save,
+    Open,
+    Copy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MediaRequest {
+    action: MediaAction,
+    kind: MediaKind,
+    url: String,
+    filename: String,
+    total_bytes: u64,
+    view_once: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaRejection {
+    ViewOnce,
+    UnsupportedAction,
+    UnsupportedScheme,
+    UntrustedOrigin,
+    TooLarge,
+    Empty,
+    Malformed,
+}
+
+impl MediaRejection {
+    fn message(self) -> &'static str {
+        match self {
+            MediaRejection::ViewOnce => "View-once media cannot be saved, opened, or copied.",
+            MediaRejection::UnsupportedAction => {
+                "Only images can be copied. Use Save or Open for this media."
+            }
+            MediaRejection::UnsupportedScheme => {
+                "Only WhatsApp media exposed as blob:, data:, or a WhatsApp host can be saved."
+            }
+            MediaRejection::UntrustedOrigin => {
+                "Media from another origin was rejected. Only WhatsApp media can be saved."
+            }
+            MediaRejection::TooLarge => {
+                "This media is larger than the 64 MB limit. Use WhatsApp's own download control."
+            }
+            MediaRejection::Empty => "WhatsApp did not expose any data for this media.",
+            MediaRejection::Malformed => "The media link is not valid.",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaFailureReason {
+    Fetch,
+    Expired,
+    TooLarge,
+    Unsupported,
+}
+
+impl MediaFailureReason {
+    fn message(self) -> &'static str {
+        match self {
+            MediaFailureReason::Fetch => {
+                "OxideZap could not read this media. Reopen it and try again."
+            }
+            MediaFailureReason::Expired => {
+                "This media expired or was revoked by WhatsApp. Reopen it and try again."
+            }
+            MediaFailureReason::TooLarge => {
+                "This media is larger than the 64 MB limit. Use WhatsApp's own download control."
+            }
+            MediaFailureReason::Unsupported => "This media type is not supported by OxideZap.",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MediaMessage {
+    Begin {
+        id: String,
+        request: MediaRequest,
+    },
+    Chunk {
+        id: String,
+        data: String,
+    },
+    End {
+        id: String,
+    },
+    Failed {
+        id: Option<String>,
+        reason: MediaFailureReason,
+    },
+}
+
+/// Returns `Ok` when a media URL may be transferred. Only data the page
+/// already exposed for the signed-in WhatsApp account is accepted: decrypted
+/// `blob:` URLs whose origin is WhatsApp, media `data:` URLs, and plain
+/// WhatsApp hosts. No other scheme, host, or lookalike domain is allowed.
+fn allowed_media_url(raw: &str) -> Result<(), MediaRejection> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > 16 * 1024 {
+        return Err(MediaRejection::Malformed);
+    }
+
+    if let Some(inner) = raw.strip_prefix("blob:") {
+        let Ok(url) = url::Url::parse(inner) else {
+            return Err(MediaRejection::Malformed);
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(MediaRejection::UnsupportedScheme);
+        }
+        let Some(host) = url.host_str() else {
+            return Err(MediaRejection::Malformed);
+        };
+        return if links::is_whatsapp_host(host) || links::is_internal_url(inner) {
+            Ok(())
+        } else {
+            Err(MediaRejection::UntrustedOrigin)
+        };
+    }
+
+    if let Some(rest) = raw.strip_prefix("data:") {
+        let header = rest.split(',').next().unwrap_or_default();
+        let mime = header
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if mime == "image/svg+xml" || mime == "image/svg" || mime.starts_with("text/") {
+            return Err(MediaRejection::UnsupportedScheme);
+        }
+        return if mime.starts_with("image/")
+            || mime.starts_with("video/")
+            || mime.starts_with("audio/")
+            || mime == "application/pdf"
+        {
+            Ok(())
+        } else {
+            Err(MediaRejection::UnsupportedScheme)
+        };
+    }
+
+    let Ok(url) = url::Url::parse(raw) else {
+        return Err(MediaRejection::Malformed);
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(MediaRejection::UnsupportedScheme);
+    }
+    let Some(host) = url.host_str() else {
+        return Err(MediaRejection::Malformed);
+    };
+    if links::is_whatsapp_host(host) || links::is_internal_url(raw) {
+        Ok(())
+    } else {
+        Err(MediaRejection::UntrustedOrigin)
+    }
+}
+
+fn validate_media_request(request: &MediaRequest) -> Result<(), MediaRejection> {
+    if request.view_once {
+        return Err(MediaRejection::ViewOnce);
+    }
+    if request.action == MediaAction::Copy && request.kind != MediaKind::Image {
+        return Err(MediaRejection::UnsupportedAction);
+    }
+    if request.total_bytes == 0 {
+        return Err(MediaRejection::Empty);
+    }
+    if request.total_bytes > MEDIA_MAX_BYTES {
+        return Err(MediaRejection::TooLarge);
+    }
+    allowed_media_url(&request.url)
+}
+
+fn media_id(value: Option<&serde_json::Value>) -> Option<String> {
+    let id = value?.as_str()?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn parse_media_message(message: &str) -> Option<MediaMessage> {
+    if message.len() > MEDIA_MESSAGE_MAX_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(message).ok()?;
+    let object = value.as_object()?;
+    match object.get("type")?.as_str()? {
+        "begin" => {
+            let id = media_id(object.get("id"))?;
+            let action = match object.get("action")?.as_str()? {
+                "save" => MediaAction::Save,
+                "open" => MediaAction::Open,
+                "copy" => MediaAction::Copy,
+                _ => return None,
+            };
+            let kind = match object.get("kind")?.as_str()? {
+                "image" => MediaKind::Image,
+                "video" => MediaKind::Video,
+                "audio" => MediaKind::Audio,
+                "document" => MediaKind::Document,
+                _ => return None,
+            };
+            let url = object.get("url")?.as_str()?.to_string();
+            let filename = object
+                .get("filename")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let total_bytes = object.get("size")?.as_u64()?;
+            let view_once = object
+                .get("viewOnce")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            Some(MediaMessage::Begin {
+                id,
+                request: MediaRequest {
+                    action,
+                    kind,
+                    url,
+                    filename,
+                    total_bytes,
+                    view_once,
+                },
+            })
+        }
+        "chunk" => Some(MediaMessage::Chunk {
+            id: media_id(object.get("id"))?,
+            data: object.get("data")?.as_str()?.to_string(),
+        }),
+        "end" => Some(MediaMessage::End {
+            id: media_id(object.get("id"))?,
+        }),
+        "error" => Some(MediaMessage::Failed {
+            id: media_id(object.get("id")),
+            reason: match object.get("reason")?.as_str()? {
+                "fetch" => MediaFailureReason::Fetch,
+                "expired" => MediaFailureReason::Expired,
+                "too-large" => MediaFailureReason::TooLarge,
+                "unsupported" => MediaFailureReason::Unsupported,
+                _ => return None,
+            },
+        }),
+        _ => None,
+    }
+}
+
+/// Decodes one base64 chunk and enforces the declared transfer size. The size
+/// is declared by the page before any bytes are sent and was already bounded
+/// by `validate_media_request`, so a lying page cannot grow the buffer beyond
+/// the user-visible limit.
+fn decode_media_chunk(data: &str, received: u64, expected: u64) -> Result<Vec<u8>, MediaRejection> {
+    if data.len() > MEDIA_MAX_CHUNK_BASE64 {
+        return Err(MediaRejection::TooLarge);
+    }
+    if data.len() % 4 != 0
+        || !data
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return Err(MediaRejection::Malformed);
+    }
+    let decoded = glib::base64_decode(data);
+    if decoded.is_empty() && !data.is_empty() {
+        return Err(MediaRejection::Malformed);
+    }
+    if received.saturating_add(decoded.len() as u64) > expected {
+        return Err(MediaRejection::TooLarge);
+    }
+    Ok(decoded)
+}
+
+/// A small, self-contained context menu for media the user explicitly
+/// right-clicks. It never scans chats, observes mutations, or reads message
+/// text: the handler only inspects the element under the pointer and walks a
+/// bounded number of ancestors to reject view-once, sticker, and avatar
+/// surfaces. All bytes are fetched in the page context (where WhatsApp has
+/// already decrypted them) and streamed to Rust, which revalidates the origin,
+/// size, and action before touching the filesystem or clipboard.
+const MEDIA_SCRIPT: &str = r#"
+(function () {
+  if (window.top !== window.self) return;
+  if (location.hostname !== "web.whatsapp.com") return;
+  if (window.__oxidezapMediaActions) return;
+
+  var DEFAULT_ENABLED = __OXIDEZAP_MEDIA_ENABLED__;
+  var MENU_ID = "oxidezap-media-menu";
+  var MAX_BYTES = 67108864;
+  var CHUNK_BYTES = 393216;
+  var menu = null;
+
+  function enabled() {
+    return window.__oxidezapMediaEnabled === undefined
+      ? DEFAULT_ENABLED
+      : !!window.__oxidezapMediaEnabled;
+  }
+
+  function post(payload) {
+    try {
+      window.webkit.messageHandlers.oxidezapMedia.postMessage(JSON.stringify(payload));
+    } catch (error) {}
+  }
+
+  function closeMenu() {
+    if (menu && menu.parentNode) menu.parentNode.removeChild(menu);
+    menu = null;
+  }
+
+  function attr(node, name) {
+    return (node && node.getAttribute && node.getAttribute(name)) || "";
+  }
+
+  function marker(node) {
+    return (attr(node, "data-testid") + " " + attr(node, "aria-label") + " " + attr(node, "title")).toLowerCase();
+  }
+
+  function viewOnce(node) {
+    for (var depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
+      var text = marker(node);
+      if (text.indexOf("view-once") >= 0 || text.indexOf("viewonce") >= 0) return true;
+      if (/view[\s-]?once|ver una vez|visualizar una vez|visualiza\u00e7\u00e3o \u00fanica|vu une fois|einmalig/.test(text)) return true;
+    }
+    return false;
+  }
+
+  function ignored(node) {
+    for (var depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+      var text = marker(node);
+      if (text.indexOf("sticker") >= 0 || text.indexOf("avatar") >= 0 || text.indexOf("emoji") >= 0) return true;
+    }
+    return false;
+  }
+
+  function whatsappUrl(value) {
+    try {
+      var parsed = new URL(value);
+      if (parsed.protocol === "blob:") return true;
+      if (parsed.protocol === "data:") {
+        return /^data:(image|video|audio)\//i.test(value) || /^data:application\/pdf/i.test(value);
+      }
+      return /(^|\.)whatsapp\.com$/.test(parsed.hostname) || /(^|\.)whatsapp\.net$/.test(parsed.hostname);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function nameFrom(node) {
+    var name = attr(node, "download") || attr(node, "title") || "";
+    if (!name) {
+      var image = node.querySelector && node.querySelector("img[alt]");
+      name = image ? attr(image, "alt") : "";
+    }
+    name = name.trim();
+    if (!name || name.indexOf("/") >= 0 || name.indexOf("\\") >= 0 || name.length > 160) return "";
+    return name;
+  }
+
+  function targetFor(event) {
+    var element = event.target;
+    if (!element || !element.closest) return null;
+    var documentLink = element.closest("a[download][href]");
+    if (documentLink && whatsappUrl(documentLink.href) && !ignored(documentLink) && !viewOnce(documentLink)) {
+      return { url: documentLink.href, kind: "document", filename: nameFrom(documentLink) };
+    }
+    var media = element.closest("img, picture, video, audio");
+    if (media) {
+      var source = media.currentSrc || media.src || "";
+      if (!source) {
+        var fallback = media.querySelector && media.querySelector("source[src]");
+        source = fallback ? fallback.src : "";
+      }
+      if (!source || ignored(media) || viewOnce(media)) return null;
+      var tag = media.tagName;
+      var kind = tag === "VIDEO" ? "video" : tag === "AUDIO" ? "audio" : "image";
+      return { url: source, kind: kind, filename: nameFrom(media) };
+    }
+    var link = element.closest("a[href]");
+    if (!link) return null;
+    var href = link.href || "";
+    if (!/^(blob:|data:)/i.test(href) && !link.hasAttribute("download")) return null;
+    if (!whatsappUrl(href) || ignored(link) || viewOnce(link)) return null;
+    return { url: href, kind: "document", filename: nameFrom(link) };
+  }
+
+  function item(box, textValue, action) {
+    var row = document.createElement("div");
+    row.setAttribute("role", "menuitem");
+    row.setAttribute("tabindex", "-1");
+    row.textContent = textValue;
+    row.style.cssText = 'padding: 7px 10px; border-radius: 6px; cursor: pointer; white-space: nowrap; outline: none;';
+    row.addEventListener("mouseenter", function () { row.style.background = '#2a3942'; });
+    row.addEventListener("mouseleave", function () { row.style.background = 'transparent'; });
+    row.addEventListener("focus", function () { row.style.background = '#2a3942'; });
+    row.addEventListener("blur", function () { row.style.background = 'transparent'; });
+    row.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMenu();
+      action();
+    });
+    box.appendChild(row);
+    return row;
+  }
+
+  function showMenu(x, y, target) {
+    closeMenu();
+    var box = document.createElement("div");
+    box.id = MENU_ID;
+    box.setAttribute("role", "menu");
+    box.style.cssText = 'position: fixed; z-index: 2147483647; min-width: 196px; padding: 6px; border-radius: 8px; background: #233138; color: #e9edef; box-shadow: 0 8px 24px rgba(0, 0, 0, .45); font: 13px/1.4 system-ui, sans-serif;';
+    box.addEventListener("mousedown", function (event) { event.stopPropagation(); });
+    box.addEventListener("contextmenu", function (event) { event.preventDefault(); event.stopPropagation(); });
+    item(box, "Save to Downloads", function () { transfer(target, "save"); });
+    item(box, "Open in system viewer", function () { transfer(target, "open"); });
+    if (target.kind === "image") item(box, "Copy image", function () { transfer(target, "copy"); });
+    document.body.appendChild(box);
+    var rect = box.getBoundingClientRect();
+    var left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
+    var top = Math.max(8, Math.min(y, window.innerHeight - rect.height - 8));
+    box.style.left = left + "px";
+    box.style.top = top + "px";
+    menu = box;
+  }
+
+  function moveFocus(delta) {
+    if (!menu) return;
+    var rows = Array.prototype.slice.call(menu.querySelectorAll('[role="menuitem"]'));
+    if (!rows.length) return;
+    var index = rows.indexOf(document.activeElement);
+    index = index < 0 ? (delta > 0 ? 0 : rows.length - 1) : (index + delta + rows.length) % rows.length;
+    rows[index].setAttribute("tabindex", "0");
+    rows[index].focus();
+  }
+
+  window.addEventListener("contextmenu", function (event) {
+    if (!enabled()) {
+      closeMenu();
+      return;
+    }
+    var target = targetFor(event);
+    if (!target) {
+      closeMenu();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    showMenu(event.clientX, event.clientY, target);
+  }, true);
+
+  window.addEventListener("mousedown", function (event) {
+    if (menu && !menu.contains(event.target)) closeMenu();
+  }, true);
+
+  window.addEventListener("keydown", function (event) {
+    if (!menu) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMenu();
+      return;
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      event.stopPropagation();
+      moveFocus(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if ((event.key === "Enter" || event.key === " ") && menu.contains(document.activeElement)) {
+      event.preventDefault();
+      event.stopPropagation();
+      document.activeElement.click();
+    }
+  }, true);
+
+  window.addEventListener("blur", closeMenu);
+  window.addEventListener("resize", closeMenu);
+  window.addEventListener("scroll", closeMenu, true);
+
+  function failure(reason, id) {
+    var payload = { type: "error", reason: reason };
+    if (id) payload.id = id;
+    post(payload);
+  }
+
+  function extension(mime, kind) {
+    var type = (mime || "").toLowerCase().split(";")[0];
+    var known = {
+      "image/jpeg": ".jpg",
+      "image/png": ".png",
+      "image/gif": ".gif",
+      "image/webp": ".webp",
+      "image/bmp": ".bmp",
+      "image/avif": ".avif",
+      "video/mp4": ".mp4",
+      "video/webm": ".webm",
+      "video/quicktime": ".mov",
+      "video/3gpp": ".3gp",
+      "audio/ogg": ".ogg",
+      "audio/mpeg": ".mp3",
+      "audio/mp4": ".m4a",
+      "audio/wav": ".wav",
+      "audio/webm": ".weba",
+      "application/pdf": ".pdf"
+    };
+    if (known[type]) return known[type];
+    if (kind === "image") return ".jpg";
+    if (kind === "video") return ".mp4";
+    if (kind === "audio") return ".ogg";
+    return "";
+  }
+
+  function timestamp() {
+    var now = new Date();
+    function pad(value) { return (value < 10 ? "0" : "") + value; }
+    return "" + now.getFullYear() + pad(now.getMonth() + 1) + pad(now.getDate()) + "-" + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+  }
+
+  function suggestName(target, mime) {
+    var name = (target.filename || "").trim();
+    if (!name) name = "whatsapp-" + target.kind + "-" + timestamp();
+    if (!/\.[a-z0-9]{1,6}$/i.test(name)) name += extension(mime, target.kind);
+    return name;
+  }
+
+  function newId() {
+    if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+    return "media-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+  }
+
+  function base64(bytes) {
+    var binary = "";
+    for (var offset = 0; offset < bytes.length; offset += 32768) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(offset, Math.min(offset + 32768, bytes.length)));
+    }
+    return btoa(binary);
+  }
+
+  function transfer(target, action) {
+    var activeId = null;
+    fetch(target.url, { credentials: "include" })
+      .then(function (response) {
+        if (!response.ok) throw new Error("http " + response.status);
+        return response.blob();
+      })
+      .then(function (blob) {
+        if (!blob || blob.size <= 0) {
+          failure("expired");
+          return;
+        }
+        if (blob.size > MAX_BYTES) {
+          failure("too-large");
+          return;
+        }
+        var id = newId();
+        activeId = id;
+        var mime = blob.type || "";
+        post({
+          type: "begin",
+          id: id,
+          action: action,
+          kind: target.kind,
+          url: target.url,
+          filename: suggestName(target, mime),
+          size: blob.size,
+          viewOnce: false
+        });
+        return blob.arrayBuffer().then(function (buffer) {
+          var bytes = new Uint8Array(buffer);
+          for (var offset = 0; offset < bytes.length; offset += CHUNK_BYTES) {
+            post({
+              type: "chunk",
+              id: id,
+              data: base64(bytes.subarray(offset, Math.min(offset + CHUNK_BYTES, bytes.length)))
+            });
+          }
+          post({ type: "end", id: id });
+        });
+      })
+      .catch(function () { failure("expired", activeId); });
+  }
+
+  window.__oxidezapMediaActions = {
+    setEnabled: function (value) {
+      window.__oxidezapMediaEnabled = !!value;
+      if (!value) closeMenu();
+    }
+  };
+})();
+"#;
+
+fn media_script(enabled: bool) -> String {
+    MEDIA_SCRIPT.replace(
+        MEDIA_ENABLED_PLACEHOLDER,
+        if enabled { "true" } else { "false" },
+    )
+}
+
+fn media_toggle_script(enabled: bool) -> String {
+    format!(
+        "if (window.__oxidezapMediaActions) window.__oxidezapMediaActions.setEnabled({enabled});"
+    )
+}
+
+struct MediaTransfer {
+    id: String,
+    account_id: String,
+    action: MediaAction,
+    path: Option<PathBuf>,
+    total_bytes: u64,
+    bytes: Vec<u8>,
+    last_progress: Instant,
+    recorded: bool,
+    active_downloads: Rc<Cell<u32>>,
+}
+
+enum MediaChunkOutcome {
+    Appended {
+        recorded: bool,
+        received: u64,
+        total: u64,
+        notify: bool,
+    },
+    Rejected(MediaRejection),
+    Ignored,
+}
+
+fn apply_media_chunk(
+    transfers: &mut HashMap<String, MediaTransfer>,
+    account_id: &str,
+    id: &str,
+    data: &str,
+) -> MediaChunkOutcome {
+    let Some(transfer) = transfers.get_mut(id) else {
+        return MediaChunkOutcome::Ignored;
+    };
+    if transfer.account_id != account_id {
+        return MediaChunkOutcome::Ignored;
+    }
+    let received = transfer.bytes.len() as u64;
+    match decode_media_chunk(data, received, transfer.total_bytes) {
+        Ok(bytes) => {
+            transfer.bytes.extend_from_slice(&bytes);
+            let notify = transfer.last_progress.elapsed() >= DOWNLOAD_PROGRESS_INTERVAL;
+            if notify {
+                transfer.last_progress = Instant::now();
+            }
+            MediaChunkOutcome::Appended {
+                recorded: transfer.recorded,
+                received: transfer.bytes.len() as u64,
+                total: transfer.total_bytes,
+                notify,
+            }
+        }
+        Err(rejection) => MediaChunkOutcome::Rejected(rejection),
+    }
+}
+
+fn handle_media_message(
+    message: &str,
+    account_id: &str,
+    events: &Sender<GtkEvent>,
+    layout: &Rc<RefCell<DownloadLayout>>,
+    transfers: &Rc<RefCell<HashMap<String, MediaTransfer>>>,
+    active_downloads: &Rc<Cell<u32>>,
+) {
+    let Some(message) = parse_media_message(message) else {
+        debug!(account_id = %account_id, "ignored an invalid media message");
+        return;
+    };
+    match message {
+        MediaMessage::Begin { id, request } => {
+            begin_media_transfer(
+                id,
+                request,
+                account_id,
+                events,
+                layout,
+                transfers,
+                active_downloads,
+            );
+        }
+        MediaMessage::Chunk { id, data } => {
+            let outcome = apply_media_chunk(&mut transfers.borrow_mut(), account_id, &id, &data);
+            match outcome {
+                MediaChunkOutcome::Appended {
+                    recorded,
+                    received,
+                    total,
+                    notify,
+                } => {
+                    if recorded && notify {
+                        let _ = events.send(GtkEvent::DownloadProgress {
+                            id,
+                            received,
+                            total: Some(total),
+                        });
+                    }
+                }
+                MediaChunkOutcome::Rejected(rejection) => {
+                    abort_media_transfer(&id, rejection, transfers, events);
+                }
+                MediaChunkOutcome::Ignored => {}
+            }
+        }
+        MediaMessage::End { id } => finish_media_transfer(&id, transfers, events),
+        MediaMessage::Failed { id, reason } => {
+            let aborted = id.is_some_and(|id| {
+                abort_media_transfer(
+                    &id,
+                    match reason {
+                        MediaFailureReason::TooLarge => MediaRejection::TooLarge,
+                        _ => MediaRejection::Empty,
+                    },
+                    transfers,
+                    events,
+                )
+            });
+            if !aborted {
+                let _ = events.send(GtkEvent::MediaFailed {
+                    account_id: account_id.to_string(),
+                    message: reason.message().to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn begin_media_transfer(
+    id: String,
+    request: MediaRequest,
+    account_id: &str,
+    events: &Sender<GtkEvent>,
+    layout: &Rc<RefCell<DownloadLayout>>,
+    transfers: &Rc<RefCell<HashMap<String, MediaTransfer>>>,
+    active_downloads: &Rc<Cell<u32>>,
+) {
+    if let Err(rejection) = validate_media_request(&request) {
+        let _ = events.send(GtkEvent::MediaFailed {
+            account_id: account_id.to_string(),
+            message: rejection.message().to_string(),
+        });
+        return;
+    }
+    if transfers.borrow().contains_key(&id) {
+        return;
+    }
+
+    let mut path = None;
+    let mut filename = sanitize_filename(&request.filename);
+    if request.action != MediaAction::Copy {
+        match layout
+            .borrow()
+            .reserve(account_id, &request.filename, SystemTime::now())
+        {
+            Ok(reserved) => {
+                if let Some(name) = reserved.file_name() {
+                    filename = name.to_string_lossy().into_owned();
+                }
+                path = Some(reserved);
+            }
+            Err(error) => {
+                warn!(account_id = %account_id, %error, "could not reserve a media download path");
+                let _ = events.send(GtkEvent::MediaFailed {
+                    account_id: account_id.to_string(),
+                    message: format!("Could not reserve a download path: {error}"),
+                });
+                return;
+            }
+        }
+    }
+
+    let recorded = path.is_some();
+    if let Some(path) = &path {
+        let _ = events.send(GtkEvent::DownloadStarted {
+            id: id.clone(),
+            account_id: account_id.to_string(),
+            filename,
+            path: path.clone(),
+            source_url: Some(request.url.clone()),
+            total_bytes: Some(request.total_bytes),
+        });
+    }
+
+    active_downloads.set(active_downloads.get().saturating_add(1));
+    transfers.borrow_mut().insert(
+        id.clone(),
+        MediaTransfer {
+            id,
+            account_id: account_id.to_string(),
+            action: request.action,
+            path,
+            total_bytes: request.total_bytes,
+            bytes: Vec::with_capacity(request.total_bytes as usize),
+            last_progress: Instant::now(),
+            recorded,
+            active_downloads: active_downloads.clone(),
+        },
+    );
+}
+
+fn abort_media_transfer(
+    id: &str,
+    rejection: MediaRejection,
+    transfers: &Rc<RefCell<HashMap<String, MediaTransfer>>>,
+    events: &Sender<GtkEvent>,
+) -> bool {
+    let Some(transfer) = transfers.borrow_mut().remove(id) else {
+        return false;
+    };
+    transfer
+        .active_downloads
+        .set(transfer.active_downloads.get().saturating_sub(1));
+    if let Some(path) = &transfer.path {
+        discard_empty_reservation(path);
+    }
+    warn!(
+        account_id = %transfer.account_id,
+        reason = %rejection.message(),
+        "aborted a media transfer"
+    );
+    if transfer.recorded {
+        let _ = events.send(GtkEvent::DownloadFinished {
+            id: transfer.id.clone(),
+            success: false,
+            cancelled: false,
+        });
+    } else {
+        let _ = events.send(GtkEvent::MediaFailed {
+            account_id: transfer.account_id.clone(),
+            message: rejection.message().to_string(),
+        });
+    }
+    true
+}
+
+fn finish_media_transfer(
+    id: &str,
+    transfers: &Rc<RefCell<HashMap<String, MediaTransfer>>>,
+    events: &Sender<GtkEvent>,
+) {
+    let Some(mut transfer) = transfers.borrow_mut().remove(id) else {
+        return;
+    };
+    transfer
+        .active_downloads
+        .set(transfer.active_downloads.get().saturating_sub(1));
+
+    if transfer.bytes.len() as u64 != transfer.total_bytes {
+        if let Some(path) = &transfer.path {
+            discard_empty_reservation(path);
+        }
+        warn!(
+            account_id = %transfer.account_id,
+            expected = transfer.total_bytes,
+            received = transfer.bytes.len(),
+            "media transfer ended with an unexpected size"
+        );
+        if transfer.recorded {
+            let _ = events.send(GtkEvent::DownloadFinished {
+                id: transfer.id.clone(),
+                success: false,
+                cancelled: false,
+            });
+        } else {
+            let _ = events.send(GtkEvent::MediaFailed {
+                account_id: transfer.account_id.clone(),
+                message: MediaRejection::Empty.message().to_string(),
+            });
+        }
+        return;
+    }
+
+    if transfer.action == MediaAction::Copy {
+        match copy_media_image(&transfer.bytes) {
+            Ok(()) => {
+                let _ = events.send(GtkEvent::MediaCopied {
+                    account_id: transfer.account_id.clone(),
+                });
+            }
+            Err(error) => {
+                warn!(account_id = %transfer.account_id, %error, "could not copy an image");
+                let _ = events.send(GtkEvent::MediaFailed {
+                    account_id: transfer.account_id.clone(),
+                    message: format!("Could not copy the image: {error}"),
+                });
+            }
+        }
+        return;
+    }
+
+    let Some(path) = transfer.path.take() else {
+        return;
+    };
+    let bytes = std::mem::take(&mut transfer.bytes);
+    let open_after = transfer.action == MediaAction::Open;
+    let draw_id = transfer.id.clone();
+    let draw_account = transfer.account_id.clone();
+    let draw_events = events.clone();
+    let cleanup_path = path.clone();
+    let spawned = std::thread::Builder::new()
+        .name("oxidezap-media-write".to_string())
+        .spawn(move || {
+            let result = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(&bytes));
+            match result {
+                Ok(()) => {
+                    let open_result = open_after.then(|| open::that(&path));
+                    if let Some(Err(error)) = open_result {
+                        let _ = draw_events.send(GtkEvent::MediaFailed {
+                            account_id: draw_account.clone(),
+                            message: format!(
+                                "Saved to {}, but the system viewer could not open it: {error}",
+                                path.display()
+                            ),
+                        });
+                    }
+                    let _ = draw_events.send(GtkEvent::DownloadFinished {
+                        id: draw_id,
+                        success: true,
+                        cancelled: false,
+                    });
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&path);
+                    let _ = draw_events.send(GtkEvent::DownloadFinished {
+                        id: draw_id,
+                        success: false,
+                        cancelled: false,
+                    });
+                    let _ = draw_events.send(GtkEvent::MediaFailed {
+                        account_id: draw_account,
+                        message: format!("Could not save the media: {error}"),
+                    });
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        let _ = std::fs::remove_file(&cleanup_path);
+        let _ = events.send(GtkEvent::DownloadFinished {
+            id: transfer.id.clone(),
+            success: false,
+            cancelled: false,
+        });
+        let _ = events.send(GtkEvent::MediaFailed {
+            account_id: transfer.account_id.clone(),
+            message: format!("Could not start the media writer: {error}"),
+        });
+    }
+}
+
+fn copy_media_image(bytes: &[u8]) -> Result<()> {
+    let stream = gtk::gio::MemoryInputStream::from_bytes(&glib::Bytes::from(bytes));
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_stream(&stream, None::<&gtk::gio::Cancellable>)
+        .map_err(|error| anyhow!("could not decode the image: {error}"))?;
+    let clipboard = gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD);
+    clipboard.set_image(&pixbuf);
+    Ok(())
+}
+
+fn prune_media_transfers(state: &mut GtkState, now: Instant) {
+    let stale: Vec<String> = {
+        let transfers = state.media_transfers.borrow();
+        transfers
+            .iter()
+            .filter(|(_, transfer)| {
+                now.duration_since(transfer.last_progress) > MEDIA_TRANSFER_TIMEOUT
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for id in stale {
+        let Some(transfer) = state.media_transfers.borrow_mut().remove(&id) else {
+            continue;
+        };
+        transfer
+            .active_downloads
+            .set(transfer.active_downloads.get().saturating_sub(1));
+        if let Some(path) = &transfer.path {
+            discard_empty_reservation(path);
+        }
+        warn!(
+            account_id = %transfer.account_id,
+            "media transfer timed out"
+        );
+        if transfer.recorded {
+            let _ = state.events.send(GtkEvent::DownloadFinished {
+                id: transfer.id.clone(),
+                success: false,
+                cancelled: false,
+            });
+        } else {
+            let _ = state.events.send(GtkEvent::MediaFailed {
+                account_id: transfer.account_id.clone(),
+                message: "The media transfer timed out. Reopen the media and try again."
+                    .to_string(),
+            });
+        }
+    }
+}
+
+fn connect_media_script(
+    manager: &UserContentManager,
+    account_id: &str,
+    events: Sender<GtkEvent>,
+    layout: Rc<RefCell<DownloadLayout>>,
+    transfers: Rc<RefCell<HashMap<String, MediaTransfer>>>,
+    active_downloads: Rc<Cell<u32>>,
+    enabled: bool,
+) {
+    if !manager.register_script_message_handler(MEDIA_MESSAGE_HANDLER) {
+        warn!(account_id = %account_id, "could not register the media message handler");
+        return;
+    }
+    manager.add_script(&UserScript::new(
+        &media_script(enabled),
+        UserContentInjectedFrames::TopFrame,
+        UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    ));
+
+    let script_account = account_id.to_string();
+    manager.connect_script_message_received(
+        Some(MEDIA_MESSAGE_HANDLER),
+        move |_manager, result| {
+            let Some(value) = result.js_value() else {
+                return;
+            };
+            let message = value.to_string();
+            handle_media_message(
+                &message,
+                &script_account,
+                &events,
+                &layout,
+                &transfers,
+                &active_downloads,
+            );
+        },
+    );
+}
+
 /// Applies the proxy configuration to a per-account WebKit data manager.
 ///
 /// WebKitGTK 2.0.2 exposes this on `WebsiteDataManager` since 2.32
@@ -917,10 +2251,12 @@ fn connect_webview_signals(
     events: Sender<GtkEvent>,
     notifications_enabled: bool,
     parent_window: gtk::Window,
+    media_enabled: Rc<Cell<bool>>,
 ) {
     let load_account = account_id.to_string();
     let load_events = events.clone();
-    webview.connect_load_changed(move |_webview, event| {
+    let load_media = media_enabled;
+    webview.connect_load_changed(move |webview, event| {
         let state = match event {
             webkit2gtk::LoadEvent::Started => LoadState::Started,
             webkit2gtk::LoadEvent::Redirected => LoadState::Redirected,
@@ -928,6 +2264,16 @@ fn connect_webview_signals(
             webkit2gtk::LoadEvent::Finished => LoadState::Finished,
             _ => return,
         };
+        if state == LoadState::Finished {
+            let script = media_toggle_script(load_media.get());
+            webview.evaluate_javascript(
+                &script,
+                None,
+                None,
+                None::<&gtk::gio::Cancellable>,
+                |_result| {},
+            );
+        }
         let _ = load_events.send(GtkEvent::LoadState {
             account_id: load_account.clone(),
             state,
@@ -992,6 +2338,22 @@ fn connect_webview_signals(
             body,
         });
         true
+    });
+
+    let camera_account = account_id.to_string();
+    let camera_events = events.clone();
+    webview.connect_camera_capture_state_notify(move |webview| {
+        report_capture_state(webview, &camera_account, &camera_events);
+    });
+    let microphone_account = account_id.to_string();
+    let microphone_events = events.clone();
+    webview.connect_microphone_capture_state_notify(move |webview| {
+        report_capture_state(webview, &microphone_account, &microphone_events);
+    });
+    let display_account = account_id.to_string();
+    let display_events = events.clone();
+    webview.connect_display_capture_state_notify(move |webview| {
+        report_capture_state(webview, &display_account, &display_events);
     });
 
     let policy_account = account_id.to_string();
@@ -1385,6 +2747,7 @@ fn connect_downloads(
 /// is consulted once as a fallback when the cached XID became invalid, which
 /// covers a window that was recreated without a new `Create` command.
 fn sync_overlays(state: &mut GtkState) {
+    prune_media_transfers(state, Instant::now());
     let x11 = &state.x11;
     for (account_id, entry) in state.entries.iter_mut() {
         if !entry.visible {
@@ -2251,6 +3614,36 @@ mod tests {
     }
 
     #[test]
+    fn any_active_or_muted_capture_counts_as_busy() {
+        let idle = MediaCaptureState::None;
+        let active = MediaCaptureState::Active;
+        let muted = MediaCaptureState::Muted;
+
+        assert!(!capture_state_is_active((idle, idle, idle)));
+        assert!(capture_state_is_active((active, idle, idle)));
+        assert!(capture_state_is_active((idle, muted, idle)));
+        assert!(capture_state_is_active((idle, idle, active)));
+        assert!(capture_state_is_active((muted, muted, muted)));
+    }
+
+    #[test]
+    fn a_download_or_capture_refuses_suspension() {
+        assert_eq!(suspend_refusal(0, false), None);
+        assert_eq!(
+            suspend_refusal(1, false),
+            Some(SuspendRefusal::DownloadActive)
+        );
+        assert_eq!(
+            suspend_refusal(0, true),
+            Some(SuspendRefusal::CaptureActive)
+        );
+        assert_eq!(
+            suspend_refusal(2, true),
+            Some(SuspendRefusal::DownloadActive)
+        );
+    }
+
+    #[test]
     fn only_whatsapp_origins_may_request_permissions() {
         assert_eq!(
             permission_action(
@@ -2315,6 +3708,201 @@ mod tests {
                 true
             ),
             PermissionAction::Deny
+        );
+    }
+
+    fn normal_image_request() -> MediaRequest {
+        MediaRequest {
+            action: MediaAction::Save,
+            kind: MediaKind::Image,
+            url: "blob:https://web.whatsapp.com/8f9a3c1e-4d2b".to_string(),
+            filename: "whatsapp-image.jpg".to_string(),
+            total_bytes: 2048,
+            view_once: false,
+        }
+    }
+
+    #[test]
+    fn media_urls_are_limited_to_whatsapp_origins() {
+        for url in [
+            "blob:https://web.whatsapp.com/8f9a3c1e-4d2b",
+            "blob:https://mmg.whatsapp.net/8f9a3c1e-4d2b",
+            "https://web.whatsapp.com/media/photo.jpg",
+            "https://mmg.whatsapp.net/v/t62/file.enc",
+            "data:image/png;base64,iVBORw0KGgo=",
+            "data:video/mp4;base64,AAAA",
+            "data:audio/ogg;base64,AAAA",
+            "data:application/pdf;base64,AAAA",
+        ] {
+            assert_eq!(
+                allowed_media_url(url),
+                Ok(()),
+                "expected {url} to be allowed"
+            );
+        }
+
+        for url in [
+            "https://example.com/photo.jpg",
+            "blob:https://example.com/8f9a3c1e-4d2b",
+            "blob:https://web.whatsapp.com.evil.test/8f9a3c1e-4d2b",
+            "https://whatsapp.com.evil.test/photo.jpg",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html;base64,AAAA",
+            "data:image/svg+xml;base64,AAAA",
+            "",
+            "not a url",
+        ] {
+            assert!(
+                allowed_media_url(url).is_err(),
+                "expected {url} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_media_requests_are_accepted() {
+        assert_eq!(validate_media_request(&normal_image_request()), Ok(()));
+
+        let mut video = normal_image_request();
+        video.kind = MediaKind::Video;
+        video.action = MediaAction::Save;
+        assert_eq!(validate_media_request(&video), Ok(()));
+
+        let mut audio = normal_image_request();
+        audio.kind = MediaKind::Audio;
+        audio.action = MediaAction::Open;
+        assert_eq!(validate_media_request(&audio), Ok(()));
+
+        let mut document = normal_image_request();
+        document.kind = MediaKind::Document;
+        document.action = MediaAction::Open;
+        assert_eq!(validate_media_request(&document), Ok(()));
+    }
+
+    #[test]
+    fn view_once_media_is_always_rejected() {
+        let mut request = normal_image_request();
+        request.view_once = true;
+        assert_eq!(
+            validate_media_request(&request),
+            Err(MediaRejection::ViewOnce)
+        );
+
+        request.action = MediaAction::Open;
+        assert_eq!(
+            validate_media_request(&request),
+            Err(MediaRejection::ViewOnce)
+        );
+    }
+
+    #[test]
+    fn copy_is_only_offered_for_images() {
+        let mut request = normal_image_request();
+        request.action = MediaAction::Copy;
+        assert_eq!(validate_media_request(&request), Ok(()));
+
+        request.kind = MediaKind::Video;
+        assert_eq!(
+            validate_media_request(&request),
+            Err(MediaRejection::UnsupportedAction)
+        );
+    }
+
+    #[test]
+    fn media_requests_reject_oversized_empty_and_foreign_payloads() {
+        let mut request = normal_image_request();
+        request.total_bytes = MEDIA_MAX_BYTES + 1;
+        assert_eq!(
+            validate_media_request(&request),
+            Err(MediaRejection::TooLarge)
+        );
+
+        request.total_bytes = 0;
+        assert_eq!(validate_media_request(&request), Err(MediaRejection::Empty));
+
+        request.total_bytes = 2048;
+        request.url = "https://example.com/photo.jpg".to_string();
+        assert_eq!(
+            validate_media_request(&request),
+            Err(MediaRejection::UntrustedOrigin)
+        );
+
+        request.url = "file:///etc/passwd".to_string();
+        assert_eq!(
+            validate_media_request(&request),
+            Err(MediaRejection::UnsupportedScheme)
+        );
+    }
+
+    #[test]
+    fn media_message_parser_reads_the_transfer_protocol() {
+        let begin = r#"{"type":"begin","id":"t1","action":"save","kind":"image","url":"blob:https://web.whatsapp.com/x","filename":"photo.jpg","size":12,"viewOnce":false}"#;
+        let Some(MediaMessage::Begin { id, request }) = parse_media_message(begin) else {
+            panic!("expected a begin message");
+        };
+        assert_eq!(id, "t1");
+        assert_eq!(request.action, MediaAction::Save);
+        assert_eq!(request.kind, MediaKind::Image);
+        assert_eq!(request.total_bytes, 12);
+
+        let chunk = r#"{"type":"chunk","id":"t1","data":"AAAA"}"#;
+        assert!(matches!(
+            parse_media_message(chunk),
+            Some(MediaMessage::Chunk { id, .. }) if id == "t1"
+        ));
+
+        let end = r#"{"type":"end","id":"t1"}"#;
+        assert!(matches!(
+            parse_media_message(end),
+            Some(MediaMessage::End { id }) if id == "t1"
+        ));
+
+        let failed = r#"{"type":"error","reason":"expired"}"#;
+        assert!(matches!(
+            parse_media_message(failed),
+            Some(MediaMessage::Failed {
+                reason: MediaFailureReason::Expired,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn media_message_parser_ignores_unknown_and_malformed_messages() {
+        for message in [
+            "not json",
+            r#"{"type":"pause"}"#,
+            r#"{"type":"begin","id":"t1","action":"delete","kind":"image","url":"blob:https://web.whatsapp.com/x","size":1}"#,
+            r#"{"type":"begin","id":"t1","action":"save"}"#,
+            r#"{"type":"chunk","id":"t1"}"#,
+            r#"{"type":"error","reason":"something-new"}"#,
+        ] {
+            assert!(parse_media_message(message).is_none(), "{message}");
+        }
+    }
+
+    #[test]
+    fn media_script_honors_the_settings_toggle() {
+        assert!(media_script(true).contains("var DEFAULT_ENABLED = true;"));
+        assert!(media_script(false).contains("var DEFAULT_ENABLED = false;"));
+        assert!(!media_script(true).contains(MEDIA_ENABLED_PLACEHOLDER));
+    }
+
+    #[test]
+    fn media_chunks_are_bounded_and_reject_invalid_base64() {
+        assert_eq!(decode_media_chunk("AAAA", 0, 12), Ok(vec![0, 0, 0]));
+        assert_eq!(
+            decode_media_chunk("AAAA", 10, 12),
+            Err(MediaRejection::TooLarge)
+        );
+        assert_eq!(
+            decode_media_chunk("!!!!", 0, 12),
+            Err(MediaRejection::Malformed)
+        );
+        assert_eq!(
+            decode_media_chunk("AAA", 0, 12),
+            Err(MediaRejection::Malformed)
         );
     }
 }

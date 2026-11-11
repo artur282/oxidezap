@@ -22,11 +22,16 @@ pub const SETTINGS_VERSION: u32 = 1;
 /// from `SETTINGS_VERSION`, so the on-disk settings schema can keep evolving
 /// without silently reinterpreted exports.
 pub const SETTINGS_EXPORT_VERSION: u32 = 1;
+/// Version of the first-run guide. Bumped when a future release needs to show
+/// a new page to installations that already completed an older guide.
+pub const ONBOARDING_VERSION: u32 = 1;
 /// Upper bound for an imported settings file. A real export is a few KiB;
 /// anything beyond this is rejected before it is parsed.
 pub const MAX_IMPORT_BYTES: u64 = 1024 * 1024;
 pub const MIN_ZOOM: f64 = 0.8;
 pub const MAX_ZOOM: f64 = 1.5;
+/// Zoom presets shared by the settings window and the command palette.
+pub const ZOOM_LEVELS: [f64; 6] = [MIN_ZOOM, 0.9, 1.0, 1.1, 1.25, MAX_ZOOM];
 pub const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+W";
 /// Global shortcut that hides every window for immediate privacy; a second
 /// press restores the windows that were visible when it fired.
@@ -34,6 +39,139 @@ pub const DEFAULT_BOSS_KEY: &str = "Ctrl+Shift+H";
 /// How long a settings change waits before it is written, so that bursts of
 /// unread/title events coalesce into a single save.
 pub const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Hard limit for experimental custom CSS. The stylesheet is parsed by WebKit
+/// on every page load, so an unbounded settings value would also make every
+/// settings save unnecessarily large.
+pub const MAX_CUSTOM_CSS_BYTES: usize = 64 * 1024;
+
+/// Experimental WhatsApp Web appearance customization.
+///
+/// The CSS is stored in the private settings file instead of a separate path
+/// so a portable profile only has one file to back up. It is deliberately
+/// excluded from settings exports: it is a user-managed artifact that can
+/// embed large data URIs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AppearanceSettings {
+    /// Global opt-in. A valid stylesheet is still kept while this is off so
+    /// the user can toggle it back without loading the file again.
+    pub experimental_css: bool,
+    /// CSS source. Only present when the user loaded a file.
+    pub custom_css: String,
+}
+
+impl AppearanceSettings {
+    /// Enforces the invariants that make an enabled setting meaningful:
+    /// oversized values are dropped instead of being truncated, and an empty
+    /// stylesheet can never be active.
+    pub fn normalize(&mut self) {
+        if self.custom_css.len() > MAX_CUSTOM_CSS_BYTES {
+            warn!(
+                bytes = self.custom_css.len(),
+                limit = MAX_CUSTOM_CSS_BYTES,
+                "experimental CSS is too large; disabling it"
+            );
+            self.custom_css.clear();
+            self.experimental_css = false;
+        }
+        if self.custom_css.trim().is_empty() {
+            self.custom_css.clear();
+            self.experimental_css = false;
+        }
+    }
+
+    /// The stylesheet WebKit should inject, or `None` when the feature is off.
+    pub fn active_css(&self) -> Option<&str> {
+        (self.experimental_css && !self.custom_css.trim().is_empty())
+            .then_some(self.custom_css.as_str())
+    }
+}
+
+/// Validates experimental CSS before it is persisted or injected.
+///
+/// This is not a CSS parser. It only rejects input that is unsafe for the
+/// documented contract: HTML breakout, script-capable URLs, remote stylesheet
+/// imports/resources, and oversized files. CSS is never evaluated as
+/// JavaScript and is injected through WebKit's user stylesheet API, not a
+/// `<style>` element.
+pub fn validate_custom_css(css: &str) -> Result<(), String> {
+    if css.trim().is_empty() {
+        return Err("Add CSS before enabling experimental styles.".to_string());
+    }
+    if css.len() > MAX_CUSTOM_CSS_BYTES {
+        return Err(format!(
+            "The CSS is too large ({} bytes; the limit is {} KiB).",
+            css.len(),
+            MAX_CUSTOM_CSS_BYTES / 1024
+        ));
+    }
+    if css.contains('\0') {
+        return Err("The CSS contains a NUL character.".to_string());
+    }
+    if css.to_ascii_lowercase().contains("</style") {
+        return Err("The CSS must not contain a </style> tag.".to_string());
+    }
+
+    // Comments are not part of the cascade. Without removing them, a comment
+    // that merely documents `@import` would be rejected as if it were active.
+    let code = strip_css_comments(css).to_ascii_lowercase();
+    if code.contains("@import") {
+        return Err("The CSS must not use @import. Paste the rules directly instead.".to_string());
+    }
+    if code.contains("javascript:") {
+        return Err("The CSS must not contain javascript: URLs.".to_string());
+    }
+    if css_uses_remote_url(&code) {
+        return Err(
+            "The CSS must not load remote resources. Use data: URIs or local rules instead."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Removes `/* ... */` comments before scanning for resource-loading rules.
+/// CSS comments do not nest, and an unterminated comment consumes the rest of
+/// the input, matching the CSS tokenizer.
+fn strip_css_comments(css: &str) -> String {
+    let mut result = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        result.push_str(&rest[..start]);
+        let Some(end) = rest[start + 2..].find("*/") else {
+            return result;
+        };
+        rest = &rest[start + 2 + end + 2..];
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Detects `url(http:...)`, `url(https:...)`, and protocol-relative URLs,
+/// including quoted and whitespace-padded forms. Data URIs and relative paths
+/// are left alone: they cannot download a remote stylesheet.
+fn css_uses_remote_url(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let mut cursor = 0;
+    while let Some(offset) = code[cursor..].find("url(") {
+        let mut index = cursor + offset + "url(".len();
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index < bytes.len() && matches!(bytes[index], b'\'' | b'"') {
+            index += 1;
+        }
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let rest = &code[index..];
+        if rest.starts_with("http:") || rest.starts_with("https:") || rest.starts_with("//") {
+            return true;
+        }
+        cursor = index;
+    }
+    false
+}
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -150,6 +288,61 @@ impl Default for LockSettings {
             lock_on_screen_lock: true,
             idle_minutes: 0,
         }
+    }
+}
+
+/// Low-memory mode. Suspending an account destroys its WebKit view and the web
+/// process behind it, while the account, its profile directories, and the
+/// WhatsApp session stay on disk. It is off by default because reactivating a
+/// view reloads WhatsApp Web and takes a few seconds.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MemorySettings {
+    /// Master switch for automatic suspension of hidden accounts.
+    pub suspend_hidden: bool,
+    /// How long an account must stay hidden before its view is released.
+    pub suspend_after_minutes: u32,
+    /// Keep the account the user opened most recently loaded, even when every
+    /// window is hidden. This is the "never unload the last active account"
+    /// guard; turning it off lets the sweep release every hidden account.
+    pub keep_active_account: bool,
+}
+
+/// Delay choices offered by Settings > Performance.
+pub const SUSPEND_DELAY_OPTIONS: [u32; 3] = [15, 30, 60];
+pub const DEFAULT_SUSPEND_MINUTES: u32 = 30;
+pub const MIN_SUSPEND_MINUTES: u32 = 5;
+pub const MAX_SUSPEND_MINUTES: u32 = 240;
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            suspend_hidden: false,
+            suspend_after_minutes: DEFAULT_SUSPEND_MINUTES,
+            keep_active_account: true,
+        }
+    }
+}
+
+impl MemorySettings {
+    pub fn normalize(&mut self) {
+        if self.suspend_after_minutes == 0 {
+            self.suspend_after_minutes = DEFAULT_SUSPEND_MINUTES;
+        }
+        self.suspend_after_minutes = self
+            .suspend_after_minutes
+            .clamp(MIN_SUSPEND_MINUTES, MAX_SUSPEND_MINUTES);
+    }
+
+    /// Idle time required before a hidden account may be released. `None`
+    /// means the automatic policy is disabled.
+    pub fn suspend_after(&self) -> Option<Duration> {
+        if !self.suspend_hidden {
+            return None;
+        }
+        Some(Duration::from_secs(
+            u64::from(self.suspend_after_minutes) * 60,
+        ))
     }
 }
 
@@ -943,6 +1136,639 @@ fn normalize_locales(locales: &[String]) -> Vec<String> {
     normalized
 }
 
+/// Default start of the recurring quiet-hours window.
+pub const DEFAULT_QUIET_HOURS_START: &str = "22:00";
+/// Default end of the recurring quiet-hours window.
+pub const DEFAULT_QUIET_HOURS_END: &str = "07:00";
+/// Fallback wake-up time used by "until tomorrow" when the quiet-hours end
+/// cannot be parsed.
+pub const DEFAULT_DND_WAKE_MINUTES: u32 = 8 * 60;
+pub const MINUTES_PER_DAY: u32 = 24 * 60;
+
+pub const EVERY_DAY: [bool; 7] = [true; 7];
+pub const WEEKDAYS: [bool; 7] = [true, true, true, true, true, false, false];
+pub const WEEKENDS: [bool; 7] = [false, false, false, false, false, true, true];
+
+const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Recurring Do Not Disturb window, evaluated in the desktop's local time.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DoNotDisturbMode {
+    #[default]
+    Off,
+    On,
+    Scheduled,
+}
+
+impl DoNotDisturbMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            DoNotDisturbMode::Off => "Off",
+            DoNotDisturbMode::On => "On",
+            DoNotDisturbMode::Scheduled => "Scheduled",
+        }
+    }
+}
+
+/// A weekly quiet-hours window. Times are wall-clock `HH:MM` in the local
+/// timezone and are resolved through libc, so DST transitions follow the
+/// desktop rules. A period whose end is before its start crosses midnight and
+/// belongs to the day it starts: `22:00`-`07:00` on Friday covers Friday night
+/// and Saturday morning.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct QuietHours {
+    pub start: String,
+    pub end: String,
+    /// Days the quiet period starts on. Monday is index 0.
+    pub days: [bool; 7],
+}
+
+impl Default for QuietHours {
+    fn default() -> Self {
+        Self {
+            start: DEFAULT_QUIET_HOURS_START.to_string(),
+            end: DEFAULT_QUIET_HOURS_END.to_string(),
+            days: EVERY_DAY,
+        }
+    }
+}
+
+impl QuietHours {
+    pub fn start_minutes(&self) -> Option<u32> {
+        parse_time_of_day(&self.start)
+    }
+
+    pub fn end_minutes(&self) -> Option<u32> {
+        parse_time_of_day(&self.end)
+    }
+
+    /// Canonicalizes the text fields. Invalid values fall back to the defaults
+    /// instead of discarding the whole settings file.
+    pub fn normalize(&mut self) {
+        self.start = format_time_of_day(
+            self.start_minutes()
+                .unwrap_or_else(|| parse_time_of_day(DEFAULT_QUIET_HOURS_START).unwrap_or(0)),
+        );
+        self.end = format_time_of_day(
+            self.end_minutes()
+                .unwrap_or_else(|| parse_time_of_day(DEFAULT_QUIET_HOURS_END).unwrap_or(0)),
+        );
+    }
+
+    pub fn is_quiet_at(&self, now: SystemTime) -> bool {
+        let (Some(start), Some(end)) = (self.start_minutes(), self.end_minutes()) else {
+            return false;
+        };
+        if start == end {
+            return false;
+        }
+        let Some(local) = local_now(now) else {
+            return false;
+        };
+        let minute = local.hour * 60 + local.minute;
+        let today = local.weekday;
+        let yesterday = (today + 6) % 7;
+        if start < end {
+            self.days[today] && minute >= start && minute < end
+        } else {
+            (self.days[today] && minute >= start) || (self.days[yesterday] && minute < end)
+        }
+    }
+
+    /// The next time this schedule becomes active after `now`.
+    pub fn next_start(&self, now: SystemTime) -> Option<SystemTime> {
+        let start = self.start_minutes()?;
+        let end = self.end_minutes()?;
+        if start == end {
+            return None;
+        }
+        let local = local_now(now)?;
+        for offset in 0..=8 {
+            let day_number = local.day_number + offset;
+            let weekday = weekday_for_day(day_number);
+            if !self.days[weekday] {
+                continue;
+            }
+            let candidate = local_time_at(day_number, start)?;
+            if candidate > now {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// The next time this schedule becomes inactive after `now`. An end time
+    /// belongs to the quiet period that started before it, which is what makes
+    /// overnight ranges work.
+    pub fn next_end(&self, now: SystemTime) -> Option<SystemTime> {
+        let start = self.start_minutes()?;
+        let end = self.end_minutes()?;
+        if start == end {
+            return None;
+        }
+        let local = local_now(now)?;
+        for offset in 0..=8 {
+            let end_day = local.day_number + offset;
+            let start_day = if start > end { end_day - 1 } else { end_day };
+            let start_weekday = weekday_for_day(start_day);
+            if !self.days[start_weekday] {
+                continue;
+            }
+            let candidate = local_time_at(end_day, end)?;
+            if candidate > now {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    pub fn days_label(&self) -> String {
+        if self.days == EVERY_DAY {
+            return "every day".to_string();
+        }
+        if self.days == WEEKDAYS {
+            return "weekdays".to_string();
+        }
+        if self.days == WEEKENDS {
+            return "weekends".to_string();
+        }
+        let selected: Vec<&str> = self
+            .days
+            .iter()
+            .enumerate()
+            .filter(|(_, selected)| **selected)
+            .map(|(index, _)| WEEKDAY_NAMES[index])
+            .collect();
+        if selected.is_empty() {
+            "no days".to_string()
+        } else {
+            selected.join(", ")
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        format!("{}-{} ({})", self.start, self.end, self.days_label())
+    }
+}
+
+/// Parsed `HH:MM` value, expressed as minutes since local midnight.
+pub fn parse_time_of_day(value: &str) -> Option<u32> {
+    let (hour, minute) = value.trim().split_once(':')?;
+    let hour: u32 = hour.parse().ok()?;
+    let minute: u32 = minute.parse().ok()?;
+    if hour >= 24 || minute >= 60 {
+        return None;
+    }
+    Some(hour * 60 + minute)
+}
+
+pub fn format_time_of_day(minutes: u32) -> String {
+    let minutes = minutes.min(MINUTES_PER_DAY - 1);
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// Persisted Do Not Disturb state.
+///
+/// `until` and `override_until` are UTC seconds since the Unix epoch. The
+/// recurring schedule stays in local wall-clock time; see [`QuietHours`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoNotDisturbSettings {
+    pub mode: DoNotDisturbMode,
+    /// End of a timed manual DND period. `None` with `mode == On` is indefinite.
+    pub until: Option<u64>,
+    /// While set and in the future, a recurring quiet period is skipped. The
+    /// schedule resumes at the next start time.
+    pub override_until: Option<u64>,
+    pub schedule: QuietHours,
+}
+
+impl Default for DoNotDisturbSettings {
+    fn default() -> Self {
+        Self {
+            mode: DoNotDisturbMode::Off,
+            until: None,
+            override_until: None,
+            schedule: QuietHours::default(),
+        }
+    }
+}
+
+impl DoNotDisturbSettings {
+    pub fn normalize(&mut self) {
+        self.schedule.normalize();
+        match self.mode {
+            DoNotDisturbMode::Off => {
+                self.until = None;
+                self.override_until = None;
+            }
+            DoNotDisturbMode::On => {
+                self.override_until = None;
+            }
+            DoNotDisturbMode::Scheduled => {
+                self.until = None;
+            }
+        }
+    }
+
+    pub fn is_active(&self, now: SystemTime) -> bool {
+        match self.mode {
+            DoNotDisturbMode::Off => false,
+            DoNotDisturbMode::On => self.until.is_none_or(|until| unix_seconds(now) < until),
+            DoNotDisturbMode::Scheduled => {
+                if self
+                    .override_until
+                    .is_some_and(|until| unix_seconds(now) < until)
+                {
+                    return false;
+                }
+                self.schedule.is_quiet_at(now)
+            }
+        }
+    }
+
+    /// True while the recurring schedule itself is silencing notifications.
+    /// Manual timed DND and quiet-hour overrides both return false.
+    pub fn schedule_is_active(&self, now: SystemTime) -> bool {
+        self.mode == DoNotDisturbMode::Scheduled && self.is_active(now)
+    }
+
+    pub fn follows_schedule(&self) -> bool {
+        self.mode == DoNotDisturbMode::Scheduled
+    }
+
+    pub fn wake_time(&self) -> &str {
+        &self.schedule.end
+    }
+
+    pub fn next_transition(&self, now: SystemTime) -> Option<SystemTime> {
+        let active = self.is_active(now);
+        let mut candidates: Vec<SystemTime> = Vec::new();
+        if self.mode == DoNotDisturbMode::On {
+            candidates.extend(self.until_time());
+        }
+        if self.mode == DoNotDisturbMode::Scheduled {
+            candidates.extend(self.override_time());
+            candidates.extend(self.schedule.next_start(now));
+            candidates.extend(self.schedule.next_end(now));
+        }
+        candidates.retain(|candidate| *candidate > now);
+        candidates.sort();
+        candidates
+            .into_iter()
+            .find(|candidate| self.is_active(*candidate) != active)
+    }
+
+    pub fn status_text(&self, now: SystemTime) -> String {
+        match self.mode {
+            DoNotDisturbMode::Off => "Off".to_string(),
+            DoNotDisturbMode::On => match self.until_time() {
+                None => "On until you turn it off".to_string(),
+                Some(until) if until > now => format!(
+                    "On until {} ({})",
+                    format_local_point(until, now),
+                    format_remaining(until, now)
+                ),
+                Some(_) => "Off".to_string(),
+            },
+            DoNotDisturbMode::Scheduled => {
+                if let Some(until) = self.override_time().filter(|until| *until > now) {
+                    return format!(
+                        "Quiet hours skipped until {}",
+                        format_local_point(until, now)
+                    );
+                }
+                if self.schedule.is_quiet_at(now) {
+                    return match self.schedule.next_end(now) {
+                        Some(end) => format!(
+                            "Quiet hours until {} ({})",
+                            format_local_point(end, now),
+                            format_remaining(end, now)
+                        ),
+                        None => "Quiet hours on".to_string(),
+                    };
+                }
+                match self.schedule.next_start(now) {
+                    Some(start) => {
+                        format!("Quiet hours from {}", format_local_point(start, now))
+                    }
+                    None => "Quiet hours have no active days".to_string(),
+                }
+            }
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match self.mode {
+            DoNotDisturbMode::Off => "off".to_string(),
+            DoNotDisturbMode::On => "on until turned off".to_string(),
+            DoNotDisturbMode::Scheduled => {
+                format!("quiet hours {}", self.schedule.summary())
+            }
+        }
+    }
+
+    pub fn set_off(&mut self) -> bool {
+        if self.mode == DoNotDisturbMode::Off
+            && self.until.is_none()
+            && self.override_until.is_none()
+        {
+            return false;
+        }
+        self.mode = DoNotDisturbMode::Off;
+        self.until = None;
+        self.override_until = None;
+        true
+    }
+
+    pub fn set_indefinite(&mut self) -> bool {
+        if self.mode == DoNotDisturbMode::On
+            && self.until.is_none()
+            && self.override_until.is_none()
+        {
+            return false;
+        }
+        self.mode = DoNotDisturbMode::On;
+        self.until = None;
+        self.override_until = None;
+        true
+    }
+
+    pub fn set_until(&mut self, until: SystemTime) -> bool {
+        let until = unix_seconds(until);
+        if self.mode == DoNotDisturbMode::On
+            && self.until == Some(until)
+            && self.override_until.is_none()
+        {
+            return false;
+        }
+        self.mode = DoNotDisturbMode::On;
+        self.until = Some(until);
+        self.override_until = None;
+        true
+    }
+
+    pub fn set_scheduled(&mut self) -> bool {
+        if self.mode == DoNotDisturbMode::Scheduled
+            && self.until.is_none()
+            && self.override_until.is_none()
+        {
+            return false;
+        }
+        self.mode = DoNotDisturbMode::Scheduled;
+        self.until = None;
+        self.override_until = None;
+        true
+    }
+
+    /// Skips the currently active quiet period until its next start. Returns
+    /// false when no recurring quiet period is active right now.
+    pub fn override_current_period(&mut self, now: SystemTime) -> bool {
+        if self.mode != DoNotDisturbMode::Scheduled || !self.schedule.is_quiet_at(now) {
+            return false;
+        }
+        let Some(next_start) = self.schedule.next_start(now) else {
+            return false;
+        };
+        let next_start = unix_seconds(next_start);
+        if self.override_until == Some(next_start) {
+            return false;
+        }
+        self.override_until = Some(next_start);
+        true
+    }
+
+    /// Clears expired timers. Returns true when the persisted state changed.
+    pub fn expire(&mut self, now: SystemTime) -> bool {
+        let now = unix_seconds(now);
+        let mut changed = false;
+        if self.until.is_some_and(|until| now >= until) {
+            self.until = None;
+            if self.mode == DoNotDisturbMode::On {
+                self.mode = DoNotDisturbMode::Off;
+            }
+            changed = true;
+        }
+        if self.override_until.is_some_and(|until| now >= until) {
+            self.override_until = None;
+            changed = true;
+        }
+        if self.mode != DoNotDisturbMode::Scheduled && self.override_until.is_some() {
+            self.override_until = None;
+            changed = true;
+        }
+        if self.mode != DoNotDisturbMode::On && self.until.is_some() {
+            self.until = None;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Next occurrence of the quiet-hours end time, used by `--dnd tomorrow`
+    /// and the "Until tomorrow" preset. Falls back to tomorrow at the default
+    /// wake time when the schedule is malformed.
+    pub fn until_tomorrow(&self, now: SystemTime) -> SystemTime {
+        if let Some(end) = self.schedule.next_end(now) {
+            return end;
+        }
+        let end = self
+            .schedule
+            .end_minutes()
+            .unwrap_or(DEFAULT_DND_WAKE_MINUTES);
+        local_now(now)
+            .and_then(|local| local_time_at(local.day_number + 1, end))
+            .unwrap_or_else(|| now + Duration::from_secs(24 * 60 * 60))
+    }
+
+    fn until_time(&self) -> Option<SystemTime> {
+        self.until
+            .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+    }
+
+    fn override_time(&self) -> Option<SystemTime> {
+        self.override_until
+            .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+    }
+}
+
+impl Serialize for DoNotDisturbSettings {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Persisted<'a> {
+            mode: DoNotDisturbMode,
+            until: Option<u64>,
+            override_until: Option<u64>,
+            schedule: &'a QuietHours,
+        }
+        Persisted {
+            mode: self.mode,
+            until: self.until,
+            override_until: self.override_until,
+            schedule: &self.schedule,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DoNotDisturbSettings {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Persisted {
+            mode: DoNotDisturbMode,
+            until: Option<u64>,
+            override_until: Option<u64>,
+            schedule: QuietHours,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            /// Settings written before scheduling landed stored a plain bool.
+            Legacy(bool),
+            Current(Persisted),
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Legacy(true) => Self {
+                mode: DoNotDisturbMode::On,
+                ..Self::default()
+            },
+            Repr::Legacy(false) => Self::default(),
+            Repr::Current(persisted) => Self {
+                mode: persisted.mode,
+                until: persisted.until,
+                override_until: persisted.override_until,
+                schedule: persisted.schedule,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalDateTime {
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    /// Days since 1970-01-01 in the local calendar.
+    day_number: i64,
+    /// Monday is 0, Sunday is 6.
+    weekday: usize,
+}
+
+fn unix_seconds(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn local_now(now: SystemTime) -> Option<LocalDateTime> {
+    let seconds = i64::try_from(unix_seconds(now)).ok()?;
+    let seconds: libc::time_t = seconds as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::localtime_r(&seconds, &mut tm) };
+    if result.is_null() {
+        return None;
+    }
+    let year = i64::from(tm.tm_year) + 1900;
+    let month = u32::try_from(tm.tm_mon + 1).ok()?;
+    let day = u32::try_from(tm.tm_mday).ok()?;
+    Some(LocalDateTime {
+        year,
+        month,
+        day,
+        hour: u32::try_from(tm.tm_hour).ok()?,
+        minute: u32::try_from(tm.tm_min).ok()?,
+        day_number: days_from_civil(year, month, day),
+        weekday: (usize::try_from(tm.tm_wday).ok()? + 6) % 7,
+    })
+}
+
+/// Resolves a local wall-clock instant through libc's `mktime`, which applies
+/// the desktop timezone and DST rules. A time that falls in a DST gap is
+/// normalized forward by libc; an ambiguous repeated time resolves to the
+/// first occurrence.
+fn local_time_at(day_number: i64, minutes: u32) -> Option<SystemTime> {
+    let (year, month, day) = civil_from_days(day_number);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = i32::try_from(year - 1900).ok()?;
+    tm.tm_mon = i32::try_from(month).ok()? - 1;
+    tm.tm_mday = i32::try_from(day).ok()?;
+    tm.tm_hour = i32::try_from(minutes / 60).ok()?;
+    tm.tm_min = i32::try_from(minutes % 60).ok()?;
+    tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    let seconds = unsafe { libc::mktime(&mut tm) };
+    if seconds == -1 {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(Duration::from_secs(u64::try_from(seconds).ok()?))
+}
+
+fn weekday_for_day(day_number: i64) -> usize {
+    (day_number + 3).rem_euclid(7) as usize
+}
+
+fn format_local_point(target: SystemTime, now: SystemTime) -> String {
+    let (Some(target), Some(now)) = (local_now(target), local_now(now)) else {
+        return format_timestamp(target);
+    };
+    let time = format!("{:02}:{:02}", target.hour, target.minute);
+    if target.day_number == now.day_number {
+        return time;
+    }
+    if target.day_number == now.day_number + 1 {
+        return format!("tomorrow {time}");
+    }
+    let month = MONTH_NAMES
+        .get(target.month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("?");
+    if target.year == now.year {
+        format!("{month} {} {time}", target.day)
+    } else {
+        format!("{month} {} {} {time}", target.day, target.year)
+    }
+}
+
+fn format_remaining(target: SystemTime, now: SystemTime) -> String {
+    let seconds = target.duration_since(now).unwrap_or_default().as_secs();
+    if seconds < 60 {
+        return "less than 1m left".to_string();
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m left");
+    }
+    let hours = minutes / 60;
+    let minutes = minutes % 60;
+    if hours < 24 {
+        if minutes == 0 {
+            return format!("{hours}h left");
+        }
+        return format!("{hours}h {minutes}m left");
+    }
+    let days = hours / 24;
+    let hours = hours % 24;
+    if hours == 0 {
+        format!("{days}d left")
+    } else {
+        format!("{days}d {hours}h left")
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
@@ -953,7 +1779,7 @@ pub struct Settings {
     pub zoom: f64,
     pub notifications: bool,
     pub connection_notifications: bool,
-    pub do_not_disturb: bool,
+    pub do_not_disturb: DoNotDisturbSettings,
     pub close_to_tray: bool,
     pub start_at_login: bool,
     pub automatic_update_checks: bool,
@@ -964,12 +1790,30 @@ pub struct Settings {
     pub downloads_directory: Option<String>,
     pub downloads_account_folders: bool,
     pub downloads_date_folders: bool,
+    /// Enables the injected media action menu. It is experimental because it
+    /// depends on WhatsApp Web's markup, and it is always limited to media the
+    /// signed-in page already decrypted and displayed.
+    pub media_actions: bool,
     pub remember_bounds: bool,
     pub shortcut: String,
     pub boss_key: String,
+    /// Optional global shortcut that opens the command palette. Empty means the
+    /// palette is only reachable from inside the native window.
+    pub command_palette_shortcut: String,
     pub lock: LockSettings,
     pub writing: WritingSettings,
     pub network: NetworkSettings,
+    pub memory: MemorySettings,
+    /// Experimental WhatsApp Web CSS. Missing fields in older settings files
+    /// fall back to the disabled default.
+    pub appearance: AppearanceSettings,
+    /// Whether the user finished or skipped the first-run guide. It is
+    /// persisted so the guide is shown only once; Settings > General can
+    /// reopen it at any time without changing this value.
+    pub onboarding_completed: bool,
+    /// Version of the guide that was last completed or skipped. Reserved for
+    /// future releases that need to present a new page to existing users.
+    pub onboarding_version: u32,
 }
 
 impl Default for Settings {
@@ -982,7 +1826,7 @@ impl Default for Settings {
             zoom: 1.0,
             notifications: true,
             connection_notifications: true,
-            do_not_disturb: false,
+            do_not_disturb: DoNotDisturbSettings::default(),
             close_to_tray: true,
             start_at_login: false,
             automatic_update_checks: true,
@@ -991,12 +1835,18 @@ impl Default for Settings {
             downloads_directory: None,
             downloads_account_folders: true,
             downloads_date_folders: false,
+            media_actions: true,
             remember_bounds: true,
             shortcut: DEFAULT_SHORTCUT.to_string(),
             boss_key: DEFAULT_BOSS_KEY.to_string(),
+            command_palette_shortcut: String::new(),
             lock: LockSettings::default(),
             writing: WritingSettings::default(),
             network: NetworkSettings::default(),
+            memory: MemorySettings::default(),
+            appearance: AppearanceSettings::default(),
+            onboarding_completed: false,
+            onboarding_version: 0,
         }
     }
 }
@@ -1077,11 +1927,20 @@ impl Settings {
                 DEFAULT_BOSS_KEY.to_string()
             };
         }
+        self.command_palette_shortcut = self.command_palette_shortcut.trim().to_string();
+        if !self.command_palette_shortcut.is_empty()
+            && crate::shortcut::Shortcut::parse(&self.command_palette_shortcut).is_err()
+        {
+            self.command_palette_shortcut.clear();
+        }
         self.lock.idle_minutes = self.lock.idle_minutes.min(240);
         if self.lock.hash.is_none() {
             self.lock.enabled = false;
         }
+        self.memory.normalize();
         self.writing.normalize();
+        self.do_not_disturb.normalize();
+        self.appearance.normalize();
         self.network.proxy.manual.normalize();
         if let Some(directory) = self.downloads_directory.take() {
             self.downloads_directory = crate::paths::valid_directory_setting(&directory)
@@ -1105,6 +1964,14 @@ impl Settings {
             return true;
         }
         false
+    }
+
+    /// Records that the first-run guide was finished, skipped, or dismissed.
+    /// Every way of leaving the guide goes through this method, so it opens
+    /// only once for a new installation.
+    pub fn mark_onboarding_completed(&mut self) {
+        self.onboarding_completed = true;
+        self.onboarding_version = ONBOARDING_VERSION;
     }
 
     pub fn account(&self, id: &str) -> Option<&Account> {
@@ -1182,35 +2049,56 @@ impl Settings {
     }
 
     pub fn set_do_not_disturb(&mut self, enabled: bool) -> bool {
-        if self.do_not_disturb == enabled {
-            return false;
+        if enabled {
+            self.do_not_disturb.set_indefinite()
+        } else {
+            self.do_not_disturb.set_off()
         }
-        self.do_not_disturb = enabled;
-        true
     }
 
-    /// A muted account or the global do-not-disturb mode suppresses message
-    /// notifications. Download, crash, and error notifications are unaffected.
+    /// A muted account, the global Do Not Disturb state, or the recurring
+    /// quiet-hours schedule suppresses message notifications. Download, crash,
+    /// and error notifications use their own gates; the unread counters and the
+    /// tray badge keep updating in every case.
     pub fn message_notifications_enabled(&self, account_id: &str) -> bool {
+        self.message_notifications_enabled_at(account_id, SystemTime::now())
+    }
+
+    pub fn message_notifications_enabled_at(&self, account_id: &str, now: SystemTime) -> bool {
         self.notifications
-            && !self.do_not_disturb
+            && !self.do_not_disturb.is_active(now)
             && self
                 .account(account_id)
                 .is_some_and(|account| !account.muted)
     }
 
     pub fn notification_sound_enabled(&self, account_id: &str) -> bool {
-        self.message_notifications_enabled(account_id)
+        self.notification_sound_enabled_at(account_id, SystemTime::now())
+    }
+
+    pub fn notification_sound_enabled_at(&self, account_id: &str, now: SystemTime) -> bool {
+        self.message_notifications_enabled_at(account_id, now)
             && self
                 .account(account_id)
                 .is_some_and(|account| account.notification_sound)
     }
 
     /// Connection notifications are opt-in on top of the global notification
-    /// switch and obey the same do-not-disturb and per-account mute rules as
-    /// message notifications.
+    /// switch and obey the same Do Not Disturb, quiet-hours, and per-account
+    /// mute rules as message notifications.
     pub fn connection_notifications_enabled(&self, account_id: &str) -> bool {
-        self.connection_notifications && self.message_notifications_enabled(account_id)
+        self.connection_notifications_enabled_at(account_id, SystemTime::now())
+    }
+
+    pub fn connection_notifications_enabled_at(&self, account_id: &str, now: SystemTime) -> bool {
+        self.connection_notifications && self.message_notifications_enabled_at(account_id, now)
+    }
+
+    /// Native notifications that only depend on the global toggle, such as
+    /// download progress, use this alongside the Do Not Disturb check in
+    /// `notify::notifications_allowed`.
+    pub fn native_notifications_enabled_at(&self, now: SystemTime) -> bool {
+        self.notifications && !self.do_not_disturb.is_active(now)
     }
 
     pub fn set_zoom(&mut self, zoom: f64) -> bool {
@@ -1246,6 +2134,18 @@ pub fn clamp_zoom(zoom: f64) -> f64 {
         return 1.0;
     }
     zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// Decides whether the first-run guide should open at startup.
+///
+/// `fresh_install` is true only when no settings file existed before this
+/// launch. It is deliberately separate from the account list: `normalize()`
+/// always creates a first account, so an empty list cannot distinguish a new
+/// installation from an existing one. Older settings files have neither
+/// onboarding field and deserialize to `false`; the missing settings file
+/// check keeps them from being interrupted by a guide they never asked for.
+pub fn should_show_onboarding(settings: &Settings, fresh_install: bool) -> bool {
+    !settings.onboarding_completed && (fresh_install || settings.accounts.is_empty())
 }
 
 /// Portable settings document written by "Export settings" and read by
@@ -1302,6 +2202,8 @@ impl SettingsExport {
         let mut settings = self.settings;
         scrub_lock_password(&mut settings);
         scrub_proxy_credentials(&mut settings);
+        scrub_custom_css(&mut settings);
+        scrub_do_not_disturb_runtime(&mut settings);
         settings.normalize();
         Ok(settings)
     }
@@ -1327,10 +2229,31 @@ fn scrub_proxy_credentials(settings: &mut Settings) {
     settings.network.proxy.manual.password.clear();
 }
 
+/// Experimental CSS is machine-specific and can embed large data URIs, so it
+/// never travels through an export or an import. Keeping the enable flag
+/// without the stylesheet would be misleading, so both are cleared.
+fn scrub_custom_css(settings: &mut Settings) {
+    settings.appearance = AppearanceSettings::default();
+}
+
+/// A timed DND countdown and a "skip this period" override are runtime state,
+/// not portable preferences. The recurring quiet-hours configuration is kept
+/// so an imported export restores the user's schedule without unexpectedly
+/// starting a countdown on the new machine.
+fn scrub_do_not_disturb_runtime(settings: &mut Settings) {
+    settings.do_not_disturb.until = None;
+    settings.do_not_disturb.override_until = None;
+    if settings.do_not_disturb.mode == DoNotDisturbMode::On {
+        settings.do_not_disturb.mode = DoNotDisturbMode::Off;
+    }
+}
+
 fn exportable_settings(settings: &Settings) -> Settings {
     let mut settings = settings.clone();
     scrub_lock_password(&mut settings);
     scrub_proxy_credentials(&mut settings);
+    scrub_custom_css(&mut settings);
+    scrub_do_not_disturb_runtime(&mut settings);
     for account in &mut settings.accounts {
         account.unread = 0;
         account.bounds = None;
@@ -1388,6 +2311,12 @@ fn describe_changes(current: &Settings, imported: &Settings) -> Vec<String> {
             percent(imported.zoom)
         ));
     }
+    if current.appearance != imported.appearance {
+        changes.push(format!(
+            "Experimental CSS: {} (custom CSS is never imported)",
+            on_off(imported.appearance.experimental_css)
+        ));
+    }
     if current.notifications != imported.notifications {
         changes.push(format!(
             "Desktop notifications: {}",
@@ -1400,10 +2329,10 @@ fn describe_changes(current: &Settings, imported: &Settings) -> Vec<String> {
             on_off(imported.connection_notifications)
         ));
     }
-    if current.do_not_disturb != imported.do_not_disturb {
+    if current.do_not_disturb.summary() != imported.do_not_disturb.summary() {
         changes.push(format!(
             "Do not disturb: {}",
-            on_off(imported.do_not_disturb)
+            imported.do_not_disturb.summary()
         ));
     }
     if current.close_to_tray != imported.close_to_tray {
@@ -1421,6 +2350,12 @@ fn describe_changes(current: &Settings, imported: &Settings) -> Vec<String> {
             on_off(imported.remember_bounds)
         ));
     }
+    if current.media_actions != imported.media_actions {
+        changes.push(format!(
+            "Media action menu: {}",
+            on_off(imported.media_actions)
+        ));
+    }
     if current.shortcut != imported.shortcut {
         changes.push(format!(
             "Global shortcut: {} -> {}",
@@ -1431,6 +2366,26 @@ fn describe_changes(current: &Settings, imported: &Settings) -> Vec<String> {
         changes.push(format!(
             "Boss key: {} -> {}",
             current.boss_key, imported.boss_key
+        ));
+    }
+    if current.command_palette_shortcut != imported.command_palette_shortcut {
+        changes.push(format!(
+            "Command palette shortcut: {} -> {}",
+            optional_shortcut(&current.command_palette_shortcut),
+            optional_shortcut(&imported.command_palette_shortcut)
+        ));
+    }
+    if current.memory != imported.memory {
+        changes.push(format!(
+            "Low-memory mode: {}",
+            if imported.memory.suspend_hidden {
+                format!(
+                    "release hidden accounts after {} min",
+                    imported.memory.suspend_after_minutes
+                )
+            } else {
+                "off".to_string()
+            }
         ));
     }
     if current.network.proxy.redacted_summary() != imported.network.proxy.redacted_summary() {
@@ -1465,6 +2420,10 @@ fn percent(zoom: f64) -> u32 {
 
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
+}
+
+fn optional_shortcut(value: &str) -> &str {
+    if value.is_empty() { "off" } else { value }
 }
 
 fn account_names(settings: &Settings) -> Vec<String> {
@@ -1565,6 +2524,23 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     };
     let year = if month <= 2 { year + 1 } else { year };
     (year, month as u32, day as u32)
+}
+
+/// Converts a proleptic Gregorian date to days since the Unix epoch.
+/// Howard Hinnant's `days_from_civil` algorithm; the inverse of
+/// [`civil_from_days`].
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - if month <= 2 { 1 } else { 0 };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_prime = if month > 2 {
+        i64::from(month) - 3
+    } else {
+        i64::from(month) + 9
+    };
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// Coalesces many settings changes into one debounced write.
@@ -1684,6 +2660,31 @@ impl SettingsWriter {
 mod tests {
     use super::*;
 
+    fn at(year: i64, month: u32, day: u32, hour: u32, minute: u32) -> SystemTime {
+        local_time_at(days_from_civil(year, month, day), hour * 60 + minute)
+            .expect("a valid local time")
+    }
+
+    fn quiet_hours(start: &str, end: &str, days: [bool; 7]) -> DoNotDisturbSettings {
+        DoNotDisturbSettings {
+            mode: DoNotDisturbMode::Scheduled,
+            until: None,
+            override_until: None,
+            schedule: QuietHours {
+                start: start.to_string(),
+                end: end.to_string(),
+                days,
+            },
+        }
+    }
+
+    fn indefinite() -> DoNotDisturbSettings {
+        DoNotDisturbSettings {
+            mode: DoNotDisturbMode::On,
+            ..DoNotDisturbSettings::default()
+        }
+    }
+
     #[test]
     fn defaults_are_valid() {
         let settings = Settings::default();
@@ -1691,9 +2692,96 @@ mod tests {
         assert_eq!(settings.zoom, 1.0);
         assert!(settings.notifications);
         assert!(settings.connection_notifications);
-        assert!(!settings.do_not_disturb);
+        assert_eq!(settings.do_not_disturb.mode, DoNotDisturbMode::Off);
+        assert_eq!(
+            settings.do_not_disturb.schedule.start,
+            DEFAULT_QUIET_HOURS_START
+        );
+        assert_eq!(
+            settings.do_not_disturb.schedule.end,
+            DEFAULT_QUIET_HOURS_END
+        );
+        assert!(settings.do_not_disturb.schedule.days.iter().all(|day| *day));
         assert!(settings.close_to_tray);
         assert!(!settings.lock.enabled);
+    }
+
+    #[test]
+    fn low_memory_mode_is_off_by_default() {
+        let settings = Settings::default();
+        assert!(!settings.memory.suspend_hidden);
+        assert_eq!(
+            settings.memory.suspend_after_minutes,
+            DEFAULT_SUSPEND_MINUTES
+        );
+        assert!(settings.memory.keep_active_account);
+        assert_eq!(settings.memory.suspend_after(), None);
+    }
+
+    #[test]
+    fn legacy_settings_without_memory_use_the_conservative_defaults() {
+        let json = br#"{"version":1,"accounts":[]}"#;
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+
+        assert!(!settings.memory.suspend_hidden);
+        assert_eq!(
+            settings.memory.suspend_after_minutes,
+            DEFAULT_SUSPEND_MINUTES
+        );
+        assert!(settings.memory.keep_active_account);
+    }
+
+    #[test]
+    fn memory_delay_is_normalized_to_a_supported_range() {
+        let mut memory = MemorySettings {
+            suspend_hidden: true,
+            suspend_after_minutes: 0,
+            keep_active_account: true,
+        };
+        memory.normalize();
+        assert_eq!(memory.suspend_after_minutes, DEFAULT_SUSPEND_MINUTES);
+
+        memory.suspend_after_minutes = 1;
+        memory.normalize();
+        assert_eq!(memory.suspend_after_minutes, MIN_SUSPEND_MINUTES);
+
+        memory.suspend_after_minutes = 999;
+        memory.normalize();
+        assert_eq!(memory.suspend_after_minutes, MAX_SUSPEND_MINUTES);
+    }
+
+    #[test]
+    fn enabled_memory_mode_reports_the_suspend_delay() {
+        let memory = MemorySettings {
+            suspend_hidden: true,
+            suspend_after_minutes: 15,
+            keep_active_account: true,
+        };
+
+        assert_eq!(memory.suspend_after(), Some(Duration::from_secs(15 * 60)));
+
+        let disabled = MemorySettings {
+            suspend_hidden: false,
+            ..memory
+        };
+        assert_eq!(disabled.suspend_after(), None);
+    }
+
+    #[test]
+    fn memory_settings_round_trip() {
+        let memory = MemorySettings {
+            suspend_hidden: true,
+            suspend_after_minutes: 60,
+            keep_active_account: false,
+        };
+
+        let json = serde_json::to_string(&memory).unwrap();
+        assert!(json.contains("\"suspend_hidden\":true"));
+        assert!(json.contains("\"suspend_after_minutes\":60"));
+        assert!(json.contains("\"keep_active_account\":false"));
+
+        let loaded: MemorySettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, memory);
     }
 
     #[test]
@@ -1728,6 +2816,25 @@ mod tests {
         settings.shortcut = DEFAULT_BOSS_KEY.to_string();
         settings.normalize();
         assert_eq!(settings.boss_key, DEFAULT_SHORTCUT);
+    }
+
+    #[test]
+    fn the_command_palette_shortcut_is_optional_and_normalized() {
+        let mut settings = Settings::default();
+        assert!(settings.command_palette_shortcut.is_empty());
+
+        settings.command_palette_shortcut = "  Ctrl+K  ".to_string();
+        settings.normalize();
+        assert_eq!(settings.command_palette_shortcut, "Ctrl+K");
+
+        settings.command_palette_shortcut = "not a shortcut".to_string();
+        settings.normalize();
+        assert!(settings.command_palette_shortcut.is_empty());
+    }
+
+    #[test]
+    fn zoom_levels_keep_the_settings_ui_presets() {
+        assert_eq!(ZOOM_LEVELS, [0.8, 0.9, 1.0, 1.1, 1.25, 1.5]);
     }
 
     #[test]
@@ -1790,6 +2897,240 @@ mod tests {
     }
 
     #[test]
+    fn legacy_boolean_do_not_disturb_still_loads() {
+        let json = br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"do_not_disturb":true}"#;
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+        assert_eq!(settings.do_not_disturb.mode, DoNotDisturbMode::On);
+        assert!(settings.do_not_disturb.until.is_none());
+
+        let json = br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"do_not_disturb":false}"#;
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+        assert_eq!(settings.do_not_disturb.mode, DoNotDisturbMode::Off);
+    }
+
+    #[test]
+    fn manual_do_not_disturb_modes_and_expiry() {
+        let now = at(2026, 11, 12, 12, 0);
+
+        assert!(!DoNotDisturbSettings::default().is_active(now));
+
+        let dnd = indefinite();
+        assert!(dnd.is_active(now));
+        assert_eq!(dnd.next_transition(now), None);
+        assert!(dnd.status_text(now).contains("turn it off"));
+
+        let until = now + Duration::from_secs(60 * 60);
+        let mut dnd = DoNotDisturbSettings::default();
+        assert!(dnd.set_until(until));
+        assert!(dnd.is_active(now));
+        assert_eq!(dnd.next_transition(now), Some(until));
+        assert!(dnd.status_text(now).contains("1h left"));
+        assert!(!dnd.is_active(until));
+        assert!(dnd.expire(until));
+        assert_eq!(dnd.mode, DoNotDisturbMode::Off);
+        assert!(dnd.until.is_none());
+        assert!(!dnd.is_active(until));
+    }
+
+    #[test]
+    fn same_day_quiet_hours_have_exact_boundaries() {
+        let dnd = quiet_hours("09:00", "17:00", EVERY_DAY);
+        let day = (2026, 11, 12);
+
+        assert!(!dnd.is_active(at(day.0, day.1, day.2, 8, 59)));
+        assert!(dnd.is_active(at(day.0, day.1, day.2, 9, 0)));
+        assert!(dnd.is_active(at(day.0, day.1, day.2, 16, 59)));
+        assert!(!dnd.is_active(at(day.0, day.1, day.2, 17, 0)));
+
+        let before = at(day.0, day.1, day.2, 8, 59);
+        assert_eq!(
+            dnd.next_transition(before),
+            Some(at(day.0, day.1, day.2, 9, 0))
+        );
+        let inside = at(day.0, day.1, day.2, 12, 0);
+        assert_eq!(
+            dnd.next_transition(inside),
+            Some(at(day.0, day.1, day.2, 17, 0))
+        );
+        let at_end = at(day.0, day.1, day.2, 17, 0);
+        assert_eq!(
+            dnd.next_transition(at_end),
+            Some(at(day.0, day.1, day.2 + 1, 9, 0))
+        );
+    }
+
+    #[test]
+    fn overnight_quiet_hours_wrap_midnight() {
+        let dnd = quiet_hours("22:00", "07:00", EVERY_DAY);
+
+        assert!(!dnd.is_active(at(2026, 11, 13, 21, 59)));
+        assert!(dnd.is_active(at(2026, 11, 13, 22, 0)));
+        assert!(dnd.is_active(at(2026, 11, 13, 23, 30)));
+        assert!(dnd.is_active(at(2026, 11, 14, 0, 0)));
+        assert!(dnd.is_active(at(2026, 11, 14, 6, 59)));
+        assert!(!dnd.is_active(at(2026, 11, 14, 7, 0)));
+
+        let late = at(2026, 11, 13, 23, 30);
+        assert_eq!(dnd.next_transition(late), Some(at(2026, 11, 14, 7, 0)));
+        let morning = at(2026, 11, 14, 7, 0);
+        assert_eq!(dnd.next_transition(morning), Some(at(2026, 11, 14, 22, 0)));
+    }
+
+    #[test]
+    fn quiet_hours_respect_selected_days_and_weekends() {
+        let weekend = quiet_hours("09:00", "17:00", WEEKENDS);
+        assert!(!weekend.is_active(at(2026, 11, 13, 10, 0)));
+        assert!(weekend.is_active(at(2026, 11, 14, 10, 0)));
+        assert!(weekend.is_active(at(2026, 11, 15, 10, 0)));
+        assert!(!weekend.is_active(at(2026, 11, 16, 10, 0)));
+        assert_eq!(
+            weekend.next_transition(at(2026, 11, 13, 10, 0)),
+            Some(at(2026, 11, 14, 9, 0))
+        );
+
+        // An overnight weekday window starts on Friday and reaches Saturday
+        // morning; Saturday night is not selected, so Sunday morning is quiet
+        // only if Sunday itself is a start day.
+        let weekdays = quiet_hours("22:00", "07:00", WEEKDAYS);
+        assert!(weekdays.is_active(at(2026, 11, 13, 23, 0)));
+        assert!(weekdays.is_active(at(2026, 11, 14, 1, 0)));
+        assert!(!weekdays.is_active(at(2026, 11, 14, 23, 0)));
+        assert!(!weekdays.is_active(at(2026, 11, 15, 1, 0)));
+        assert!(!weekdays.is_active(at(2026, 11, 16, 1, 0)));
+        assert!(weekdays.is_active(at(2026, 11, 16, 23, 0)));
+    }
+
+    #[test]
+    fn a_disabled_schedule_never_activates() {
+        let now = at(2026, 11, 13, 23, 0);
+        let dnd = DoNotDisturbSettings::default();
+        assert!(!dnd.is_active(now));
+        assert_eq!(dnd.next_transition(now), None);
+
+        let empty = quiet_hours("22:00", "07:00", [false; 7]);
+        assert!(!empty.is_active(now));
+        assert_eq!(empty.next_transition(now), None);
+        assert!(empty.status_text(now).contains("no active days"));
+    }
+
+    #[test]
+    fn manual_override_skips_one_quiet_period() {
+        let mut dnd = quiet_hours("22:00", "07:00", EVERY_DAY);
+        let friday_night = at(2026, 11, 13, 23, 0);
+
+        assert!(dnd.is_active(friday_night));
+        assert!(dnd.override_current_period(friday_night));
+        assert!(!dnd.is_active(friday_night));
+        assert!(dnd.status_text(friday_night).contains("skipped"));
+        assert_eq!(
+            dnd.next_transition(friday_night),
+            Some(at(2026, 11, 14, 22, 0))
+        );
+
+        assert!(dnd.is_active(at(2026, 11, 14, 22, 0)));
+        assert!(dnd.expire(at(2026, 11, 14, 22, 0)));
+        assert!(dnd.override_until.is_none());
+    }
+
+    #[test]
+    fn until_tomorrow_uses_the_quiet_hours_end_time() {
+        let dnd = quiet_hours("22:00", "07:00", EVERY_DAY);
+        assert_eq!(
+            dnd.until_tomorrow(at(2026, 11, 12, 10, 0)),
+            at(2026, 11, 13, 7, 0)
+        );
+        assert_eq!(
+            dnd.until_tomorrow(at(2026, 11, 13, 2, 0)),
+            at(2026, 11, 13, 7, 0)
+        );
+
+        let fallback = DoNotDisturbSettings::default();
+        assert_eq!(
+            fallback.until_tomorrow(at(2026, 11, 12, 10, 0)),
+            at(2026, 11, 13, 7, 0)
+        );
+    }
+
+    #[test]
+    fn schedule_policy_respects_manual_and_global_notification_switches() {
+        let mut settings = Settings::default();
+        settings.ensure_first_account();
+        let id = settings.accounts[0].id.clone();
+        settings.do_not_disturb = quiet_hours("22:00", "07:00", EVERY_DAY);
+
+        let quiet = at(2026, 11, 13, 23, 0);
+        let awake = at(2026, 11, 13, 12, 0);
+
+        assert!(!settings.message_notifications_enabled_at(&id, quiet));
+        assert!(!settings.notification_sound_enabled_at(&id, quiet));
+        assert!(!settings.connection_notifications_enabled_at(&id, quiet));
+        assert!(!settings.native_notifications_enabled_at(quiet));
+
+        assert!(settings.message_notifications_enabled_at(&id, awake));
+        assert!(settings.notification_sound_enabled_at(&id, awake));
+        assert!(settings.connection_notifications_enabled_at(&id, awake));
+        assert!(settings.native_notifications_enabled_at(awake));
+
+        settings.set_muted(&id, true);
+        assert!(!settings.message_notifications_enabled_at(&id, awake));
+        settings.set_muted(&id, false);
+        settings.notifications = false;
+        assert!(!settings.message_notifications_enabled_at(&id, awake));
+        assert!(!settings.native_notifications_enabled_at(awake));
+    }
+
+    #[test]
+    fn quiet_hours_round_trip_and_legacy_export_scrubs_runtime_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings {
+            do_not_disturb: quiet_hours("23:15", "06:45", WEEKDAYS),
+            ..Settings::default()
+        };
+        settings.do_not_disturb.until = Some(1_700_000_000);
+
+        settings.save(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.do_not_disturb.schedule.start, "23:15");
+        assert_eq!(loaded.do_not_disturb.schedule.end, "06:45");
+        assert_eq!(loaded.do_not_disturb.schedule.days, WEEKDAYS);
+
+        let mut timed = quiet_hours("23:15", "06:45", WEEKDAYS);
+        timed.mode = DoNotDisturbMode::On;
+        timed.until = Some(1_700_000_000);
+        timed.override_until = Some(1_700_000_100);
+        settings.do_not_disturb = timed;
+        let export = SettingsExport::new(&settings, UNIX_EPOCH);
+        let json = export.to_json().unwrap();
+        assert!(!json.contains("1700000000"), "{json}");
+        assert!(!json.contains("1700000100"), "{json}");
+        let restored = SettingsExport::from_bytes(json.as_bytes()).unwrap();
+        assert_eq!(restored.do_not_disturb.mode, DoNotDisturbMode::Off);
+        assert!(restored.do_not_disturb.until.is_none());
+        assert!(restored.do_not_disturb.override_until.is_none());
+        assert_eq!(restored.do_not_disturb.schedule.days, WEEKDAYS);
+    }
+
+    #[test]
+    fn time_of_day_parsing_is_strict_but_normalizes_short_hours() {
+        assert_eq!(parse_time_of_day("7:05"), Some(7 * 60 + 5));
+        assert_eq!(parse_time_of_day(" 22:00 "), Some(22 * 60));
+        assert_eq!(parse_time_of_day("24:00"), None);
+        assert_eq!(parse_time_of_day("12:60"), None);
+        assert_eq!(parse_time_of_day("noon"), None);
+        assert_eq!(format_time_of_day(7 * 60 + 5), "07:05");
+
+        let mut quiet = QuietHours {
+            start: "7:00".to_string(),
+            end: "25:00".to_string(),
+            days: EVERY_DAY,
+        };
+        quiet.normalize();
+        assert_eq!(quiet.start, "07:00");
+        assert_eq!(quiet.end, DEFAULT_QUIET_HOURS_END);
+    }
+
+    #[test]
     fn muting_one_account_keeps_the_others_active() {
         let mut settings = Settings {
             accounts: vec![Account::with_id("a", "A"), Account::with_id("b", "B")],
@@ -1808,10 +3149,52 @@ mod tests {
         let json = br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"active_account":"a"}"#;
         let settings: Settings = serde_json::from_slice(json).unwrap();
 
-        assert!(!settings.do_not_disturb);
+        assert_eq!(settings.do_not_disturb.mode, DoNotDisturbMode::Off);
         assert!(settings.connection_notifications);
         assert!(!settings.accounts[0].muted);
         assert!(settings.accounts[0].notification_sound);
+    }
+
+    #[test]
+    fn onboarding_is_shown_once_on_a_fresh_install() {
+        let mut settings = Settings::default();
+        settings.ensure_first_account();
+        assert!(should_show_onboarding(&settings, true));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        settings.mark_onboarding_completed();
+        settings.save(&path).unwrap();
+
+        let loaded = Settings::load(&path).unwrap();
+        assert!(loaded.onboarding_completed);
+        assert_eq!(loaded.onboarding_version, ONBOARDING_VERSION);
+        assert!(!should_show_onboarding(&loaded, true));
+    }
+
+    #[test]
+    fn legacy_settings_have_an_uncompleted_guide_but_are_not_interrupted() {
+        let json = br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"active_account":"a"}"#;
+        let mut settings: Settings = serde_json::from_slice(json).unwrap();
+        settings.normalize();
+
+        assert!(!settings.onboarding_completed);
+        assert_eq!(settings.onboarding_version, 0);
+        assert!(!should_show_onboarding(&settings, false));
+    }
+
+    #[test]
+    fn skipping_the_guide_persists_completion() {
+        let mut settings = Settings::default();
+        settings.ensure_first_account();
+        assert!(should_show_onboarding(&settings, true));
+
+        settings.mark_onboarding_completed();
+
+        assert!(settings.onboarding_completed);
+        assert_eq!(settings.onboarding_version, ONBOARDING_VERSION);
+        assert!(!should_show_onboarding(&settings, true));
+        assert!(!should_show_onboarding(&settings, false));
     }
 
     #[test]
@@ -1819,6 +3202,27 @@ mod tests {
         let settings = Settings::default();
         assert!(settings.automatic_update_checks);
         assert!(settings.skipped_update_version.is_none());
+    }
+
+    #[test]
+    fn media_actions_default_to_enabled_and_round_trip() {
+        let settings = Settings::default();
+        assert!(settings.media_actions);
+
+        let legacy: Settings = serde_json::from_slice(
+            br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"active_account":"a"}"#,
+        )
+        .unwrap();
+        assert!(legacy.media_actions);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.ensure_first_account();
+        settings.media_actions = false;
+        settings.save(&path).unwrap();
+
+        assert!(!Settings::load(&path).unwrap().media_actions);
     }
 
     #[test]
@@ -2328,12 +3732,16 @@ mod tests {
             theme: ThemeMode::Dark,
             zoom: 1.25,
             notifications: false,
-            do_not_disturb: true,
+            do_not_disturb: DoNotDisturbSettings {
+                mode: DoNotDisturbMode::On,
+                ..DoNotDisturbSettings::default()
+            },
             close_to_tray: false,
             start_at_login: true,
             remember_bounds: false,
             shortcut: "Ctrl+Alt+O".to_string(),
             boss_key: "Ctrl+Alt+B".to_string(),
+            command_palette_shortcut: String::new(),
             lock: LockSettings {
                 enabled: true,
                 hash: Some("$argon2id$v=19$m=19456,t=2,p=1$secret$hash".to_string()),
@@ -2376,7 +3784,7 @@ mod tests {
         assert_eq!(restored.theme, ThemeMode::Dark);
         assert_eq!(restored.zoom, 1.25);
         assert!(!restored.notifications);
-        assert!(restored.do_not_disturb);
+        assert_eq!(restored.do_not_disturb.mode, DoNotDisturbMode::Off);
         assert!(!restored.close_to_tray);
         assert!(restored.start_at_login);
         assert!(!restored.remember_bounds);

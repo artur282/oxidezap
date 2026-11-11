@@ -13,29 +13,45 @@ use crate::shortcut::Shortcut;
 pub enum HotkeyAction {
     Toggle,
     BossKey,
+    CommandPalette,
 }
 
-/// The global shortcuts the hotkey thread grabs. A boss key equal to the
-/// show/hide shortcut would never be distinguishable, so it is dropped.
+/// The global shortcuts the hotkey thread grabs. A shortcut that duplicates a
+/// higher-priority binding is dropped because the actions would be
+/// indistinguishable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HotkeyBindings {
     pub toggle: Shortcut,
     pub boss_key: Option<Shortcut>,
+    pub command_palette: Option<Shortcut>,
 }
 
 impl HotkeyBindings {
-    pub fn new(toggle: Shortcut, boss_key: Option<Shortcut>) -> Self {
+    pub fn new(
+        toggle: Shortcut,
+        boss_key: Option<Shortcut>,
+        command_palette: Option<Shortcut>,
+    ) -> Self {
+        let boss_key = boss_key.filter(|boss_key| *boss_key != toggle);
+        let command_palette =
+            command_palette.filter(|shortcut| *shortcut != toggle && Some(*shortcut) != boss_key);
         Self {
             toggle,
-            boss_key: boss_key.filter(|boss_key| *boss_key != toggle),
+            boss_key,
+            command_palette,
         }
     }
 
     fn entries(self) -> impl Iterator<Item = (Shortcut, HotkeyAction)> {
-        std::iter::once((self.toggle, HotkeyAction::Toggle)).chain(
-            self.boss_key
-                .map(|shortcut| (shortcut, HotkeyAction::BossKey)),
-        )
+        std::iter::once((self.toggle, HotkeyAction::Toggle))
+            .chain(
+                self.boss_key
+                    .map(|shortcut| (shortcut, HotkeyAction::BossKey)),
+            )
+            .chain(
+                self.command_palette
+                    .map(|shortcut| (shortcut, HotkeyAction::CommandPalette)),
+            )
     }
 }
 
@@ -89,7 +105,7 @@ pub fn start(shortcut: Shortcut, actions: Sender<HotkeyAction>) -> HotkeyHandle 
         tx,
         _thread: thread,
     };
-    handle.set(HotkeyBindings::new(shortcut, None));
+    handle.set(HotkeyBindings::new(shortcut, None, None));
     handle
 }
 
@@ -105,7 +121,7 @@ fn run(rx: Receiver<Command>, actions: Sender<HotkeyAction>) {
     let min_keycode = conn.setup().min_keycode;
     let max_keycode = conn.setup().max_keycode;
     let mut grabs: Vec<Grab> = Vec::new();
-    let mut current = HotkeyBindings::new(Shortcut::default(), None);
+    let mut current = HotkeyBindings::new(Shortcut::default(), None, None);
 
     loop {
         while let Ok(command) = rx.try_recv() {
@@ -298,24 +314,53 @@ mod tests {
 
     #[test]
     fn bindings_map_each_shortcut_to_its_action() {
-        let bindings =
-            HotkeyBindings::new(shortcut("Ctrl+Shift+W"), Some(shortcut("Ctrl+Shift+H")));
+        let bindings = HotkeyBindings::new(
+            shortcut("Ctrl+Shift+W"),
+            Some(shortcut("Ctrl+Shift+H")),
+            Some(shortcut("Ctrl+Shift+K")),
+        );
         let entries: Vec<(Shortcut, HotkeyAction)> = bindings.entries().collect();
 
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0], (shortcut("Ctrl+Shift+W"), HotkeyAction::Toggle));
         assert_eq!(
             entries[1],
             (shortcut("Ctrl+Shift+H"), HotkeyAction::BossKey)
+        );
+        assert_eq!(
+            entries[2],
+            (shortcut("Ctrl+Shift+K"), HotkeyAction::CommandPalette)
         );
     }
 
     #[test]
     fn a_boss_key_equal_to_the_show_hide_shortcut_is_ignored() {
         let toggle = shortcut("Ctrl+Shift+W");
-        let bindings = HotkeyBindings::new(toggle, Some(toggle));
+        let bindings = HotkeyBindings::new(toggle, Some(toggle), None);
 
         assert_eq!(bindings.boss_key, None);
+        assert_eq!(bindings.entries().count(), 1);
+    }
+
+    #[test]
+    fn a_palette_shortcut_that_duplicates_another_binding_is_ignored() {
+        let toggle = shortcut("Ctrl+Shift+W");
+        let boss = shortcut("Ctrl+Shift+H");
+
+        let bindings = HotkeyBindings::new(toggle, Some(boss), Some(toggle));
+        assert_eq!(bindings.command_palette, None);
+        assert_eq!(bindings.entries().count(), 2);
+
+        let bindings = HotkeyBindings::new(toggle, Some(boss), Some(boss));
+        assert_eq!(bindings.command_palette, None);
+        assert_eq!(bindings.entries().count(), 2);
+    }
+
+    #[test]
+    fn the_global_palette_shortcut_is_optional() {
+        let bindings = HotkeyBindings::new(shortcut("Ctrl+Shift+W"), None, None);
+
+        assert_eq!(bindings.command_palette, None);
         assert_eq!(bindings.entries().count(), 1);
     }
 

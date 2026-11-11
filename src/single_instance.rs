@@ -53,16 +53,9 @@ impl DndMode {
         }
     }
 
-    /// Scheduling belongs to the Do Not Disturb issue. Until it lands, every
-    /// non-`off` value drives the existing `Settings::do_not_disturb` flag.
+    /// Every non-`off` value enables Do Not Disturb.
     pub fn is_enabled(self) -> bool {
         !matches!(self, Self::Off)
-    }
-
-    /// `1h` and `tomorrow` need the scheduling model from the Do Not Disturb
-    /// issue. The CLI warns that they currently stay on until disabled.
-    pub fn is_scheduled(self) -> bool {
-        matches!(self, Self::OneHour | Self::Tomorrow)
     }
 }
 
@@ -647,8 +640,6 @@ mod tests {
         assert!(!DndMode::Off.is_enabled());
         assert!(DndMode::OneHour.is_enabled());
         assert!(DndMode::Tomorrow.is_enabled());
-        assert!(DndMode::OneHour.is_scheduled());
-        assert!(DndMode::Tomorrow.is_scheduled());
         assert_eq!(DndMode::parse("1H"), Some(DndMode::OneHour));
     }
 
