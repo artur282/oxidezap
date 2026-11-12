@@ -3,14 +3,17 @@ use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render,
-    SharedString, StatefulInteractiveElement, Subscription, Timer, Window, div, prelude::*, px,
+    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, Render, SharedString, StatefulInteractiveElement, Subscription, Timer, Window,
+    div, prelude::*, px,
 };
 
 use crate::app::downloads::{DOWNLOAD_HISTORY_LIMIT, valid_base_dir};
 use crate::app::{AppModel, AppModelEntityExt};
 use crate::assets::{ICON_BELL, ICON_GEAR, ICON_INFO, ICON_PALETTE, ICON_SHIELD, ICON_USER};
+use crate::diagnostics;
 use crate::lock::MIN_PASSWORD_LENGTH;
+use crate::settings::performance::PerformanceMode;
 use crate::settings::storage::{self, ConfirmationLevel, StorageOperation};
 use crate::settings::{
     DoNotDisturbMode, EVERY_DAY, ImportPreview, MAX_CUSTOM_CSS_BYTES, MAX_ZOOM, MIN_ZOOM,
@@ -36,6 +39,14 @@ enum FileChooserMode {
     Save,
     Folder,
     Css,
+    Diagnostics,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticsAction {
+    Preview,
+    Copy,
+    Save,
 }
 
 /// A storage operation waiting for the user to confirm it.
@@ -101,15 +112,15 @@ pub enum SettingsSection {
 impl SettingsSection {
     fn label(self) -> &'static str {
         match self {
-            SettingsSection::Accounts => "Accounts",
-            SettingsSection::Storage => "Storage",
-            SettingsSection::Appearance => "Appearance",
-            SettingsSection::Notifications => "Notifications",
-            SettingsSection::Network => "Network",
-            SettingsSection::General => "General",
-            SettingsSection::Performance => "Performance",
-            SettingsSection::Security => "Security",
-            SettingsSection::About => "About",
+            SettingsSection::Accounts => t!("Accounts"),
+            SettingsSection::Storage => t!("Storage"),
+            SettingsSection::Appearance => t!("Appearance"),
+            SettingsSection::Notifications => t!("Notifications"),
+            SettingsSection::Network => t!("Network"),
+            SettingsSection::General => t!("General"),
+            SettingsSection::Performance => t!("Performance"),
+            SettingsSection::Security => t!("Security"),
+            SettingsSection::About => t!("About"),
         }
     }
 
@@ -164,6 +175,9 @@ pub struct SettingsWindow {
     storage_confirm_error: Option<String>,
     feedback: Option<Notice>,
     memory_feedback: Option<Notice>,
+    diagnostics_preview: Option<String>,
+    diagnostics_feedback: Option<Notice>,
+    diagnostics_running: bool,
     file_dialog_open: bool,
     operation_running: bool,
     appearance_subscription: Option<Subscription>,
@@ -172,15 +186,15 @@ pub struct SettingsWindow {
 impl SettingsWindow {
     pub fn new(model: Entity<AppModel>, cx: &mut Context<Self>) -> Self {
         tracing::info!("SettingsWindow::new");
-        let password_field = cx.new(|cx| TextField::new("New password", cx).masked(true));
-        let confirm_field = cx.new(|cx| TextField::new("Confirm password", cx).masked(true));
+        let password_field = cx.new(|cx| TextField::new(t!("New password"), cx).masked(true));
+        let confirm_field = cx.new(|cx| TextField::new(t!("Confirm password"), cx).masked(true));
         let shortcut = model.read(cx).settings.shortcut.clone();
         let boss_key = model.read(cx).settings.boss_key.clone();
         let palette_shortcut = model.read(cx).settings.command_palette_shortcut.clone();
         let shortcut_field = cx.new(|cx| TextField::new("Ctrl+Shift+W", cx).with_content(shortcut));
         let boss_key_field = cx.new(|cx| TextField::new("Ctrl+Shift+H", cx).with_content(boss_key));
         let palette_shortcut_field = cx.new(|cx| {
-            TextField::new("Optional, e.g. Ctrl+Shift+K", cx).with_content(palette_shortcut)
+            TextField::new(t!("Optional, e.g. Ctrl+Shift+K"), cx).with_content(palette_shortcut)
         });
         let quiet_hours = model.read(cx).settings.do_not_disturb.schedule.clone();
         let dnd_start_field =
@@ -194,7 +208,7 @@ impl SettingsWindow {
             .clone()
             .unwrap_or_else(|| model.read(cx).paths.downloads_dir.display().to_string());
         let downloads_dir_field =
-            cx.new(|cx| TextField::new("Download folder", cx).with_content(downloads_dir));
+            cx.new(|cx| TextField::new(t!("Download folder"), cx).with_content(downloads_dir));
         let proxy = model.read(cx).settings.network.proxy.clone();
         let proxy_mode = proxy.mode;
         let proxy_protocol = proxy.manual.protocol;
@@ -209,10 +223,10 @@ impl SettingsWindow {
         let proxy_port_field =
             cx.new(|cx| TextField::new("8080", cx).with_content(proxy_port_text));
         let proxy_username_field = cx.new(|cx| {
-            TextField::new("Optional username", cx).with_content(proxy.manual.username.clone())
+            TextField::new(t!("Optional username"), cx).with_content(proxy.manual.username.clone())
         });
         let proxy_password_field = cx.new(|cx| {
-            TextField::new("Optional password", cx)
+            TextField::new(t!("Optional password"), cx)
                 .masked(true)
                 .with_content(proxy.manual.password.clone())
         });
@@ -264,6 +278,9 @@ impl SettingsWindow {
             storage_confirm_error: None,
             feedback: None,
             memory_feedback: None,
+            diagnostics_preview: None,
+            diagnostics_feedback: None,
+            diagnostics_running: false,
             file_dialog_open: false,
             operation_running: false,
             appearance_subscription: None,
@@ -345,7 +362,7 @@ impl SettingsWindow {
                                 .child(field)
                                 .child(button(
                                     SharedString::from(format!("rename-save-{save_id}")),
-                                    "Save",
+                                    t!("Save"),
                                     theme,
                                     true,
                                     cx.listener(move |this, _event, _window, cx| {
@@ -361,7 +378,7 @@ impl SettingsWindow {
                                 ))
                                 .child(button(
                                     SharedString::from(format!("rename-cancel-{cancel_id}")),
-                                    "Cancel",
+                                    t!("Cancel"),
                                     theme,
                                     false,
                                     cx.listener(|this, _event, _window, cx| {
@@ -385,23 +402,20 @@ impl SettingsWindow {
                             div()
                                 .text_size(px(13.))
                                 .text_color(theme.text)
-                                .child("Remove this account?"),
+                                .child(t!("Remove this account?")),
                         )
                         .child(
                             div()
                                 .text_size(px(12.))
                                 .text_color(theme.text_muted)
-                                .child(
-                                    "The local WhatsApp session, cookies, and cached files for this account will be deleted. This cannot be undone.",
-                                ),
+                                .child(t!("The local WhatsApp session, cookies, and cached files for this account will be deleted. This cannot be undone.")),
                         )
                         .child(
                             div()
                                 .flex()
                                 .gap(px(8.))
                                 .child(button(
-                                    SharedString::from(format!("remove-yes-{remove_id}")),
-                                    "Remove account",
+                                    SharedString::from(format!("remove-yes-{remove_id}")),t!("Remove account"),
                                     theme,
                                     true,
                                     cx.listener(move |this, _event, _window, cx| {
@@ -414,8 +428,7 @@ impl SettingsWindow {
                                     }),
                                 ))
                                 .child(button(
-                                    SharedString::from(format!("remove-no-{cancel_id}")),
-                                    "Cancel",
+                                    SharedString::from(format!("remove-no-{cancel_id}")),t!("Cancel"),
                                     theme,
                                     false,
                                     cx.listener(|this, _event, _window, cx| {
@@ -462,9 +475,13 @@ impl SettingsWindow {
                                                 .text_size(px(11.))
                                                 .text_color(theme.text_muted)
                                                 .child(if unread > 0 {
-                                                    format!("{unread} unread")
+                                                    tn!(
+                                                        unread,
+                                                        "{count} unread message",
+                                                        "{count} unread messages"
+                                                    )
                                                 } else {
-                                                    "No unread messages".to_string()
+                                                    t!("No unread messages").to_string()
                                                 }),
                                         ),
                                 ),
@@ -476,7 +493,7 @@ impl SettingsWindow {
                                 .gap(px(6.))
                                 .child(button(
                                     SharedString::from(format!("open-{open_id}")),
-                                    "Open",
+                                    t!("Open"),
                                     theme,
                                     true,
                                     cx.listener(move |this, _event, _window, cx| {
@@ -488,12 +505,12 @@ impl SettingsWindow {
                                 ))
                                 .child(button(
                                     SharedString::from(format!("rename-{rename_id}")),
-                                    "Rename",
+                                    t!("Rename"),
                                     theme,
                                     false,
                                     cx.listener(move |this, _event, _window, cx| {
                                         let field = cx.new(|cx| {
-                                            TextField::new("Account name", cx)
+                                            TextField::new(t!("Account name"), cx)
                                                 .with_content(rename_name.clone())
                                         });
                                         register_field_tab_stop(&field, cx);
@@ -504,7 +521,7 @@ impl SettingsWindow {
                                 .when(settings.accounts.len() > 1, |style| {
                                     style.child(button(
                                         SharedString::from(format!("remove-{remove_id}")),
-                                        "Remove",
+                                        t!("Remove"),
                                         theme,
                                         false,
                                         cx.listener(move |this, _event, _window, cx| {
@@ -520,7 +537,7 @@ impl SettingsWindow {
 
         let add_button = button(
             "add-account",
-            "Add account",
+            t!("Add account"),
             theme,
             false,
             cx.listener(|this, _event, _window, cx| {
@@ -533,8 +550,8 @@ impl SettingsWindow {
             .flex_col()
             .gap(px(18.))
             .child(section_header(
-                "Accounts",
-                "Every account has its own isolated WhatsApp Web session and window.",
+                t!("Accounts"),
+                t!("Every account has its own isolated WhatsApp Web session and window."),
                 theme,
             ))
             .child(list)
@@ -543,7 +560,9 @@ impl SettingsWindow {
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child("Adding an account opens a new window with a fresh QR code."),
+                    .child(t!(
+                        "Adding an account opens a new window with a fresh QR code."
+                    )),
             )
             .into_any_element()
     }
@@ -569,7 +588,7 @@ impl SettingsWindow {
                 self.storage_confirm_error = None;
             }
             ConfirmationLevel::TypedName => {
-                let field = cx.new(|cx| TextField::new("Account name", cx));
+                let field = cx.new(|cx| TextField::new(t!("Account name"), cx));
                 register_field_tab_stop(&field, cx);
                 self.storage_confirm = Some(StorageConfirm::DeleteData {
                     account_id: account_id.to_string(),
@@ -603,20 +622,20 @@ impl SettingsWindow {
             .map(|snapshot| storage::format_bytes(snapshot.total_bytes))
             .unwrap_or_else(|| {
                 if scanning {
-                    "Scanning…".to_string()
+                    t!("Scanning…").to_string()
                 } else {
-                    "Not scanned yet".to_string()
+                    t!("Not scanned yet").to_string()
                 }
             });
         let free = snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.free_bytes)
             .map(storage::format_bytes)
-            .unwrap_or_else(|| "Unavailable".to_string());
+            .unwrap_or_else(|| t!("Unavailable").to_string());
         let last_cleanup = settings
             .last_storage_cleanup
             .clone()
-            .unwrap_or_else(|| "Never".to_string());
+            .unwrap_or_else(|| t!("Never").to_string());
 
         let mut summary = card(theme)
             .child(
@@ -624,9 +643,9 @@ impl SettingsWindow {
                     .flex()
                     .flex_wrap()
                     .gap(px(28.))
-                    .child(storage_stat("Total account data", total, theme))
-                    .child(storage_stat("Free disk space", free, theme))
-                    .child(storage_stat("Last cleanup", last_cleanup, theme)),
+                    .child(storage_stat(t!("Total account data"), total, theme))
+                    .child(storage_stat(t!("Free disk space"), free, theme))
+                    .child(storage_stat(t!("Last cleanup"), last_cleanup, theme)),
             )
             .child(
                 div()
@@ -634,7 +653,11 @@ impl SettingsWindow {
                     .gap(px(8.))
                     .child(button(
                         "storage-refresh",
-                        if scanning { "Scanning…" } else { "Refresh" },
+                        if scanning {
+                            t!("Scanning…")
+                        } else {
+                            t!("Refresh")
+                        },
                         theme,
                         false,
                         cx.listener(|this, _event, _window, cx| {
@@ -644,7 +667,7 @@ impl SettingsWindow {
                     ))
                     .child(button(
                         "storage-open-folder",
-                        "Open data folder",
+                        t!("Open data folder"),
                         theme,
                         false,
                         cx.listener(|this, _event, _window, cx| {
@@ -657,7 +680,7 @@ impl SettingsWindow {
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child(format!("Data folder: {}", data_dir.display())),
+                    .child(tr!("Data folder: {path}", path = data_dir.display())),
             );
         if let Some(notice) = notice {
             summary = summary.child(
@@ -692,19 +715,24 @@ impl SettingsWindow {
                 .as_ref()
                 .and_then(|snapshot| snapshot.account(&account_id))
                 .map(|info| {
-                    let partial = if info.complete() { "" } else { " · partial" };
-                    format!(
-                        "Data {} · Cache {} · Total {}{partial}",
-                        storage::format_bytes(info.data.bytes),
-                        storage::format_bytes(info.cache.bytes),
-                        storage::format_bytes(info.total_bytes())
+                    let partial = if info.complete() {
+                        ""
+                    } else {
+                        t!(" · partial")
+                    };
+                    tr!(
+                        "Data {data} · Cache {cache} · Total {total}{partial}",
+                        data = storage::format_bytes(info.data.bytes),
+                        cache = storage::format_bytes(info.cache.bytes),
+                        total = storage::format_bytes(info.total_bytes()),
+                        partial = partial
                     )
                 })
                 .unwrap_or_else(|| {
                     if scanning {
-                        "Scanning…".to_string()
+                        t!("Scanning…").to_string()
                     } else {
-                        "Not scanned yet".to_string()
+                        t!("Not scanned yet").to_string()
                     }
                 });
             let open = self.model.read(cx).is_account_window_open(&account_id);
@@ -742,7 +770,7 @@ impl SettingsWindow {
                             div()
                                 .text_size(px(10.))
                                 .text_color(theme.text_faint)
-                                .child("Window open"),
+                                .child(t!("Window open")),
                         )
                     }),
             );
@@ -752,7 +780,7 @@ impl SettingsWindow {
                     div()
                         .text_size(px(11.))
                         .text_color(theme.text_muted)
-                        .child("Running storage operation…"),
+                        .child(t!("Running storage operation…")),
                 );
             } else {
                 let clear_id = account_id.clone();
@@ -765,7 +793,7 @@ impl SettingsWindow {
                         .gap(px(6.))
                         .child(button(
                             SharedString::from(format!("storage-clear-cache-{clear_id}")),
-                            "Clear cache",
+                            t!("Clear cache"),
                             theme,
                             false,
                             cx.listener(move |this, _event, _window, cx| {
@@ -779,7 +807,7 @@ impl SettingsWindow {
                         ))
                         .child(button(
                             SharedString::from(format!("storage-sign-out-{sign_out_id}")),
-                            "Sign out",
+                            t!("Sign out"),
                             theme,
                             false,
                             cx.listener(move |this, _event, _window, cx| {
@@ -793,7 +821,7 @@ impl SettingsWindow {
                         ))
                         .child(button(
                             SharedString::from(format!("storage-delete-{delete_id}")),
-                            "Delete account data",
+                            t!("Delete account data"),
                             theme,
                             false,
                             cx.listener(move |this, _event, _window, cx| {
@@ -814,9 +842,7 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(section_header(
-                "Storage",
-                "Inspect and clean the WebKit profile behind each account.",
+            .child(section_header(t!("Storage"),t!("Inspect and clean the WebKit profile behind each account."),
                 theme,
             ))
             .child(summary)
@@ -828,12 +854,12 @@ impl SettingsWindow {
                     .gap(px(4.))
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child(
+                    .child(t!(
                         "Clearing data closes and recreates the account's webview. Clearing the cache keeps the WhatsApp session; signing out requires the QR code again. Sizes are approximate while WhatsApp Web is running and stop at a bounded scan limit.",
-                    )
-                    .child(
+                    ))
+                    .child(t!(
                         "Deleting account data requires typing the account name and removes the account from OxideZap. The last account cannot be deleted.",
-                    ),
+                    )),
             )
             .into_any_element()
     }
@@ -859,23 +885,22 @@ impl SettingsWindow {
                         div()
                             .text_size(px(12.))
                             .text_color(theme.text)
-                            .child(format!("Sign out of \"{name}\"?")),
+                            .child(tr!("Sign out of “{name}”?", name = name)),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_muted)
-                            .child(
+                            .child(t!(
                                 "The account and its settings are kept, but its WebKit data is deleted. WhatsApp Web will ask for the QR code again.",
-                            ),
+                            )),
                     )
                     .child(
                         div()
                             .flex()
                             .gap(px(8.))
                             .child(button(
-                                SharedString::from(format!("storage-sign-out-yes-{confirm_id}")),
-                                "Sign out",
+                                SharedString::from(format!("storage-sign-out-yes-{confirm_id}")),t!("Sign out"),
                                 theme,
                                 true,
                                 cx.listener(move |this, _event, _window, cx| {
@@ -892,8 +917,7 @@ impl SettingsWindow {
                                 }),
                             ))
                             .child(button(
-                                SharedString::from(format!("storage-sign-out-no-{cancel_id}")),
-                                "Cancel",
+                                SharedString::from(format!("storage-sign-out-no-{cancel_id}")),t!("Cancel"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -920,18 +944,17 @@ impl SettingsWindow {
                         div()
                             .text_size(px(12.))
                             .text_color(theme.text)
-                            .child(format!("Delete all data for \"{name}\"?")),
+                            .child(tr!("Delete all data for “{name}”?", name = name)),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_muted)
-                            .child(
+                            .child(t!(
                                 "This closes the account, deletes its WebKit profile, and removes it from OxideZap. This cannot be undone.",
-                            ),
+                            )),
                     )
-                    .child(labeled_field(
-                        "Type the account name to confirm",
+                    .child(labeled_field(t!("Type the account name to confirm"),
                         None,
                         theme,
                         field.clone(),
@@ -949,17 +972,14 @@ impl SettingsWindow {
                             .flex()
                             .gap(px(8.))
                             .child(button(
-                                SharedString::from(format!("storage-delete-yes-{delete_id}")),
-                                "Delete account data",
+                                SharedString::from(format!("storage-delete-yes-{delete_id}")),t!("Delete account data"),
                                 theme,
                                 true,
                                 cx.listener(move |this, _event, _window, cx| {
                                     let typed = field.read(cx).content().to_string();
                                     if !storage::typed_confirmation_matches(&typed, &expected) {
-                                        this.storage_confirm_error = Some(
-                                            "Type the account name exactly to confirm."
-                                                .to_string(),
-                                        );
+                                        this.storage_confirm_error =
+                                            Some(t!("Type the account name exactly to confirm.").to_string());
                                         cx.notify();
                                         return;
                                     }
@@ -976,8 +996,7 @@ impl SettingsWindow {
                                 }),
                             ))
                             .child(button(
-                                SharedString::from(format!("storage-delete-no-{cancel_id}")),
-                                "Cancel",
+                                SharedString::from(format!("storage-delete-no-{cancel_id}")),t!("Cancel"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -1001,14 +1020,14 @@ impl SettingsWindow {
         let mut theme_cards = div().flex().gap(px(10.));
         for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
             let selected = settings.theme == mode;
-            let id = SharedString::from(format!("theme-{}", mode.label().to_lowercase()));
+            let id = SharedString::from(format!("theme-{mode:?}").to_lowercase());
             let description = match mode {
-                ThemeMode::System => "Follow the desktop",
-                ThemeMode::Light => "Bright surfaces",
-                ThemeMode::Dark => "Low-light surfaces",
+                ThemeMode::System => t!("Follow the desktop"),
+                ThemeMode::Light => t!("Bright surfaces"),
+                ThemeMode::Dark => t!("Low-light surfaces"),
             };
             let description = if selected {
-                format!("Selected · {description}")
+                tr!("Selected · {description}", description = description)
             } else {
                 description.to_string()
             };
@@ -1080,9 +1099,7 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(section_header(
-                "Appearance",
-                "Choose how the native shell looks and how large WhatsApp Web is rendered.",
+            .child(section_header(t!("Appearance"),t!("Choose how the native shell looks and how large WhatsApp Web is rendered."),
                 theme,
             ))
             .child(
@@ -1092,16 +1109,16 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("Theme"),
+                            .child(t!("Theme")),
                     )
                     .child(theme_cards)
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
-                            .child(
+                            .child(t!(
                                 "System follows the desktop color scheme live. On Linux this depends on the XDG desktop portal and the desktop settings service, so some window managers may not report changes.",
-                            ),
+                            )),
                     ),
             )
             .child(
@@ -1111,17 +1128,17 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("Display size"),
+                            .child(t!("Display size")),
                     )
                     .child(zoom_row)
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
-                            .child(format!(
-                                "WhatsApp Web zoom is limited to {}%–{}%. The native UI keeps its own size.",
-                                (MIN_ZOOM * 100.0) as u32,
-                                (MAX_ZOOM * 100.0) as u32
+                            .child(tr!(
+                                "WhatsApp Web zoom is limited to {min}%–{max}%. The native UI keeps its own size.",
+                                min = (MIN_ZOOM * 100.0) as u32,
+                                max = (MAX_ZOOM * 100.0) as u32
                             )),
                     ),
             )
@@ -1138,15 +1155,15 @@ impl SettingsWindow {
         let appearance = &settings.appearance;
         let css_size = appearance.custom_css.trim().len();
         let status = if css_size == 0 {
-            "No stylesheet loaded.".to_string()
+            t!("No stylesheet loaded.").to_string()
         } else {
-            format!(
-                "{} · {}",
-                css_size_label(css_size),
-                if appearance.experimental_css {
-                    "applied"
+            tr!(
+                "{size} · {state}",
+                size = css_size_label(css_size),
+                state = if appearance.experimental_css {
+                    t!("applied")
                 } else {
-                    "not applied"
+                    t!("not applied")
                 }
             )
         };
@@ -1161,7 +1178,7 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted)
-                    .child("Experimental CSS"),
+                    .child(t!("Experimental CSS")),
             )
             .child(
                 div()
@@ -1173,21 +1190,19 @@ impl SettingsWindow {
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.danger)
-                            .child("Unsupported and experimental"),
+                            .child(t!("Unsupported and experimental")),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_muted)
-                            .child(
+                            .child(t!(
                                 "WhatsApp Web changes its DOM without notice. A stylesheet can break the QR login, calls, dialogs, or the chat view, and may stop working after any WhatsApp update. Do not hide security, privacy, or abuse-reporting controls. OxideZap injects CSS only: it never runs JavaScript from this file and never downloads remote themes.",
-                            ),
+                            )),
                     ),
             )
             .child(toggle_row(
-                "experimental-css-enabled",
-                "Apply experimental CSS",
-                "Enable the loaded stylesheet on every open WhatsApp Web account.",
+                "experimental-css-enabled",t!("Apply experimental CSS"),t!("Enable the loaded stylesheet on every open WhatsApp Web account."),
                 enabled,
                 theme,
                 cx.listener(move |this, _event, _window, cx| {
@@ -1195,8 +1210,8 @@ impl SettingsWindow {
                         .model
                         .update(cx, |model, cx| model.set_custom_css_enabled(!enabled, cx));
                     this.css_feedback = Some(match result {
-                        Ok(()) if enabled => Notice::success("Experimental CSS disabled."),
-                        Ok(()) => Notice::success("Experimental CSS enabled."),
+                        Ok(()) if enabled => Notice::success(t!("Experimental CSS disabled.")),
+                        Ok(()) => Notice::success(t!("Experimental CSS enabled.")),
                         Err(error) => Notice::error(error),
                     });
                     cx.notify();
@@ -1209,8 +1224,7 @@ impl SettingsWindow {
                     .gap(px(8.))
                     .when(!busy, |row| {
                         row.child(button(
-                            "load-custom-css",
-                            "Load CSS file\u{2026}",
+                            "load-custom-css",t!("Load CSS file\u{2026}"),
                             theme,
                             false,
                             cx.listener(|this, _event, _window, cx| {
@@ -1219,8 +1233,7 @@ impl SettingsWindow {
                         ))
                     })
                     .child(button(
-                        "reset-custom-css",
-                        "Reset",
+                        "reset-custom-css",t!("Reset"),
                         theme,
                         false,
                         cx.listener(|this, _event, _window, cx| {
@@ -1232,7 +1245,7 @@ impl SettingsWindow {
                             div()
                                 .text_size(px(11.))
                                 .text_color(theme.text_muted)
-                                .child("Waiting for the file dialog\u{2026}"),
+                                .child(t!("Waiting for the file dialog\u{2026}")),
                         )
                     }),
             )
@@ -1263,9 +1276,9 @@ impl SettingsWindow {
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child(
+                    .child(t!(
                         "Restricted to https://web.whatsapp.com · 64 KiB limit · CSS only · excluded from settings exports.",
-                    ),
+                    )),
             );
 
         if let Some(notice) = feedback {
@@ -1300,11 +1313,11 @@ impl SettingsWindow {
             let muted = account.muted;
             let sound = account.notification_sound;
             let state = if muted {
-                "Muted"
+                t!("Muted")
             } else if sound {
-                "Notifications and sound"
+                t!("Notifications and sound")
             } else {
-                "Notifications, silent"
+                t!("Notifications, silent")
             };
             let mute_target = account_id.clone();
             let sound_target = account_id.clone();
@@ -1332,8 +1345,8 @@ impl SettingsWindow {
                 )
                 .child(toggle_row(
                     SharedString::from(format!("mute-{account_id}")),
-                    "Mute notifications",
-                    "Suppress native message notifications from this account.",
+                    t!("Mute notifications"),
+                    t!("Suppress native message notifications from this account."),
                     muted,
                     theme,
                     cx.listener(move |this, _event, _window, cx| {
@@ -1347,8 +1360,8 @@ impl SettingsWindow {
                 ))
                 .child(toggle_row(
                     SharedString::from(format!("sound-{account_id}")),
-                    "Notification sound",
-                    "Ask the desktop notification service to play a message sound.",
+                    t!("Notification sound"),
+                    t!("Ask the desktop notification service to play a message sound."),
                     sound,
                     theme,
                     cx.listener(move |this, _event, _window, cx| {
@@ -1377,7 +1390,7 @@ impl SettingsWindow {
         dnd_presets = dnd_presets
             .child(button(
                 "dnd-one-hour",
-                "For 1 hour",
+                t!("For 1 hour"),
                 theme,
                 false,
                 cx.listener(|this, _event, _window, cx| {
@@ -1392,7 +1405,7 @@ impl SettingsWindow {
             ))
             .child(button(
                 "dnd-tomorrow",
-                format!("Until tomorrow ({wake_time})"),
+                tr!("Until tomorrow ({wake})", wake = wake_time),
                 theme,
                 false,
                 cx.listener(|this, _event, _window, cx| {
@@ -1407,7 +1420,7 @@ impl SettingsWindow {
             ))
             .child(button(
                 "dnd-indefinite",
-                "Indefinitely",
+                t!("Indefinitely"),
                 theme,
                 false,
                 cx.listener(|this, _event, _window, cx| {
@@ -1421,9 +1434,9 @@ impl SettingsWindow {
             .child(button(
                 "dnd-use-quiet-hours",
                 if dnd.mode == DoNotDisturbMode::Scheduled {
-                    "✓ Quiet hours"
+                    format!("✓ {}", t!("Quiet hours"))
                 } else {
-                    "Quiet hours"
+                    t!("Quiet hours").to_string()
                 },
                 theme,
                 dnd.mode == DoNotDisturbMode::Scheduled,
@@ -1438,9 +1451,9 @@ impl SettingsWindow {
 
         let mut days_row = div().flex().flex_wrap().gap(px(8.));
         for (id, label, days) in [
-            ("dnd-days-every", "Every day", EVERY_DAY),
-            ("dnd-days-weekdays", "Weekdays", WEEKDAYS),
-            ("dnd-days-weekends", "Weekends", WEEKENDS),
+            ("dnd-days-every", t!("Every day"), EVERY_DAY),
+            ("dnd-days-weekdays", t!("Weekdays"), WEEKDAYS),
+            ("dnd-days-weekends", t!("Weekends"), WEEKENDS),
         ] {
             let selected = schedule_days == days;
             let text = if selected {
@@ -1466,7 +1479,7 @@ impl SettingsWindow {
 
         let mut quiet_actions = div().flex().flex_wrap().gap(px(8.)).child(button(
             "dnd-apply-quiet-hours",
-            "Apply quiet hours",
+            t!("Apply quiet hours"),
             theme,
             true,
             cx.listener(|this, _event, _window, cx| this.apply_quiet_hours(cx)),
@@ -1474,7 +1487,7 @@ impl SettingsWindow {
         if scheduled_active {
             quiet_actions = quiet_actions.child(button(
                 "dnd-skip-quiet-hours",
-                "Skip this quiet period",
+                t!("Skip this quiet period"),
                 theme,
                 false,
                 cx.listener(|this, _event, _window, cx| {
@@ -1490,9 +1503,7 @@ impl SettingsWindow {
 
         let dnd_card = card(theme)
             .child(toggle_row(
-                "do-not-disturb",
-                "Do not disturb",
-                "Pause native notifications and sounds from every account. Unread counts, window titles, and the tray badge keep updating.",
+                "do-not-disturb",t!("Do not disturb"),t!("Pause native notifications and sounds from every account. Unread counts, window titles, and the tray badge keep updating."),
                 dnd_active,
                 theme,
                 cx.listener(move |this, _event, _window, cx| {
@@ -1508,7 +1519,11 @@ impl SettingsWindow {
                 div()
                     .text_size(px(13.))
                     .text_color(theme.text_muted)
-                    .child(format!("Mode: {dnd_mode} · Status: {dnd_status}")),
+                    .child(tr!(
+                        "Mode: {mode} · Status: {status}",
+                        mode = dnd_mode,
+                        status = dnd_status
+                    )),
             )
             .child(dnd_presets)
             .child(divider(theme))
@@ -1517,30 +1532,28 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted)
-                    .child("Quiet hours"),
+                    .child(t!("Quiet hours")),
             )
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child(format!(
-                        "Recurring window: {}.",
-                        dnd.schedule.summary()
+                    .child(tr!(
+                        "Recurring window: {window}.",
+                        window = dnd.schedule.summary()
                     )),
             )
             .child(
                 div()
                     .flex()
                     .gap(px(12.))
-                    .child(div().w(px(150.)).child(labeled_field(
-                        "Start",
-                        Some(SharedString::from("HH:MM, local time")),
+                    .child(div().w(px(150.)).child(labeled_field(t!("Start"),
+                        Some(SharedString::from(t!("HH:MM, local time"))),
                         theme,
                         start_field,
                     )))
-                    .child(div().w(px(150.)).child(labeled_field(
-                        "End",
-                        Some(SharedString::from("HH:MM, may cross midnight")),
+                    .child(div().w(px(150.)).child(labeled_field(t!("End"),
+                        Some(SharedString::from(t!("HH:MM, may cross midnight"))),
                         theme,
                         end_field,
                     ))),
@@ -1559,30 +1572,26 @@ impl SettingsWindow {
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child("Quiet hours use the desktop's local time. Overnight ranges such as 22:00-07:00 are supported; each period belongs to the day it starts. Times are re-evaluated when the clock changes or the machine resumes, and daylight-saving transitions follow the desktop timezone."),
+                    .child(t!("Quiet hours use the desktop's local time. Overnight ranges such as 22:00-07:00 are supported; each period belongs to the day it starts. Times are re-evaluated when the clock changes or the machine resumes, and daylight-saving transitions follow the desktop timezone.")),
             )
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child("'Until tomorrow' uses the quiet-hours end time as its wake hour. Changing the times requires Apply; toggles and presets apply immediately."),
+                    .child(t!("'Until tomorrow' uses the quiet-hours end time as its wake hour. Changing the times requires Apply; toggles and presets apply immediately.")),
             );
 
         div()
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(section_header(
-                "Notifications",
-                "WhatsApp Web notifications are delivered by the desktop notification service.",
+            .child(section_header(t!("Notifications"),t!("WhatsApp Web notifications are delivered by the desktop notification service."),
                 theme,
             ))
             .child(
                 card(theme)
                     .child(toggle_row(
-                        "notifications-enabled",
-                        "Desktop notifications",
-                        "Show a native notification when a message arrives while OxideZap is in the background.",
+                        "notifications-enabled",t!("Desktop notifications"),t!("Show a native notification when a message arrives while OxideZap is in the background."),
                         settings.notifications,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -1593,9 +1602,7 @@ impl SettingsWindow {
                     ))
                     .child(divider(theme))
                     .child(toggle_row(
-                        "connection-notifications",
-                        "Connection notifications",
-                        "Show a native notification when an account goes offline or reconnects.",
+                        "connection-notifications",t!("Connection notifications"),t!("Show a native notification when an account goes offline or reconnects."),
                         settings.connection_notifications,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -1615,7 +1622,7 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("Per-account"),
+                            .child(t!("Per-account")),
                     )
                     .child(per_account),
             )
@@ -1626,10 +1633,10 @@ impl SettingsWindow {
                     .gap(px(4.))
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child("Muted accounts and Do not disturb have priority over per-account sounds.")
-                    .child("Connection notifications also follow Do not disturb and per-account mute.")
-                    .child("Notifications are also suppressed while the app is locked.")
-                    .child("Sound playback depends on the notification service and its sound theme; some servers ignore the requested sound or always use their own."),
+                    .child(t!("Muted accounts and Do not disturb have priority over per-account sounds."))
+                    .child(t!("Connection notifications also follow Do not disturb and per-account mute."))
+                    .child(t!("Notifications are also suppressed while the app is locked."))
+                    .child(t!("Sound playback depends on the notification service and its sound theme; some servers ignore the requested sound or always use their own.")),
             )
             .into_any_element()
     }
@@ -1664,7 +1671,14 @@ impl SettingsWindow {
                 .spawn(async move {
                     let json = SettingsExport::new(&settings, SystemTime::now()).to_json()?;
                     std::fs::write(&path, json).map_err(|error| {
-                        anyhow::anyhow!("could not write {}: {error}", path.display())
+                        anyhow::anyhow!(
+                            "{}",
+                            tr!(
+                                "Could not write {path}: {error}",
+                                path = path.display(),
+                                error = error
+                            )
+                        )
                     })?;
                     Ok::<PathBuf, anyhow::Error>(path)
                 })
@@ -1673,9 +1687,11 @@ impl SettingsWindow {
                 this.file_dialog_open = false;
                 this.feedback = Some(match result {
                     Ok(path) => {
-                        Notice::success(format!("Settings exported to {}.", path.display()))
+                        Notice::success(tr!("Settings exported to {path}.", path = path.display()))
                     }
-                    Err(error) => Notice::error(format!("Could not export settings: {error}")),
+                    Err(error) => {
+                        Notice::error(tr!("Could not export settings: {error}", error = error))
+                    }
                 });
                 cx.notify();
             })
@@ -1716,10 +1732,83 @@ impl SettingsWindow {
                         this.reset_confirm = false;
                     }
                     Err(error) => {
-                        this.feedback =
-                            Some(Notice::error(format!("Could not import settings: {error}")));
+                        this.feedback = Some(Notice::error(tr!(
+                            "Could not import settings: {error}",
+                            error = error
+                        )));
                     }
                 }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_diagnostics_action(&mut self, action: DiagnosticsAction, cx: &mut Context<Self>) {
+        if self.diagnostics_running || self.file_dialog_open || self.operation_running {
+            return;
+        }
+        let context = self.model.read(cx).diagnostics_context();
+        self.diagnostics_running = true;
+        self.diagnostics_feedback = None;
+        if action == DiagnosticsAction::Save {
+            self.file_dialog_open = true;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let report = cx
+                .background_executor()
+                .spawn(async move { diagnostics::collect(&context).render_text() })
+                .await;
+            let feedback = match action {
+                DiagnosticsAction::Preview => Notice::success("Diagnostics report generated."),
+                DiagnosticsAction::Copy => Notice::success("Diagnostics copied to the clipboard."),
+                DiagnosticsAction::Save => {
+                    let (sender, receiver) = bounded(1);
+                    request_file_chooser(
+                        FileChooserMode::Diagnostics,
+                        diagnostics::report_file_name(SystemTime::now()),
+                        sender,
+                    );
+                    match wait_for_file_choice(receiver).await {
+                        None => Notice::success("Diagnostics save cancelled."),
+                        Some(path) => {
+                            let path = diagnostics::report_path(path);
+                            let text = report.clone();
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    std::fs::write(&path, text).map_err(|error| {
+                                        anyhow::anyhow!(
+                                            "could not write {}: {error}",
+                                            path.display()
+                                        )
+                                    })?;
+                                    Ok::<PathBuf, anyhow::Error>(path)
+                                })
+                                .await;
+                            match result {
+                                Ok(path) => Notice::success(format!(
+                                    "Diagnostics saved to {}.",
+                                    path.display()
+                                )),
+                                Err(error) => {
+                                    Notice::error(format!("Could not save diagnostics: {error}"))
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            this.update(cx, |this, cx| {
+                if action == DiagnosticsAction::Copy {
+                    cx.write_to_clipboard(ClipboardItem::new_string(report.clone()));
+                }
+                this.diagnostics_running = false;
+                this.file_dialog_open = false;
+                this.diagnostics_preview = Some(report);
+                this.diagnostics_feedback = Some(feedback);
                 cx.notify();
             })
             .ok();
@@ -1733,12 +1822,13 @@ impl SettingsWindow {
         let (Some(start_minutes), Some(end_minutes)) =
             (parse_time_of_day(&start), parse_time_of_day(&end))
         else {
-            self.dnd_error = Some("Enter both quiet-hours times as HH:MM.".to_string());
+            self.dnd_error = Some(t!("Enter both quiet-hours times as HH:MM.").to_string());
             cx.notify();
             return;
         };
         if start_minutes == end_minutes {
-            self.dnd_error = Some("The quiet-hours start and end times must differ.".to_string());
+            self.dnd_error =
+                Some(t!("The quiet-hours start and end times must differ.").to_string());
             cx.notify();
             return;
         }
@@ -1767,7 +1857,7 @@ impl SettingsWindow {
             .to_string();
         let Some(path) = valid_base_dir(&value) else {
             self.downloads_error =
-                Some("Enter an absolute folder path, or use the default.".to_string());
+                Some(t!("Enter an absolute folder path, or use the default.").to_string());
             cx.notify();
             return;
         };
@@ -1849,9 +1939,9 @@ impl SettingsWindow {
                     Ok(()) => {
                         let enabled = this.model.read(cx).settings.appearance.experimental_css;
                         if enabled {
-                            Notice::success("CSS loaded and applied to open accounts.")
+                            Notice::success(t!("CSS loaded and applied to open accounts."))
                         } else {
-                            Notice::success("CSS loaded. Use the toggle above to apply it.")
+                            Notice::success(t!("CSS loaded. Use the toggle above to apply it."))
                         }
                     }
                     Err(error) => Notice::error(error),
@@ -1866,9 +1956,9 @@ impl SettingsWindow {
     fn reset_custom_css(&mut self, cx: &mut Context<Self>) {
         self.model
             .update(cx, |model, cx| model.reset_custom_css(cx));
-        self.css_feedback = Some(Notice::success(
-            "Experimental CSS removed. WhatsApp Web uses its own styles again.",
-        ));
+        self.css_feedback = Some(Notice::success(t!(
+            "Experimental CSS removed. WhatsApp Web uses its own styles again."
+        )));
         cx.notify();
     }
 
@@ -1894,15 +1984,16 @@ impl SettingsWindow {
                         this.model.update(cx, |model, cx| {
                             model.apply_imported_settings(preview.settings, cx);
                         });
-                        this.feedback = Some(Notice::success(format!(
-                            "Settings imported. The previous settings were backed up to {}.",
-                            path.display()
+                        this.feedback = Some(Notice::success(tr!(
+                            "Settings imported. The previous settings were backed up to {path}.",
+                            path = path.display()
                         )));
                     }
                     Err(error) => {
                         this.pending_import = Some(preview);
-                        this.feedback = Some(Notice::error(format!(
-                            "Could not back up the current settings, so nothing was imported: {error}"
+                        this.feedback = Some(Notice::error(tr!(
+                            "Could not back up the current settings, so nothing was imported: {error}",
+                            error = error
                         )));
                     }
                 }
@@ -1932,14 +2023,15 @@ impl SettingsWindow {
                 match result {
                     Ok(path) => {
                         this.model.update(cx, |model, cx| model.reset_settings(cx));
-                        this.feedback = Some(Notice::success(format!(
-                            "Preferences reset to their defaults. Your accounts were kept and a backup was written to {}.",
-                            path.display()
+                        this.feedback = Some(Notice::success(tr!(
+                            "Preferences reset to their defaults. Your accounts were kept and a backup was written to {path}.",
+                            path = path.display()
                         )));
                     }
                     Err(error) => {
-                        this.feedback = Some(Notice::error(format!(
-                            "Could not back up the current settings, so nothing was reset: {error}"
+                        this.feedback = Some(Notice::error(tr!(
+                            "Could not back up the current settings, so nothing was reset: {error}",
+                            error = error
                         )));
                     }
                 }
@@ -1963,7 +2055,7 @@ impl SettingsWindow {
                 style
                     .child(button(
                         "export-settings",
-                        "Export settings\u{2026}",
+                        t!("Export settings\u{2026}"),
                         theme,
                         false,
                         cx.listener(|this, _event, _window, cx| {
@@ -1972,7 +2064,7 @@ impl SettingsWindow {
                     ))
                     .child(button(
                         "import-settings",
-                        "Import settings\u{2026}",
+                        t!("Import settings\u{2026}"),
                         theme,
                         false,
                         cx.listener(|this, _event, _window, cx| {
@@ -1981,7 +2073,7 @@ impl SettingsWindow {
                     ))
                     .child(button(
                         "reset-settings",
-                        "Reset settings",
+                        t!("Reset settings"),
                         theme,
                         false,
                         cx.listener(|this, _event, _window, cx| {
@@ -1996,7 +2088,9 @@ impl SettingsWindow {
                     div()
                         .text_size(px(12.))
                         .text_color(theme.text_muted)
-                        .child("Waiting for the file dialog or the current operation\u{2026}"),
+                        .child(t!(
+                            "Waiting for the file dialog or the current operation\u{2026}"
+                        )),
                 )
             });
 
@@ -2006,23 +2100,23 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted)
-                    .child("Backup and restore"),
+                    .child(t!("Backup and restore")),
             )
             .child(
                 div()
                     .text_size(px(12.))
                     .text_color(theme.text_muted)
-                    .child(
+                    .child(t!(
                         "Export the configuration to a readable JSON file, import it on another installation, or restore the defaults.",
-                    ),
+                    )),
             )
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child(
+                    .child(t!(
                         "Exports never include account sessions, cookies, chats, or the app-lock password. Every import and reset writes a dated backup first.",
-                    ),
+                    )),
             )
             .child(actions);
 
@@ -2056,24 +2150,23 @@ impl SettingsWindow {
                         .text_size(px(12.))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.text_muted)
-                        .child("Import summary"),
+                        .child(t!("Import summary")),
                 )
                 .child(summary)
                 .child(
                     div()
                         .text_size(px(11.))
                         .text_color(theme.text_faint)
-                        .child(
+                        .child(t!(
                             "Accounts from the file replace the current account list; local session data is not deleted. The app-lock password is not imported, so set it again afterwards.",
-                        ),
+                        )),
                 )
                 .child(
                     div()
                         .flex()
                         .gap(px(8.))
                         .child(button(
-                            "import-apply",
-                            "Apply import",
+                            "import-apply",t!("Apply import"),
                             theme,
                             true,
                             cx.listener(|this, _event, _window, cx| {
@@ -2081,8 +2174,7 @@ impl SettingsWindow {
                             }),
                         ))
                         .child(button(
-                            "import-cancel",
-                            "Cancel",
+                            "import-cancel",t!("Cancel"),
                             theme,
                             false,
                             cx.listener(|this, _event, _window, cx| {
@@ -2100,23 +2192,22 @@ impl SettingsWindow {
                     div()
                         .text_size(px(12.))
                         .text_color(theme.text)
-                        .child("Reset preferences to their defaults?"),
+                        .child(t!("Reset preferences to their defaults?")),
                 )
                 .child(
                     div()
                         .text_size(px(11.))
                         .text_color(theme.text_faint)
-                        .child(
+                        .child(t!(
                             "Theme, zoom, notifications, startup, the global shortcut, the app-lock password, and the first-run guide status are reset. Accounts and their WhatsApp sessions are kept, and the first-run guide opens again. A dated backup is written first.",
-                        ),
+                        )),
                 )
                 .child(
                     div()
                         .flex()
                         .gap(px(8.))
                         .child(button(
-                            "reset-apply",
-                            "Reset settings",
+                            "reset-apply",t!("Reset settings"),
                             theme,
                             true,
                             cx.listener(|this, _event, _window, cx| {
@@ -2124,8 +2215,7 @@ impl SettingsWindow {
                             }),
                         ))
                         .child(button(
-                            "reset-cancel",
-                            "Cancel",
+                            "reset-cancel",t!("Cancel"),
                             theme,
                             false,
                             cx.listener(|this, _event, _window, cx| {
@@ -2143,11 +2233,11 @@ impl SettingsWindow {
         let port_text = self.proxy_port_field.read(cx).content().trim().to_string();
         let port = if self.proxy_mode == ProxyMode::Manual {
             if port_text.is_empty() {
-                return Err("Enter the proxy port.".to_string());
+                return Err(t!("Enter the proxy port.").to_string());
             }
-            port_text
-                .parse::<u16>()
-                .map_err(|_| "The proxy port must be a number between 1 and 65535.".to_string())?
+            port_text.parse::<u16>().map_err(|_| {
+                t!("The proxy port must be a number between 1 and 65535.").to_string()
+            })?
         } else {
             port_text.parse().unwrap_or(ManualProxy::DEFAULT_PORT)
         };
@@ -2175,9 +2265,9 @@ impl SettingsWindow {
             Ok(proxy) => {
                 self.model
                     .update(cx, |model, cx| model.set_network_proxy(proxy, cx));
-                self.proxy_feedback = Some(Notice::success(
+                self.proxy_feedback = Some(Notice::success(t!(
                     "Proxy settings saved. Reopen an account if the new route does not take effect.",
-                ));
+                )));
             }
             Err(error) => {
                 self.proxy_feedback = Some(Notice::error(error));
@@ -2254,7 +2344,7 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted)
-                    .child("Connection mode"),
+                    .child(t!("Connection mode")),
             )
             .child(mode_row)
             .child(
@@ -2302,21 +2392,19 @@ impl SettingsWindow {
                         .text_size(px(12.))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.text_muted)
-                        .child("Proxy protocol"),
+                        .child(t!("Proxy protocol")),
                 )
                 .child(protocol_row)
                 .child(
                     div()
                         .flex()
                         .gap(px(12.))
-                        .child(div().flex_1().child(labeled_field(
-                            "Host",
+                        .child(div().flex_1().child(labeled_field(t!("Host"),
                             None,
                             theme,
                             host_field,
                         )))
-                        .child(div().w(px(120.)).child(labeled_field(
-                            "Port",
+                        .child(div().w(px(120.)).child(labeled_field(t!("Port"),
                             None,
                             theme,
                             port_field,
@@ -2326,15 +2414,13 @@ impl SettingsWindow {
                     div()
                         .flex()
                         .gap(px(12.))
-                        .child(div().flex_1().child(labeled_field(
-                            "Username",
-                            Some(SharedString::from("Optional")),
+                        .child(div().flex_1().child(labeled_field(t!("Username"),
+                            Some(SharedString::from(t!("Optional"))),
                             theme,
                             username_field,
                         )))
-                        .child(div().flex_1().child(labeled_field(
-                            "Password",
-                            Some(SharedString::from("Optional, stored as plain text")),
+                        .child(div().flex_1().child(labeled_field(t!("Password"),
+                            Some(SharedString::from(t!("Optional, stored as plain text"))),
                             theme,
                             password_field,
                         ))),
@@ -2343,9 +2429,7 @@ impl SettingsWindow {
                     div()
                         .text_size(px(11.))
                         .text_color(theme.danger)
-                        .child(
-                            "Proxy credentials are stored as plain text in settings.json. The file is private (0600) and credentials are never logged or written to exports, but this build does not use a system keyring. Prefer a proxy that does not require a password.",
-                        ),
+                        .child(t!("Proxy credentials are stored as plain text in settings.json. The file is private (0600) and credentials are never logged or written to exports, but this build does not use a system keyring. Prefer a proxy that does not require a password.")),
                 );
         }
 
@@ -2356,23 +2440,21 @@ impl SettingsWindow {
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child(
-                        "The proxy is applied to each account's WebKit data manager when the account opens. Existing connections keep their route, so reopen an account if the change does not take effect.",
-                    ),
+                    .child(t!("The proxy is applied to each account's WebKit data manager when the account opens. Existing connections keep their route, so reopen an account if the change does not take effect.")),
             )
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child("Test connection checks web.whatsapp.com through the configured route without blocking the interface. HTTP and SOCKS5 proxies are tested end to end; an HTTPS proxy is checked for reachability before the TLS handshake."),
+                    .child(t!("Test connection checks web.whatsapp.com through the configured route without blocking the interface. HTTP and SOCKS5 proxies are tested end to end; an HTTPS proxy is checked for reachability before the TLS handshake.")),
             )
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_muted)
-                    .child(format!(
-                        "Saved configuration: {}",
-                        settings.network.proxy.redacted_summary()
+                    .child(tr!(
+                        "Saved configuration: {summary}",
+                        summary = settings.network.proxy.redacted_summary()
                     )),
             )
             .child(
@@ -2382,9 +2464,9 @@ impl SettingsWindow {
                     .child(button(
                         "proxy-test-connection",
                         if running {
-                            "Testing\u{2026}"
+                            t!("Testing…")
                         } else {
-                            "Test connection"
+                            t!("Test connection")
                         },
                         theme,
                         false,
@@ -2393,8 +2475,7 @@ impl SettingsWindow {
                         }),
                     ))
                     .child(button(
-                        "proxy-apply",
-                        "Apply proxy settings",
+                        "proxy-apply",t!("Apply proxy settings"),
                         theme,
                         true,
                         cx.listener(|this, _event, _window, cx| {
@@ -2420,9 +2501,7 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(section_header(
-                "Network",
-                "Choose how WhatsApp Web reaches the network. Changes apply per account and may require reopening an account.",
+            .child(section_header(t!("Network"),t!("Choose how WhatsApp Web reaches the network. Changes apply per account and may require reopening an account."),
                 theme,
             ))
             .child(mode_card)
@@ -2445,29 +2524,71 @@ impl SettingsWindow {
         let downloads_error = self.downloads_error.clone();
         let backup_card = self.backup_card(theme, cx);
         let onboarding_status = if settings.onboarding_completed {
-            format!(
-                "Completed (guide version {}). Reopening it here never marks it uncompleted.",
-                settings.onboarding_version
+            tr!(
+                "Completed (guide version {version}). Reopening it here never marks it uncompleted.",
+                version = settings.onboarding_version
             )
         } else {
-            "Not completed. It opens automatically only on a new installation.".to_string()
+            t!("Not completed. It opens automatically only on a new installation.").to_string()
         };
 
         div()
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(section_header(
-                "General",
-                "Window behavior, startup, writing, downloads, media actions, and the global show/hide shortcut.",
+            .child(section_header(t!("General"),t!("Window behavior, startup, writing, downloads, media actions, and the global show/hide shortcut."),
                 theme,
             ))
             .child(
                 card(theme)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child(t!("Interface language")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(t!(
+                                "Translates the native shell and its windows. WhatsApp Web content keeps its own language."
+                            )),
+                    )
+                    .child({
+                        let current = settings.language;
+                        let mut row = div().flex().flex_wrap().gap(px(8.));
+                        for language in [
+                            crate::i18n::Language::System,
+                            crate::i18n::Language::English,
+                            crate::i18n::Language::Spanish,
+                        ] {
+                            let selected = current == language;
+                            let label = if selected {
+                                format!("✓ {}", language.label())
+                            } else {
+                                language.label().to_string()
+                            };
+                            row = row.child(button(
+                                SharedString::from(format!("language-{}", language.slug())),
+                                label,
+                                theme,
+                                selected,
+                                cx.listener(move |this, _event, _window, cx| {
+                                    this.model.update_settings(cx, |settings| {
+                                        settings.language = language;
+                                    });
+                                }),
+                            ));
+                        }
+                        row
+                    }),
+            )
+            .child(
+                card(theme)
                     .child(toggle_row(
-                        "close-to-tray",
-                        "Close to tray",
-                        "Closing an account window hides it instead of quitting OxideZap.",
+                        "close-to-tray",t!("Close to tray"),t!("Closing an account window hides it instead of quitting OxideZap."),
                         settings.close_to_tray,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -2478,9 +2599,7 @@ impl SettingsWindow {
                     ))
                     .child(divider(theme))
                     .child(toggle_row(
-                        "start-at-login",
-                        "Launch at login",
-                        "Start OxideZap automatically when you sign in to the desktop.",
+                        "start-at-login",t!("Launch at login"),t!("Start OxideZap automatically when you sign in to the desktop."),
                         settings.start_at_login,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -2491,9 +2610,7 @@ impl SettingsWindow {
                     ))
                     .child(divider(theme))
                     .child(toggle_row(
-                        "remember-bounds",
-                        "Remember window size and position",
-                        "Restore each account window where you left it.",
+                        "remember-bounds",t!("Remember window size and position"),t!("Restore each account window where you left it."),
                         settings.remember_bounds,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -2510,13 +2627,10 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("Global shortcut"),
+                            .child(t!("Global shortcut")),
                     )
-                    .child(labeled_field(
-                        "Show or hide OxideZap",
-                        Some(SharedString::from(
-                            "Use modifiers plus one key, for example Ctrl+Shift+W.",
-                        )),
+                    .child(labeled_field(t!("Show or hide OxideZap"),
+                        Some(SharedString::from(t!("Use modifiers plus one key, for example Ctrl+Shift+W."))),
                         theme,
                         shortcut_field,
                     ))
@@ -2529,8 +2643,7 @@ impl SettingsWindow {
                         )
                     })
                     .child(div().flex().gap(px(8.)).child(button(
-                        "apply-shortcut",
-                        "Apply shortcut",
+                        "apply-shortcut",t!("Apply shortcut"),
                         theme,
                         true,
                         cx.listener(|this, _event, _window, cx| {
@@ -2547,7 +2660,7 @@ impl SettingsWindow {
                                     cx.notify();
                                 }
                                 Err(error) => {
-                                    this.shortcut_error = Some(error.to_string());
+                                    this.shortcut_error = Some(crate::i18n::translate_owned(&error.to_string()));
                                     cx.notify();
                                 }
                             }
@@ -2557,7 +2670,7 @@ impl SettingsWindow {
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
-                            .child("Global shortcuts require an X11 or XWayland session."),
+                            .child(t!("Global shortcuts require an X11 or XWayland session.")),
                     )
                     .child(divider(theme))
                     .child(
@@ -2565,13 +2678,10 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("Boss key"),
+                            .child(t!("Boss key")),
                     )
-                    .child(labeled_field(
-                        "Hide or restore every window",
-                        Some(SharedString::from(
-                            "A second global shortcut for instant privacy. A second press restores the windows that were visible.",
-                        )),
+                    .child(labeled_field(t!("Hide or restore every window"),
+                        Some(SharedString::from(t!("A second global shortcut for instant privacy. A second press restores the windows that were visible."))),
                         theme,
                         boss_key_field,
                     ))
@@ -2584,8 +2694,7 @@ impl SettingsWindow {
                         )
                     })
                     .child(div().flex().gap(px(8.)).child(button(
-                        "apply-boss-key",
-                        "Apply boss key",
+                        "apply-boss-key",t!("Apply boss key"),
                         theme,
                         true,
                         cx.listener(|this, _event, _window, cx| {
@@ -2602,7 +2711,7 @@ impl SettingsWindow {
                                     cx.notify();
                                 }
                                 Err(error) => {
-                                    this.boss_key_error = Some(error.to_string());
+                                    this.boss_key_error = Some(crate::i18n::translate_owned(&error.to_string()));
                                     cx.notify();
                                 }
                             }
@@ -2612,7 +2721,7 @@ impl SettingsWindow {
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
-                            .child("The boss key uses the same X11/XWayland grab and can conflict with desktop shortcuts."),
+                            .child(t!("The boss key uses the same X11/XWayland grab and can conflict with desktop shortcuts.")),
                     )
                     .child(divider(theme))
                     .child(
@@ -2620,13 +2729,10 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("Command palette"),
+                            .child(t!("Command palette")),
                     )
-                    .child(labeled_field(
-                        "Optional global shortcut",
-                        Some(SharedString::from(
-                            "Opens the command palette while any application is focused. Leave empty to use Ctrl+K only inside the native window.",
-                        )),
+                    .child(labeled_field(t!("Optional global shortcut"),
+                        Some(SharedString::from(t!("Opens the command palette while any application is focused. Leave empty to use Ctrl+K only inside the native window."))),
                         theme,
                         palette_shortcut_field,
                     ))
@@ -2639,8 +2745,7 @@ impl SettingsWindow {
                         )
                     })
                     .child(div().flex().gap(px(8.)).child(button(
-                        "apply-palette-shortcut",
-                        "Apply palette shortcut",
+                        "apply-palette-shortcut",t!("Apply palette shortcut"),
                         theme,
                         true,
                         cx.listener(|this, _event, _window, cx| {
@@ -2671,7 +2776,7 @@ impl SettingsWindow {
                                     cx.notify();
                                 }
                                 Err(error) => {
-                                    this.palette_shortcut_error = Some(error.to_string());
+                                    this.palette_shortcut_error = Some(crate::i18n::translate_owned(&error.to_string()));
                                     cx.notify();
                                 }
                             }
@@ -2681,7 +2786,7 @@ impl SettingsWindow {
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
-                            .child("A global palette shortcut takes precedence over WhatsApp Web's own Ctrl+K chat search."),
+                            .child(t!("A global palette shortcut takes precedence over WhatsApp Web's own Ctrl+K chat search.")),
                     ),
             )
             .child(
@@ -2691,13 +2796,10 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("Downloads"),
+                            .child(t!("Downloads")),
                     )
-                    .child(labeled_field(
-                        "Download folder",
-                        Some(SharedString::from(
-                            "Leave the default to follow the desktop Downloads directory.",
-                        )),
+                    .child(labeled_field(t!("Download folder"),
+                        Some(SharedString::from(t!("Leave the default to follow the desktop Downloads directory."))),
                         theme,
                         downloads_dir_field,
                     ))
@@ -2715,8 +2817,7 @@ impl SettingsWindow {
                             .flex_wrap()
                             .gap(px(8.))
                             .child(button(
-                                "choose-downloads-directory",
-                                "Choose…",
+                                "choose-downloads-directory",t!("Choose…"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -2724,8 +2825,7 @@ impl SettingsWindow {
                                 }),
                             ))
                             .child(button(
-                                "apply-downloads-directory",
-                                "Apply folder",
+                                "apply-downloads-directory",t!("Apply folder"),
                                 theme,
                                 true,
                                 cx.listener(|this, _event, _window, cx| {
@@ -2733,8 +2833,7 @@ impl SettingsWindow {
                                 }),
                             ))
                             .child(button(
-                                "default-downloads-directory",
-                                "Use default",
+                                "default-downloads-directory",t!("Use default"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -2742,8 +2841,7 @@ impl SettingsWindow {
                                 }),
                             ))
                             .child(button(
-                                "open-download-center",
-                                "Open Download Center",
+                                "open-download-center",t!("Open Download Center"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -2755,9 +2853,7 @@ impl SettingsWindow {
                     )
                     .child(divider(theme))
                     .child(toggle_row(
-                        "downloads-account-folders",
-                        "Organize by account",
-                        "Save each account's files in its own subfolder.",
+                        "downloads-account-folders",t!("Organize by account"),t!("Save each account's files in its own subfolder."),
                         settings.downloads_account_folders,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -2769,9 +2865,7 @@ impl SettingsWindow {
                     ))
                     .child(divider(theme))
                     .child(toggle_row(
-                        "downloads-date-folders",
-                        "Organize by month",
-                        "Add a YYYY-MM subfolder (UTC) for the month each file was downloaded.",
+                        "downloads-date-folders",t!("Organize by month"),t!("Add a YYYY-MM subfolder (UTC) for the month each file was downloaded."),
                         settings.downloads_date_folders,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -2783,9 +2877,7 @@ impl SettingsWindow {
                     ))
                     .child(divider(theme))
                     .child(toggle_row(
-                        "media-actions",
-                        "Media action menu",
-                        "Right-click normal media to save it, open it, or copy an image. View-once and protected media are never offered.",
+                        "media-actions",t!("Media action menu"),t!("Right-click normal media to save it, open it, or copy an image. View-once and protected media are never offered."),
                         settings.media_actions,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -2798,8 +2890,9 @@ impl SettingsWindow {
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
-                            .child(format!(
-                                "The download history keeps the last {DOWNLOAD_HISTORY_LIMIT} entries. Existing files are never overwritten; collisions get a numbered suffix."
+                            .child(tr!(
+                                "The download history keeps the last {count} entries. Existing files are never overwritten; collisions get a numbered suffix.",
+                                count = DOWNLOAD_HISTORY_LIMIT
                             )),
                     ),
             )
@@ -2810,15 +2903,13 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("First-run guide"),
+                            .child(t!("First-run guide")),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(theme.text_muted)
-                            .child(
-                                "Review the WhatsApp Web login, the QR steps, account isolation, tray and close behavior, notifications, the app lock, and where OxideZap stores data.",
-                            ),
+                            .child(t!("Review the WhatsApp Web login, the QR steps, account isolation, tray and close behavior, notifications, the app lock, and where OxideZap stores data.")),
                     )
                     .child(
                         div()
@@ -2827,8 +2918,7 @@ impl SettingsWindow {
                             .child(onboarding_status),
                     )
                     .child(div().flex().gap(px(8.)).child(button(
-                        "replay-onboarding",
-                        "Show the first-run guide again",
+                        "replay-onboarding",t!("Show the first-run guide again"),
                         theme,
                         false,
                         cx.listener(|this, _event, _window, cx| {
@@ -2848,16 +2938,23 @@ impl SettingsWindow {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (suspended, active_views, total_accounts) = {
+        let (suspended, active_views, total_accounts, performance) = {
             let model = self.model.read(cx);
             (
                 model.suspended_account_count(),
                 model.active_webview_count(),
                 model.settings.accounts.len(),
+                model.performance_status(),
             )
         };
         let estimate = suspended as u64 * crate::app::ESTIMATED_SUSPENDED_MEMORY_BYTES;
         let feedback = self.memory_feedback.clone();
+        let saver_active = performance.battery_saver;
+
+        let mut mode_row = div().flex().flex_wrap().gap(px(8.));
+        for mode in PerformanceMode::ALL {
+            mode_row = mode_row.child(performance_mode_button(mode, settings, theme, cx));
+        }
 
         let mut delay_row = div().flex().flex_wrap().gap(px(8.));
         for minutes in SUSPEND_DELAY_OPTIONS {
@@ -2869,16 +2966,100 @@ impl SettingsWindow {
             .flex_col()
             .gap(px(18.))
             .child(section_header(
-                "Performance",
-                "Reduce memory by releasing accounts you are not using. Off by default.",
+                t!("Performance"),
+                t!("Reduce animation and polling work without turning off notifications, downloads, calls, the app lock, or security checks."),
                 theme,
             ))
             .child(
                 card(theme)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child("Battery saver mode"),
+                    )
+                    .child(mode_row)
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(settings.performance.mode.description()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(
+                                "Automatic reads the power source from /sys/class/power_supply and stays in normal mode when no battery can be read. Changes apply immediately; no restart is needed.",
+                            ),
+                    )
+                    .child(divider(theme))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(if saver_active {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(performance.status_text()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(format!(
+                                "Power source: {}. {} mode.",
+                                performance.power.label(),
+                                if saver_active { "Battery saver" } else { "Normal" }
+                            )),
+                    ),
+            )
+            .child(
+                card(theme)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child("What battery saver changes"),
+                    )
+                    .child(performance_change_line(
+                        "Pauses WhatsApp Web animation and CSS transitions.",
+                        theme,
+                    ))
+                    .child(performance_change_line(
+                        "Checks the connection and QR login state every 5 s instead of 2 s; online/offline events still report immediately.",
+                        theme,
+                    ))
+                    .child(performance_change_line(
+                        "Synchronizes the native WebKit overlay 4 times per second instead of 10.",
+                        theme,
+                    ))
+                    .child(performance_change_line(
+                        "When low-memory mode is already on, releases hidden accounts after at most 15 minutes and sweeps every 30 s. It never enables low-memory mode on its own.",
+                        theme,
+                    ))
+                    .child(performance_change_line(
+                        "Keeps downloads, calls and recordings, notifications, the app lock, and the WhatsApp login working.",
+                        theme,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(
+                                "These are qualitative cadence reductions, not benchmarked FPS or watt savings. WebKit does not expose per-view CPU or GPU use, and WhatsApp Web plus WebKit still dominate power consumption.",
+                            ),
+                    ),
+            )
+            .child(
+                card(theme)
                     .child(toggle_row(
                         "low-memory-mode",
-                        "Low-memory mode",
-                        "Destroy the WebKit view of an account that stayed hidden for the delay below. The account and its WhatsApp session stay on disk.",
+                        t!("Low-memory mode"),
+                        t!("Destroy the WebKit view of an account that stayed hidden for the delay below. The account and its WhatsApp session stay on disk."),
                         settings.memory.suspend_hidden,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -2893,22 +3074,18 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("Release hidden accounts after"),
+                            .child(t!("Release hidden accounts after")),
                     )
                     .child(delay_row)
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
-                            .child(
-                                "Reactivating reloads WhatsApp Web, which takes a few seconds. The current scroll position or an unsent draft may be lost.",
-                            ),
+                            .child(t!("Reactivating reloads WhatsApp Web, which takes a few seconds. The current scroll position or an unsent draft may be lost.")),
                     )
                     .child(divider(theme))
                     .child(toggle_row(
-                        "keep-active-loaded",
-                        "Keep the active account loaded",
-                        "Never release the account you opened most recently, even when every window is hidden.",
+                        "keep-active-loaded",t!("Keep the active account loaded"),t!("Never release the account you opened most recently, even when every window is hidden."),
                         settings.memory.keep_active_account,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -2926,7 +3103,7 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("Status"),
+                            .child(t!("Status")),
                     )
                     .child(
                         div()
@@ -2934,17 +3111,21 @@ impl SettingsWindow {
                             .flex_wrap()
                             .gap(px(28.))
                             .child(storage_stat(
-                                "Active views",
-                                format!("{active_views} of {total_accounts}"),
+                                t!("Active views"),
+                                tr!(
+                                    "{active} of {total}",
+                                    active = active_views,
+                                    total = total_accounts
+                                ),
                                 theme,
                             ))
                             .child(storage_stat(
-                                "Suspended accounts",
+                                t!("Suspended accounts"),
                                 suspended.to_string(),
                                 theme,
                             ))
                             .child(storage_stat(
-                                "Estimated memory released",
+                                t!("Estimated memory released"),
                                 storage::format_bytes(estimate),
                                 theme,
                             )),
@@ -2953,9 +3134,9 @@ impl SettingsWindow {
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
-                            .child(format!(
-                                "The estimate assumes about {} per released WebKit web process. WebKit does not expose per-view memory, so this is not a measurement.",
-                                storage::format_bytes(crate::app::ESTIMATED_SUSPENDED_MEMORY_BYTES)
+                            .child(tr!(
+                                "The estimate assumes about {size} per released WebKit web process. WebKit does not expose per-view memory, so this is not a measurement.",
+                                size = storage::format_bytes(crate::app::ESTIMATED_SUSPENDED_MEMORY_BYTES)
                             )),
                     )
                     .child(
@@ -2964,8 +3145,7 @@ impl SettingsWindow {
                             .flex_wrap()
                             .gap(px(8.))
                             .child(button(
-                                "release-hidden-accounts",
-                                "Release hidden accounts now",
+                                "release-hidden-accounts",t!("Release hidden accounts now"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -2973,13 +3153,14 @@ impl SettingsWindow {
                                         model.release_hidden_accounts_now(cx)
                                     });
                                     this.memory_feedback = Some(if released == 0 {
-                                        Notice::success(
+                                        Notice::success(t!(
                                             "No hidden account could be released right now. Downloads, calls or recordings, the active account, the app lock, and quitting all block suspension.",
-                                        )
+                                        ))
                                     } else {
-                                        Notice::success(format!(
-                                            "Released {released} hidden account{}. Open the account to restore it.",
-                                            if released == 1 { "" } else { "s" }
+                                        Notice::success(tn!(
+                                            released,
+                                            "Released {count} hidden account. Open the account to restore it.",
+                                            "Released {count} hidden accounts. Open the account to restore it.",
                                         ))
                                     });
                                     cx.notify();
@@ -3006,15 +3187,13 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("What suspension keeps"),
+                            .child(t!("What suspension keeps")),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(theme.text_muted)
-                            .child(
-                                "Suspending never deletes the account, its WebKit profile, cookies, local storage, or the WhatsApp login. It only destroys the running view, which lets WebKit terminate that account's web process. Downloads, calls, and recordings always block suspension, and nothing is released while the app is locked or quitting.",
-                            ),
+                            .child(t!("Suspending never deletes the account, its WebKit profile, cookies, local storage, or the WhatsApp login. It only destroys the running view, which lets WebKit terminate that account's web process. Downloads, calls, and recordings always block suspension, and nothing is released while the app is locked or quitting.")),
                     ),
             )
             .into_any_element()
@@ -3033,8 +3212,8 @@ impl SettingsWindow {
 
         let mut security_card = card(theme).child(toggle_row(
             "lock-enabled",
-            "Require a password to unlock",
-            "Hide every account window behind a lock screen.",
+            t!("Require a password to unlock"),
+            t!("Hide every account window behind a lock screen."),
             settings.lock.enabled,
             theme,
             cx.listener(|this, _event, _window, cx| {
@@ -3047,9 +3226,7 @@ impl SettingsWindow {
             security_card = security_card
                 .child(divider(theme))
                 .child(toggle_row(
-                    "lock-on-launch",
-                    "Lock on launch",
-                    "Ask for the password when OxideZap starts.",
+                    "lock-on-launch",t!("Lock on launch"),t!("Ask for the password when OxideZap starts."),
                     settings.lock.lock_on_launch,
                     theme,
                     cx.listener(|this, _event, _window, cx| {
@@ -3060,9 +3237,7 @@ impl SettingsWindow {
                 ))
                 .child(divider(theme))
                 .child(toggle_row(
-                    "lock-on-hide",
-                    "Lock when hidden",
-                    "Lock automatically when the window is hidden to the tray.",
+                    "lock-on-hide",t!("Lock when hidden"),t!("Lock automatically when the window is hidden to the tray."),
                     settings.lock.lock_on_hide,
                     theme,
                     cx.listener(|this, _event, _window, cx| {
@@ -3073,9 +3248,7 @@ impl SettingsWindow {
                 ))
                 .child(divider(theme))
                 .child(toggle_row(
-                    "lock-on-suspend",
-                    "Lock on system suspend",
-                    "Lock before sleeping and after waking, using the logind D-Bus signal when available.",
+                    "lock-on-suspend",t!("Lock on system suspend"),t!("Lock before sleeping and after waking, using the logind D-Bus signal when available."),
                     settings.lock.lock_on_suspend,
                     theme,
                     cx.listener(|this, _event, _window, cx| {
@@ -3086,9 +3259,7 @@ impl SettingsWindow {
                 ))
                 .child(divider(theme))
                 .child(toggle_row(
-                    "lock-on-screen-lock",
-                    "Lock when the desktop screen locks",
-                    "Best effort: depends on the desktop exposing a ScreenSaver D-Bus interface.",
+                    "lock-on-screen-lock",t!("Lock when the desktop screen locks"),t!("Best effort: depends on the desktop exposing a ScreenSaver D-Bus interface."),
                     settings.lock.lock_on_screen_lock,
                     theme,
                     cx.listener(|this, _event, _window, cx| {
@@ -3108,7 +3279,7 @@ impl SettingsWindow {
                                 .text_size(px(14.))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
-                                .child("Lock after idle time"),
+                                .child(t!("Lock after idle time")),
                         )
                         .child(
                             div()
@@ -3129,22 +3300,23 @@ impl SettingsWindow {
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text_muted)
                 .child(if has_password {
-                    "Change password"
+                    t!("Change password")
                 } else {
-                    "Set a password"
+                    t!("Set a password")
                 }),
         );
         password_card = password_card
             .child(labeled_field(
-                "Password",
-                Some(SharedString::from(format!(
-                    "At least {MIN_PASSWORD_LENGTH} characters."
+                t!("Password"),
+                Some(SharedString::from(tr!(
+                    "At least {count} characters.",
+                    count = MIN_PASSWORD_LENGTH
                 ))),
                 theme,
                 password_field,
             ))
             .child(labeled_field(
-                "Confirm password",
+                t!("Confirm password"),
                 None,
                 theme,
                 confirm_field,
@@ -3164,9 +3336,9 @@ impl SettingsWindow {
                     .child(button(
                         "save-password",
                         if has_password {
-                            "Update password"
+                            t!("Update password")
                         } else {
-                            "Set password"
+                            t!("Set password")
                         },
                         theme,
                         true,
@@ -3175,7 +3347,7 @@ impl SettingsWindow {
                             let confirm = this.confirm_field.read(cx).content().to_string();
                             if password != confirm {
                                 this.security_error =
-                                    Some("The passwords do not match.".to_string());
+                                    Some(t!("The passwords do not match.").to_string());
                                 cx.notify();
                                 return;
                             }
@@ -3199,7 +3371,7 @@ impl SettingsWindow {
                     .when(has_password, |style| {
                         style.child(button(
                             "remove-password",
-                            "Remove password",
+                            t!("Remove password"),
                             theme,
                             false,
                             cx.listener(|this, _event, _window, cx| {
@@ -3223,7 +3395,7 @@ impl SettingsWindow {
                         div()
                             .text_size(px(12.))
                             .text_color(theme.text)
-                            .child("Remove password protection?"),
+                            .child(t!("Remove password protection?")),
                     )
                     .child(
                         div()
@@ -3231,7 +3403,7 @@ impl SettingsWindow {
                             .gap(px(8.))
                             .child(button(
                                 "remove-password-yes",
-                                "Remove",
+                                t!("Remove"),
                                 theme,
                                 true,
                                 cx.listener(|this, _event, _window, cx| {
@@ -3242,7 +3414,7 @@ impl SettingsWindow {
                             ))
                             .child(button(
                                 "remove-password-no",
-                                "Cancel",
+                                t!("Cancel"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -3258,17 +3430,14 @@ impl SettingsWindow {
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(section_header(
-                "Security",
-                "The app lock uses Argon2id. System suspend and screen-lock detection are best effort through D-Bus.",
+            .child(section_header(t!("Security"),t!("The app lock uses Argon2id. System suspend and screen-lock detection are best effort through D-Bus."),
                 theme,
             ))
             .child(security_card)
             .child(password_card)
             .when(settings.lock.enabled && has_password, |style| {
                 style.child(div().flex().gap(px(8.)).child(button(
-                    "lock-now",
-                    "Lock now",
+                    "lock-now",t!("Lock now"),
                     theme,
                     false,
                     cx.listener(|this, _event, _window, cx| {
@@ -3287,17 +3456,17 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let status = if update.development {
-            Some("Development builds do not check for updates.".to_string())
+            Some(t!("Development builds do not check for updates.").to_string())
         } else if !settings.automatic_update_checks {
-            Some("Automatic update checks are off.".to_string())
+            Some(t!("Automatic update checks are off.").to_string())
         } else if update.available.is_none() {
             match update.skipped_version.as_ref() {
                 Some(skipped) if update.latest_version.as_deref() == Some(skipped.as_str()) => {
-                    Some(format!("Version {skipped} is skipped."))
+                    Some(tr!("Version {version} is skipped.", version = skipped))
                 }
                 Some(_) => None,
                 None if update.latest_version.is_some() => {
-                    Some("You are running the latest release.".to_string())
+                    Some(t!("You are running the latest release.").to_string())
                 }
                 None => None,
             }
@@ -3305,13 +3474,15 @@ impl SettingsWindow {
             None
         };
 
+        let diagnostics_running = self.diagnostics_running;
+        let diagnostics_feedback = self.diagnostics_feedback.clone();
+        let diagnostics_preview = self.diagnostics_preview.clone();
+
         div()
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(section_header(
-                "About OxideZap",
-                "A native Linux shell around the official WhatsApp Web experience.",
+            .child(section_header(t!("About OxideZap"),t!("A native Linux shell around the official WhatsApp Web experience."),
                 theme,
             ))
             .child(
@@ -3338,21 +3509,24 @@ impl SettingsWindow {
                                         div()
                                             .text_size(px(12.))
                                             .text_color(theme.text_muted)
-                                            .child(format!("Version {}", update.current_version)),
+                                            .child(tr!(
+                                                "Version {version}",
+                                                version = update.current_version
+                                            )),
                                     )
                                     .when(update.development, |style| {
                                         style.child(
                                             div()
                                                 .text_size(px(11.))
                                                 .text_color(theme.text_faint)
-                                                .child("Development build"),
+                                                .child(t!("Development build")),
                                         )
                                     })
                                     .child(
                                         div()
                                             .text_size(px(11.))
                                             .text_color(theme.text_faint)
-                                            .child("Rust · GPUI · WebKitGTK"),
+                                            .child(t!("Rust · GPUI · WebKitGTK")),
                                     ),
                             ),
                     )
@@ -3361,17 +3535,14 @@ impl SettingsWindow {
                         div()
                             .text_size(px(12.))
                             .text_color(theme.text_muted)
-                            .child(
-                                "OxideZap is an unofficial, independent project. It is not affiliated with, endorsed by, or sponsored by WhatsApp or Meta. WhatsApp is a trademark of Meta Platforms, Inc.",
-                            ),
+                            .child(t!("OxideZap is an unofficial, independent project. It is not affiliated with, endorsed by, or sponsored by WhatsApp or Meta. WhatsApp is a trademark of Meta Platforms, Inc.")),
                     )
                     .child(
                         div()
                             .flex()
                             .gap(px(8.))
                             .child(button(
-                                "open-repo",
-                                "GitHub repository",
+                                "open-repo",t!("GitHub repository"),
                                 theme,
                                 false,
                                 |_event, _window, _cx| {
@@ -3381,8 +3552,7 @@ impl SettingsWindow {
                                 },
                             ))
                             .child(button(
-                                "open-issues",
-                                "Report an issue",
+                                "open-issues",t!("Report an issue"),
                                 theme,
                                 false,
                                 |_event, _window, _cx| {
@@ -3393,6 +3563,89 @@ impl SettingsWindow {
                             )),
                     ),
             )
+            .child(
+                card(theme)
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child("Diagnostics"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "Preview, copy, or save a privacy-scrubbed report with versions, session details, settings states, and recent errors. It never includes chats, account names or ids, cookies, proxy credentials, the app-lock hash, or full home paths.",
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(button(
+                                "diagnostics-preview",
+                                if diagnostics_running {
+                                    "Generating…"
+                                } else {
+                                    "Preview report"
+                                },
+                                theme,
+                                true,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.start_diagnostics_action(DiagnosticsAction::Preview, cx);
+                                }),
+                            ))
+                            .child(button(
+                                "diagnostics-copy",
+                                "Copy to clipboard",
+                                theme,
+                                false,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.start_diagnostics_action(DiagnosticsAction::Copy, cx);
+                                }),
+                            ))
+                            .child(button(
+                                "diagnostics-save",
+                                "Save to file",
+                                theme,
+                                false,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.start_diagnostics_action(DiagnosticsAction::Save, cx);
+                                }),
+                            )),
+                    )
+                    .when_some(diagnostics_feedback, |style, notice| {
+                        style.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(if notice.error {
+                                    theme.danger
+                                } else {
+                                    theme.text_muted
+                                })
+                                .child(notice.text),
+                        )
+                    })
+                    .when_some(diagnostics_preview, |style, preview| {
+                        style.child(
+                            div()
+                                .id("diagnostics-preview-text")
+                                .max_h(px(280.))
+                                .overflow_y_scroll()
+                                .p(px(10.))
+                                .rounded_md()
+                                .bg(theme.surface_alt)
+                                .border_1()
+                                .border_color(theme.border)
+                                .font_family("monospace")
+                                .text_size(px(10.))
+                                .text_color(theme.text_muted)
+                                .child(preview),
+                        )
+                    }),
+            )
             .when_some(update.available.clone(), |style, info| {
                 style.child(
                     card(theme)
@@ -3402,23 +3655,23 @@ impl SettingsWindow {
                                 .text_size(px(14.))
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme.text)
-                                .child(format!("Version {} is available", info.version)),
+                                .child(tr!(
+                                    "Version {version} is available",
+                                    version = info.version
+                                )),
                         )
                         .child(
                             div()
                                 .text_size(px(12.))
                                 .text_color(theme.text_muted)
-                                .child(
-                                    "A newer release is published on GitHub. OxideZap does not download or install it automatically.",
-                                ),
+                                .child(t!("A newer release is published on GitHub. OxideZap does not download or install it automatically.")),
                         )
                         .child(
                             div()
                                 .flex()
                                 .gap(px(8.))
                                 .child(button(
-                                    "update-view-release",
-                                    "View release",
+                                    "update-view-release",t!("View release"),
                                     theme,
                                     true,
                                     cx.listener(|this, _event, _window, cx| {
@@ -3428,8 +3681,7 @@ impl SettingsWindow {
                                     }),
                                 ))
                                 .child(button(
-                                    "update-skip-version",
-                                    "Skip this version",
+                                    "update-skip-version",t!("Skip this version"),
                                     theme,
                                     false,
                                     cx.listener(|this, _event, _window, cx| {
@@ -3444,9 +3696,7 @@ impl SettingsWindow {
             .child(
                 card(theme)
                     .child(toggle_row(
-                        "automatic-update-checks",
-                        "Check for updates automatically",
-                        "Ask GitHub for the latest release at most once every 24 hours. The request contains no personal data.",
+                        "automatic-update-checks",t!("Check for updates automatically"),t!("Ask GitHub for the latest release at most once every 24 hours. The request contains no personal data."),
                         settings.automatic_update_checks,
                         theme,
                         cx.listener(|this, _event, _window, cx| {
@@ -3472,19 +3722,19 @@ impl SettingsWindow {
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child("Built with"),
+                            .child(t!("Built with")),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(theme.text)
-                            .child("GPUI for the native shell · WebKitGTK for WhatsApp Web · Rust for everything in between."),
+                            .child(t!("GPUI for the native shell · WebKitGTK for WhatsApp Web · Rust for everything in between.")),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(theme.text_faint)
-                            .child("MIT licensed. The source code is available on GitHub."),
+                            .child(t!("MIT licensed. The source code is available on GitHub.")),
                     ),
             )
             .into_any_element()
@@ -3511,10 +3761,7 @@ fn writing_card(
         };
         let writing = settings.writing.clone();
         language_row = language_row.child(button(
-            SharedString::from(format!(
-                "spell-check-language-{}",
-                language.label().to_lowercase()
-            )),
+            SharedString::from(format!("spell-check-language-{language:?}").to_lowercase()),
             label,
             theme,
             selected,
@@ -3534,20 +3781,18 @@ fn writing_card(
                 .text_size(px(12.))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text_muted)
-                .child("Writing"),
+                .child(t!("Writing")),
         )
         .child(
             div()
                 .text_size(px(13.))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text)
-                .child("Spell check language"),
+                .child(t!("Spell check language")),
         )
         .child(language_row)
         .child(toggle_row(
-            "spell-check-enabled",
-            "Correct while I type",
-            "Use WebKitGTK's local spell checker in the WhatsApp composer.",
+            "spell-check-enabled",t!("Correct while I type"),t!("Use WebKitGTK's local spell checker in the WhatsApp composer."),
             settings.writing.spell_check,
             theme,
             cx.listener(move |this, _event, _window, cx| {
@@ -3561,7 +3806,7 @@ fn writing_card(
             div()
                 .text_size(px(11.))
                 .text_color(theme.text_faint)
-                .child("Automatic follows the desktop locale. WebKitGTK only checks languages whose hunspell dictionaries are installed. Changes apply to open accounts; WhatsApp Web still controls its own composer and Enter-to-send behavior."),
+                .child(t!("Automatic follows the desktop locale. WebKitGTK only checks languages whose hunspell dictionaries are installed. Changes apply to open accounts; WhatsApp Web still controls its own composer and Enter-to-send behavior.")),
         )
 }
 
@@ -3576,6 +3821,7 @@ impl Render for SettingsWindow {
         if window.focused(cx).is_none() {
             window.focus(&self.focus_handle);
         }
+        window.set_window_title(t!("OxideZap Settings"));
 
         // The theme is resolved from the window appearance on every render, so a
         // repaint is enough when the system appearance changes. Register once per
@@ -3639,7 +3885,7 @@ impl Render for SettingsWindow {
                                 div()
                                     .text_size(px(10.))
                                     .text_color(theme.text_faint)
-                                    .child("Settings"),
+                                    .child(t!("Settings")),
                             ),
                     ),
             )
@@ -3657,7 +3903,7 @@ impl Render for SettingsWindow {
             SettingsSection::About,
         ] {
             let active = self.section == section;
-            let id = SharedString::from(format!("settings-nav-{}", section.label()));
+            let id = SharedString::from(format!("settings-nav-{section:?}"));
             sidebar = sidebar.child(sidebar_item(
                 id,
                 section.icon(),
@@ -3698,7 +3944,7 @@ impl Render for SettingsWindow {
                     .gap(px(18.))
                     .child(div().flex().justify_end().child(button(
                         "close-settings",
-                        "Close",
+                        t!("Close"),
                         theme,
                         false,
                         cx.listener(|_this, _event, window, _cx| {
@@ -3744,6 +3990,41 @@ fn avatar(initial: &str, theme: Theme) -> impl IntoElement {
         .child(initial.to_uppercase())
 }
 
+fn performance_mode_button(
+    mode: PerformanceMode,
+    settings: &Settings,
+    theme: Theme,
+    cx: &mut Context<SettingsWindow>,
+) -> impl IntoElement {
+    let selected = settings.performance.mode == mode;
+    let text = if selected {
+        format!("✓ {}", mode.label())
+    } else {
+        mode.label().to_string()
+    };
+    button(
+        SharedString::from(format!("performance-mode-{}", mode.slug())),
+        text,
+        theme,
+        selected,
+        cx.listener(move |this, _event, _window, cx| {
+            this.model.update_settings(cx, |settings| {
+                settings.performance.mode = mode;
+            });
+        }),
+    )
+}
+
+fn performance_change_line(text: &'static str, theme: Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .gap(px(6.))
+        .text_size(px(12.))
+        .text_color(theme.text_muted)
+        .child("•")
+        .child(text)
+}
+
 fn suspend_delay_button(
     minutes: u32,
     settings: &Settings,
@@ -3777,7 +4058,7 @@ fn idle_button(
 ) -> impl IntoElement {
     let selected = settings.lock.idle_minutes == minutes;
     let label = if minutes == 0 {
-        "Off".to_string()
+        t!("Off").to_string()
     } else {
         format!("{minutes} min")
     };
@@ -3812,7 +4093,7 @@ const CSS_PREVIEW_CHARS: usize = 1200;
 fn css_preview(css: &str) -> String {
     let css = css.trim();
     if css.is_empty() {
-        return "Choose a local .css file to load a stylesheet.".to_string();
+        return t!("Choose a local .css file to load a stylesheet.").to_string();
     }
     let mut chars = css.chars();
     let mut preview: String = chars.by_ref().take(CSS_PREVIEW_CHARS).collect();
@@ -3826,19 +4107,29 @@ fn css_preview(css: &str) -> String {
 /// rejects an oversized file before allocating its contents; validation runs
 /// before the CSS reaches settings or WebKit.
 fn read_custom_css_file(path: &Path) -> Result<String, String> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        tr!(
+            "Could not inspect {path}: {error}",
+            path = path.display(),
+            error = error
+        )
+    })?;
     if metadata.len() > MAX_CUSTOM_CSS_BYTES as u64 {
-        return Err(format!(
-            "The CSS file is too large ({} bytes; the limit is {} KiB).",
-            metadata.len(),
-            MAX_CUSTOM_CSS_BYTES / 1024
+        return Err(tr!(
+            "The CSS file is too large ({bytes} bytes; the limit is {limit} KiB).",
+            bytes = metadata.len(),
+            limit = MAX_CUSTOM_CSS_BYTES / 1024
         ));
     }
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
-    let css =
-        String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8.", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|error| {
+        tr!(
+            "Could not read {path}: {error}",
+            path = path.display(),
+            error = error
+        )
+    })?;
+    let css = String::from_utf8(bytes)
+        .map_err(|_| tr!("{path} is not valid UTF-8.", path = path.display()))?;
     validate_custom_css(&css)?;
     Ok(css)
 }
@@ -3852,31 +4143,37 @@ fn request_file_chooser(
     result: Sender<Option<PathBuf>>,
 ) {
     glib::MainContext::default().invoke(move || {
-        let save = mode == FileChooserMode::Save;
+        let save = matches!(mode, FileChooserMode::Save | FileChooserMode::Diagnostics);
         let folder = mode == FileChooserMode::Folder;
-        let (title, action, accept) = if save {
+        let (title, action, accept) = if mode == FileChooserMode::Diagnostics {
             (
-                "Export OxideZap settings",
+                "Save OxideZap diagnostics",
                 gtk::FileChooserAction::Save,
-                "Export",
+                "Save",
+            )
+        } else if mode == FileChooserMode::Save {
+            (
+                t!("Export OxideZap settings"),
+                gtk::FileChooserAction::Save,
+                t!("Export"),
             )
         } else if folder {
             (
-                "Choose the OxideZap download folder",
+                t!("Choose the OxideZap download folder"),
                 gtk::FileChooserAction::SelectFolder,
-                "Select",
+                t!("Select"),
             )
         } else if mode == FileChooserMode::Css {
             (
-                "Load experimental WhatsApp CSS",
+                t!("Load experimental WhatsApp CSS"),
                 gtk::FileChooserAction::Open,
-                "Load",
+                t!("Load"),
             )
         } else {
             (
-                "Import OxideZap settings",
+                t!("Import OxideZap settings"),
                 gtk::FileChooserAction::Open,
-                "Import",
+                t!("Import"),
             )
         };
         let dialog = gtk::FileChooserNative::new(
@@ -3884,7 +4181,7 @@ fn request_file_chooser(
             None::<&gtk::Window>,
             action,
             Some(accept),
-            Some("Cancel"),
+            Some(t!("Cancel")),
         );
         dialog.set_modal(true);
         if save {
@@ -3893,10 +4190,13 @@ fn request_file_chooser(
         if !folder {
             let filter = gtk::FileFilter::new();
             if mode == FileChooserMode::Css {
-                filter.set_name(Some("CSS files (*.css)"));
+                filter.set_name(Some(t!("CSS files (*.css)")));
                 filter.add_pattern("*.css");
+            } else if mode == FileChooserMode::Diagnostics {
+                filter.set_name(Some(t!("Text files (*.txt)")));
+                filter.add_pattern("*.txt");
             } else {
-                filter.set_name(Some("OxideZap settings (*.json)"));
+                filter.set_name(Some(t!("OxideZap settings (*.json)")));
                 filter.add_pattern("*.json");
             }
             dialog.add_filter(filter);

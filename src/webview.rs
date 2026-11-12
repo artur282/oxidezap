@@ -26,6 +26,7 @@ use crate::app::downloads::{
 };
 use crate::links::{self, LinkAction};
 use crate::paths::Paths;
+use crate::settings::performance::PerformanceCadence;
 use crate::settings::storage::{self, StorageOperation};
 use crate::settings::{
     AppearanceSettings, ProxyMode, ProxySettings, WritingSettings, validate_custom_css,
@@ -175,6 +176,17 @@ pub enum GtkEvent {
     MediaCopied {
         account_id: String,
     },
+    /// One or more shared or dropped files were queued for the attachment
+    /// preview. The payload never contains paths or file names.
+    ShareAttached {
+        account_id: String,
+        count: usize,
+    },
+    /// A shared or dropped file was rejected before it reached WhatsApp.
+    ShareRejected {
+        account_id: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +247,12 @@ pub enum GtkCommand {
     SetMediaActions {
         enabled: bool,
     },
+    /// Applies the resolved performance policy. The stylesheet and the injected
+    /// connection poll change immediately; no restart or reload is needed.
+    SetPerformance {
+        battery_saver: bool,
+        cadence: PerformanceCadence,
+    },
     SetDownloadLayout(DownloadLayout),
     CancelDownload {
         id: String,
@@ -266,6 +284,18 @@ pub enum GtkCommand {
     /// process. The profile directories and the WhatsApp session stay on disk.
     Suspend {
         account_id: String,
+    },
+    /// Validates and queues local files for the account's attachment preview.
+    /// Used by the CLI, the desktop drop target, and the native titlebar drop.
+    PastePaths {
+        account_id: String,
+        paths: Vec<PathBuf>,
+    },
+    /// Keeps the WebKit overlay above its parent when the account window is
+    /// always-on-top.
+    SetAlwaysOnTop {
+        account_id: String,
+        enabled: bool,
     },
     Close {
         account_id: String,
@@ -316,6 +346,13 @@ impl GtkHandle {
 
     pub fn set_media_actions(&self, enabled: bool) {
         self.send(GtkCommand::SetMediaActions { enabled });
+    }
+
+    pub fn set_performance(&self, battery_saver: bool, cadence: PerformanceCadence) {
+        self.send(GtkCommand::SetPerformance {
+            battery_saver,
+            cadence,
+        });
     }
 
     pub fn set_download_layout(&self, layout: DownloadLayout) {
@@ -374,6 +411,20 @@ impl GtkHandle {
         });
     }
 
+    pub fn paste_paths(&self, account_id: &str, paths: Vec<PathBuf>) {
+        self.send(GtkCommand::PastePaths {
+            account_id: account_id.to_string(),
+            paths,
+        });
+    }
+
+    pub fn set_always_on_top(&self, account_id: &str, enabled: bool) {
+        self.send(GtkCommand::SetAlwaysOnTop {
+            account_id: account_id.to_string(),
+            enabled,
+        });
+    }
+
     pub fn quit(&self) {
         self.send(GtkCommand::Quit);
     }
@@ -415,6 +466,10 @@ pub fn spawn(
                 proxy: ProxySettings::default(),
                 appearance: AppearanceSettings::default(),
                 media_actions: true,
+                cadence: PerformanceCadence::NORMAL,
+                battery_saver: false,
+                last_overlay_sync: Instant::now(),
+                connection_poll: Rc::new(Cell::new(PerformanceCadence::NORMAL.connection_report)),
                 media_transfers: Rc::new(RefCell::new(HashMap::new())),
             }));
 
@@ -438,7 +493,10 @@ pub fn spawn(
             let sync_state = state.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 if let Ok(mut state) = sync_state.try_borrow_mut() {
-                    sync_overlays(&mut state);
+                    if state.last_overlay_sync.elapsed() >= state.cadence.overlay_sync {
+                        state.last_overlay_sync = Instant::now();
+                        sync_overlays(&mut state);
+                    }
                 }
                 glib::ControlFlow::Continue
             });
@@ -474,6 +532,17 @@ struct GtkState {
     appearance: AppearanceSettings,
     /// Whether the injected media action menu is enabled for new accounts.
     media_actions: bool,
+    /// Resolved performance policy. `overlay_sync` gates the native
+    /// synchronization timer; `connection_report` is injected into open pages.
+    cadence: PerformanceCadence,
+    /// Whether the reduced-motion stylesheet is currently applied.
+    battery_saver: bool,
+    /// Last time the overlay geometry was synchronized, so the fastest timer
+    /// can serve both cadences without rebuilding the GLib source.
+    last_overlay_sync: Instant,
+    /// Current in-page connection poll, shared with every view so a reload
+    /// picks up a change made while the previous document was loading.
+    connection_poll: Rc<Cell<Duration>>,
     /// Media transfers currently streaming from a page into the download
     /// pipeline. Keyed by the page-generated transfer id.
     media_transfers: Rc<RefCell<HashMap<String, MediaTransfer>>>,
@@ -607,6 +676,8 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 state.notifications_enabled,
                 state.paste.clone(),
                 media_actions,
+                state.battery_saver,
+                state.connection_poll.clone(),
                 state.media_transfers.clone(),
             ) {
                 Ok(mut entry) => {
@@ -674,10 +745,37 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
             }
             for entry in state.entries.values() {
                 if let Some(manager) = entry.webview.user_content_manager() {
-                    apply_custom_css(&manager, &appearance);
+                    apply_user_stylesheets(&manager, &appearance, state.battery_saver);
                 }
             }
             state.appearance = appearance;
+        }
+        GtkCommand::SetPerformance {
+            battery_saver,
+            cadence,
+        } => {
+            let saver_changed = state.battery_saver != battery_saver;
+            let poll_changed = state.connection_poll.get() != cadence.connection_report;
+            state.battery_saver = battery_saver;
+            state.cadence = cadence;
+            state.connection_poll.set(cadence.connection_report);
+            if saver_changed || poll_changed {
+                let poll_script = connection_poll_script(cadence.connection_report);
+                for entry in state.entries.values() {
+                    if saver_changed {
+                        if let Some(manager) = entry.webview.user_content_manager() {
+                            apply_user_stylesheets(&manager, &state.appearance, battery_saver);
+                        }
+                    }
+                    entry.webview.evaluate_javascript(
+                        &poll_script,
+                        None,
+                        None,
+                        None::<&gtk::gio::Cancellable>,
+                        |_result| {},
+                    );
+                }
+            }
         }
         GtkCommand::SetMediaActions { enabled } => {
             if state.media_actions == enabled {
@@ -845,6 +943,23 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 }
             }
         }
+        GtkCommand::PastePaths { account_id, paths } => {
+            queue_share_paths(
+                &account_id,
+                &paths,
+                &state.paste,
+                &state.events,
+                state.entries.contains_key(&account_id),
+            );
+        }
+        GtkCommand::SetAlwaysOnTop {
+            account_id,
+            enabled,
+        } => {
+            if let Some(entry) = state.entries.get(&account_id) {
+                entry.window.set_keep_above(enabled);
+            }
+        }
         GtkCommand::Quit => {
             for (_, entry) in state.entries.drain() {
                 entry.window.close();
@@ -874,6 +989,8 @@ fn create_entry(
     notifications_enabled: bool,
     paste: Rc<RefCell<PasteQueue>>,
     media_actions: bool,
+    battery_saver: bool,
+    connection_poll: Rc<Cell<Duration>>,
     media_transfers: Rc<RefCell<HashMap<String, MediaTransfer>>>,
 ) -> Result<WebEntry> {
     crate::paths::create_private_dir(data_dir)?;
@@ -899,8 +1016,13 @@ fn create_entry(
     let context = webkit2gtk::WebContext::with_website_data_manager(&manager);
     apply_spell_checking(&context, writing);
     let user_content = UserContentManager::new();
-    connect_connection_script(&user_content, account_id, events.clone());
-    apply_custom_css(&user_content, appearance);
+    connect_connection_script(
+        &user_content,
+        account_id,
+        events.clone(),
+        connection_poll.get(),
+    );
+    apply_user_stylesheets(&user_content, appearance, battery_saver);
     let downloads = Rc::new(Cell::new(0));
     let media_enabled = Rc::new(Cell::new(media_actions));
     connect_media_script(
@@ -934,7 +1056,9 @@ fn create_entry(
         notifications_enabled,
         window.clone(),
         media_enabled.clone(),
+        connection_poll,
     );
+    let drop_events = events.clone();
     connect_downloads(
         &context,
         account_id,
@@ -945,6 +1069,7 @@ fn create_entry(
         downloads.clone(),
     );
     let paste_account = account_id.to_string();
+    let drop_paste = paste.clone();
     webview.connect_key_press_event(move |_webview, event| {
         if try_paste_clipboard(&paste_account, event, &paste) {
             glib::Propagation::Stop
@@ -953,7 +1078,9 @@ fn create_entry(
         }
     });
 
-    window.add(&webview);
+    let (overlay, drop_hint) = build_drop_overlay(&webview);
+    setup_drop_target(&webview, account_id, drop_paste, drop_hint, drop_events);
+    window.add(&overlay);
     window.realize();
 
     let gdk_window = window
@@ -985,38 +1112,70 @@ fn create_entry(
     })
 }
 
-/// Replaces the experimental stylesheet on a user content manager.
+/// Pauses decorative motion while battery saver is active. Media playback and
+/// layout are untouched; only CSS animation and transition timing is collapsed
+/// so WhatsApp's interface stops repainting for effects it no longer shows.
+const BATTERY_SAVER_STYLESHEET: &str = r#"
+*, *::before, *::after {
+  animation-duration: 0.001ms !important;
+  animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  transition-delay: 0ms !important;
+}
+"#;
+
+/// Replaces the user stylesheets on a content manager. Experimental CSS and
+/// the battery-saver stylesheet share the manager, so both are rebuilt
+/// together; removing only one would also detach the other.
 ///
 /// WebKit injects user stylesheets at document start and keeps them attached
 /// to the manager, so they survive WhatsApp Web's in-page SPA navigation. The
 /// allow list is the origin gate: WebKit never applies the CSS to a document
 /// outside `https://web.whatsapp.com`. Stylesheets are CSS only; this function
 /// never evaluates the file as JavaScript.
-fn apply_custom_css(manager: &UserContentManager, appearance: &AppearanceSettings) {
+fn apply_user_stylesheets(
+    manager: &UserContentManager,
+    appearance: &AppearanceSettings,
+    battery_saver: bool,
+) {
     manager.remove_all_style_sheets();
-    let Some(css) = appearance.active_css() else {
-        return;
-    };
-    if let Err(error) = validate_custom_css(css) {
-        warn!(%error, "refusing to inject invalid experimental CSS");
-        return;
+    if let Some(css) = appearance.active_css() {
+        if let Err(error) = validate_custom_css(css) {
+            warn!(%error, "refusing to inject invalid experimental CSS");
+        } else {
+            manager.add_style_sheet(&UserStyleSheet::new(
+                css,
+                UserContentInjectedFrames::TopFrame,
+                UserStyleLevel::User,
+                CUSTOM_CSS_ALLOW_PATTERNS,
+                &[],
+            ));
+            info!(bytes = css.len(), "applied experimental custom CSS");
+        }
     }
-    manager.add_style_sheet(&UserStyleSheet::new(
-        css,
-        UserContentInjectedFrames::TopFrame,
-        UserStyleLevel::User,
-        CUSTOM_CSS_ALLOW_PATTERNS,
-        &[],
-    ));
-    info!(bytes = css.len(), "applied experimental custom CSS");
+    if battery_saver {
+        manager.add_style_sheet(&UserStyleSheet::new(
+            BATTERY_SAVER_STYLESHEET,
+            UserContentInjectedFrames::TopFrame,
+            UserStyleLevel::User,
+            CUSTOM_CSS_ALLOW_PATTERNS,
+            &[],
+        ));
+    }
 }
 
 const CONNECTION_MESSAGE_HANDLER: &str = "oxidezapConnection";
+const CONNECTION_POLL_PLACEHOLDER: &str = "__OXIDEZAP_CONNECTION_POLL_MS__";
 
 /// Reports the browser's online state and whether the QR login screen is
 /// showing. User scripts are injected by WebKit itself, so the page CSP does
 /// not block them. The script deliberately reads only `navigator.onLine` and
 /// a short list of known QR containers; it does not inspect chat content.
+///
+/// The interval is a recursive timeout instead of `setInterval` so the native
+/// side can change it without reloading the page. Battery saver raises it from
+/// 2 s to 5 s; `online`/`offline` events still report immediately.
 const CONNECTION_SCRIPT: &str = r#"
 (function () {
   if (location.hostname !== "web.whatsapp.com") return;
@@ -1052,24 +1211,47 @@ const CONNECTION_SCRIPT: &str = r#"
     }
   }
 
+  var defaultPollMs = __OXIDEZAP_CONNECTION_POLL_MS__;
+  function schedule() {
+    setTimeout(function () {
+      report();
+      schedule();
+    }, window.__oxidezapConnectionPoll || defaultPollMs);
+  }
+
   window.addEventListener("online", report);
   window.addEventListener("offline", report);
-  setInterval(report, 2000);
+  schedule();
   report();
 })();
 "#;
+
+/// Script injected after a page finishes loading and when the policy changes.
+/// The connection script reads the variable on its next tick, so this takes
+/// effect without reloading WhatsApp Web.
+fn connection_poll_script(poll: Duration) -> String {
+    format!(
+        "window.__oxidezapConnectionPoll = {};",
+        poll.as_millis().max(1)
+    )
+}
 
 fn connect_connection_script(
     manager: &UserContentManager,
     account_id: &str,
     events: Sender<GtkEvent>,
+    poll: Duration,
 ) {
     if !manager.register_script_message_handler(CONNECTION_MESSAGE_HANDLER) {
         warn!(account_id = %account_id, "could not register the connection message handler");
         return;
     }
+    let script = CONNECTION_SCRIPT.replace(
+        CONNECTION_POLL_PLACEHOLDER,
+        &poll.as_millis().max(1).to_string(),
+    );
     manager.add_script(&UserScript::new(
-        CONNECTION_SCRIPT,
+        &script,
         UserContentInjectedFrames::TopFrame,
         UserScriptInjectionTime::Start,
         &[],
@@ -2252,6 +2434,7 @@ fn connect_webview_signals(
     notifications_enabled: bool,
     parent_window: gtk::Window,
     media_enabled: Rc<Cell<bool>>,
+    connection_poll: Rc<Cell<Duration>>,
 ) {
     let load_account = account_id.to_string();
     let load_events = events.clone();
@@ -2268,6 +2451,16 @@ fn connect_webview_signals(
             let script = media_toggle_script(load_media.get());
             webview.evaluate_javascript(
                 &script,
+                None,
+                None,
+                None::<&gtk::gio::Cancellable>,
+                |_result| {},
+            );
+            // A reload creates a fresh window object. Restore the current
+            // policy so battery saver survives WhatsApp's own reloads.
+            let poll = connection_poll_script(connection_poll.get());
+            webview.evaluate_javascript(
+                &poll,
                 None,
                 None,
                 None::<&gtk::gio::Cancellable>,
@@ -2841,7 +3034,11 @@ fn overlay_target(
 fn install_css() {
     let provider = gtk::CssProvider::new();
     if provider
-        .load_from_data(b"window { background-color: #0b141a; }")
+        .load_from_data(
+            b"window { background-color: #0b141a; }\
+              #oxidezap-drop-hint { background-color: rgba(11, 20, 26, 0.88);\
+              border: 2px dashed #25d366; border-radius: 14px; padding: 18px; }",
+        )
         .is_err()
     {
         return;
@@ -2857,6 +3054,203 @@ fn install_css() {
 
 const PASTE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const PASTE_CHUNK_BYTES: usize = 3 * 1024 * 1024;
+
+/// One validated local file ready for the attachment pipeline. The dialog and
+/// notifications use `name`; the full path never reaches a log line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShareFileInfo {
+    pub path: PathBuf,
+    pub name: String,
+    pub mime: String,
+    pub image: bool,
+    pub video: bool,
+    pub bytes: u64,
+}
+
+/// Validates local files before they are attached. Only regular, non-empty
+/// files under the paste limit are accepted; the batch shares the same 64 MB
+/// budget as clipboard pastes so the page never receives an unbounded payload.
+pub fn validate_share_paths(paths: &[PathBuf]) -> Result<Vec<ShareFileInfo>, String> {
+    if paths.is_empty() {
+        return Err("No files to attach.".to_string());
+    }
+    let mut total = 0u64;
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("file")
+            .to_string();
+        let metadata = std::fs::metadata(path).map_err(|_| format!("Could not read {name}."))?;
+        if !metadata.is_file() {
+            return Err(format!("{name} is not a regular file."));
+        }
+        total = total.saturating_add(metadata.len());
+        if metadata.len() > PASTE_MAX_BYTES || total > PASTE_MAX_BYTES {
+            return Err(format!(
+                "{name} exceeds the 64 MB attachment limit for files."
+            ));
+        }
+        if metadata.len() == 0 {
+            return Err(format!("{name} is empty."));
+        }
+        let mime = mime_for_path(path);
+        files.push(ShareFileInfo {
+            path: path.clone(),
+            name,
+            image: mime.starts_with("image/"),
+            video: mime.starts_with("video/"),
+            mime,
+            bytes: metadata.len(),
+        });
+    }
+    Ok(files)
+}
+
+/// Extracts local file paths from an XDND/`text/uri-list` payload. Comments,
+/// blank lines, non-file schemes, and malformed URIs are ignored.
+pub fn parse_file_uri_list(list: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for line in list.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Ok(url) = url::Url::parse(line) else {
+            continue;
+        };
+        if url.scheme() != "file" {
+            continue;
+        }
+        if let Ok(path) = url.to_file_path() {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// Builds the WebKit overlay and the hidden "drop to attach" hint.
+fn build_drop_overlay(webview: &webkit2gtk::WebView) -> (gtk::Overlay, gtk::Box) {
+    let overlay = gtk::Overlay::new();
+    overlay.add(webview);
+
+    let hint = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    hint.set_widget_name("oxidezap-drop-hint");
+    hint.set_halign(gtk::Align::Center);
+    hint.set_valign(gtk::Align::Center);
+    hint.set_size_request(360, 120);
+    let title = gtk::Label::new(None);
+    title.set_markup("<span size=\"x-large\" weight=\"bold\">Drop to attach</span>");
+    let subtitle = gtk::Label::new(Some(
+        "Images, videos, PDFs, and files up to 64 MB stay in the preview until you send.",
+    ));
+    subtitle.set_line_wrap(true);
+    subtitle.set_justify(gtk::Justification::Center);
+    hint.add(&title);
+    hint.add(&subtitle);
+    hint.show_all();
+    hint.set_no_show_all(true);
+    hint.hide();
+    overlay.add_overlay(&hint);
+    overlay.set_overlay_pass_through(&hint, true);
+    (overlay, hint)
+}
+
+/// Registers the WebKit view as a local-file drop target. Only `text/uri-list`
+/// entries with a `file://` URI are considered; remote URLs are ignored.
+fn setup_drop_target(
+    webview: &webkit2gtk::WebView,
+    account_id: &str,
+    paste: Rc<RefCell<PasteQueue>>,
+    drop_hint: gtk::Box,
+    events: Sender<GtkEvent>,
+) {
+    let targets = [gtk::TargetEntry::new(
+        "text/uri-list",
+        gtk::TargetFlags::OTHER_APP,
+        0,
+    )];
+    webview.drag_dest_set(gtk::DestDefaults::ALL, &targets, gtk::gdk::DragAction::COPY);
+    webview.drag_dest_set_track_motion(true);
+
+    let motion_hint = drop_hint.clone();
+    webview.connect_drag_motion(move |_webview, context, _x, _y, time| {
+        context.drag_status(gtk::gdk::DragAction::COPY, time);
+        motion_hint.show();
+        true
+    });
+    let leave_hint = drop_hint.clone();
+    webview.connect_drag_leave(move |_webview, _context, _time| {
+        leave_hint.hide();
+    });
+
+    let drop_account = account_id.to_string();
+    let drop_hint = drop_hint;
+    let drop_paste = paste;
+    let drop_events = events;
+    webview.connect_drag_drop(move |webview, context, _x, _y, time| {
+        let target = gtk::gdk::Atom::intern("text/uri-list");
+        if context.list_targets().contains(&target) {
+            webview.drag_get_data(context, &target, time);
+            true
+        } else {
+            false
+        }
+    });
+    webview.connect_drag_data_received(move |_webview, context, _x, _y, data, _info, time| {
+        context.drag_finish(true, false, time);
+        drop_hint.hide();
+        let text = {
+            let bytes = data.data();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let paths = parse_file_uri_list(&text);
+        queue_share_paths(&drop_account, &paths, &drop_paste, &drop_events, true);
+    });
+}
+
+fn queue_share_paths(
+    account_id: &str,
+    paths: &[PathBuf],
+    paste: &Rc<RefCell<PasteQueue>>,
+    events: &Sender<GtkEvent>,
+    view_ready: bool,
+) {
+    if !view_ready {
+        let _ = events.send(GtkEvent::ShareRejected {
+            account_id: account_id.to_string(),
+            message: "The account window is not ready. Try again in a moment.".to_string(),
+        });
+        return;
+    }
+    let files = match validate_share_paths(paths) {
+        Ok(files) => files,
+        Err(message) => {
+            let _ = events.send(GtkEvent::ShareRejected {
+                account_id: account_id.to_string(),
+                message,
+            });
+            return;
+        }
+    };
+    let image = files.iter().all(|file| file.image);
+    let count = files.len();
+    let files = files
+        .into_iter()
+        .map(|file| PasteFile {
+            name: file.name,
+            mime: file.mime,
+            source: PasteSource::File(file.path),
+        })
+        .collect();
+    paste.borrow().submit(account_id, files, image);
+    let _ = events.send(GtkEvent::ShareAttached {
+        account_id: account_id.to_string(),
+        count,
+    });
+}
 
 #[derive(Debug)]
 enum PasteSource {
@@ -2947,7 +3341,7 @@ impl PasteQueue {
             files,
         };
         if let Err(error) = self.jobs.send(job) {
-            warn!(%error, "could not queue a clipboard paste");
+            warn!(%error, "could not queue an attachment");
         }
     }
 
@@ -3018,7 +3412,7 @@ fn process_paste_job(job: PasteJob) -> PasteResult {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        warn!(%error, path = %path.display(), "could not read a pasted file");
+                        warn!(%error, "could not read a pasted file");
                     }
                 }
             }
@@ -3334,20 +3728,24 @@ fn base64_chunks(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+fn paste_begin_script(files: &[PastedFile]) -> String {
+    let metadata: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(name, mime, _)| serde_json::json!({ "name": name, "type": mime }))
+        .collect();
+    format!(
+        "{PASTE_HELPER}\n__oxidezapPaste.begin({});",
+        serde_json::to_string(&metadata).unwrap_or_else(|_| "[]".to_string())
+    )
+}
+
 fn queue_paste_files(
     webview: webkit2gtk::WebView,
     files: Vec<PastedFile>,
     on_done: impl FnOnce() + 'static,
 ) {
-    let metadata: Vec<serde_json::Value> = files
-        .iter()
-        .map(|(name, mime, _)| serde_json::json!({ "name": name, "type": mime }))
-        .collect();
     let mut queue = VecDeque::new();
-    queue.push_back(format!(
-        "{PASTE_HELPER}\n__oxidezapPaste.begin({});",
-        serde_json::to_string(&metadata).unwrap_or_else(|_| "[]".to_string())
-    ));
+    queue.push_back(paste_begin_script(&files));
     for (index, (_, _, chunks)) in files.iter().enumerate() {
         for chunk in chunks {
             queue.push_back(format!("__oxidezapPaste.chunk({index}, \"{chunk}\");"));
@@ -3423,6 +3821,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connection_script_bakes_the_poll_and_has_no_placeholder() {
+        let script = CONNECTION_SCRIPT.replace(
+            CONNECTION_POLL_PLACEHOLDER,
+            &Duration::from_secs(5).as_millis().to_string(),
+        );
+        assert!(script.contains("defaultPollMs = 5000"));
+        assert!(!script.contains(CONNECTION_POLL_PLACEHOLDER));
+        assert_eq!(
+            connection_poll_script(Duration::from_secs(2)),
+            "window.__oxidezapConnectionPoll = 2000;"
+        );
+    }
+
+    #[test]
     fn parses_browser_connection_reports() {
         assert_eq!(
             parse_connection_report("online=1&login=0"),
@@ -3476,6 +3888,98 @@ mod tests {
         assert!(budget.add(PASTE_MAX_BYTES - 1));
         assert!(budget.add(1));
         assert!(!budget.add(1));
+    }
+
+    #[test]
+    fn share_validation_accepts_regular_media_and_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("photo.png");
+        let video = dir.path().join("clip.mp4");
+        let pdf = dir.path().join("report.pdf");
+        let generic = dir.path().join("notes");
+        std::fs::write(&image, b"png").unwrap();
+        std::fs::write(&video, b"mp4").unwrap();
+        std::fs::write(&pdf, b"pdf").unwrap();
+        std::fs::write(&generic, b"text").unwrap();
+
+        let files = validate_share_paths(&[image, video, pdf, generic]).unwrap();
+
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].mime, "image/png");
+        assert!(files[0].image);
+        assert!(!files[0].video);
+        assert_eq!(files[1].mime, "video/mp4");
+        assert!(files[1].video);
+        assert_eq!(files[2].mime, "application/pdf");
+        assert!(!files[2].image);
+        assert!(!files[2].video);
+        assert_eq!(files[3].mime, "application/octet-stream");
+        assert_eq!(files[3].bytes, 4);
+    }
+
+    #[test]
+    fn share_validation_rejects_directories_missing_files_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = dir.path().join("huge.bin");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len(PASTE_MAX_BYTES + 1).unwrap();
+        drop(file);
+
+        assert!(validate_share_paths(&[]).is_err());
+        assert!(validate_share_paths(&[dir.path().to_path_buf()]).is_err());
+        assert!(validate_share_paths(&[dir.path().join("missing.png")]).is_err());
+        let error = validate_share_paths(&[huge]).unwrap_err();
+        assert!(error.contains("64 MB"), "{error}");
+        assert!(!error.contains('/'), "errors must not leak paths: {error}");
+    }
+
+    #[test]
+    fn share_validation_applies_the_paste_budget_to_the_whole_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.bin");
+        let second = dir.path().join("second.bin");
+        let half = PASTE_MAX_BYTES / 2;
+        std::fs::File::create(&first)
+            .unwrap()
+            .set_len(half + 1)
+            .unwrap();
+        std::fs::File::create(&second)
+            .unwrap()
+            .set_len(half + 1)
+            .unwrap();
+
+        assert!(validate_share_paths(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn file_uri_lists_accept_only_local_files() {
+        let paths = parse_file_uri_list(
+            "# comment\r\nfile:///home/user/photo%20one.png\r\n\
+             https://example.com/remote.png\r\nfile:///home/user/report.pdf\r\n\
+             not a uri\r\n",
+        );
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/home/user/photo one.png"),
+                PathBuf::from("/home/user/report.pdf"),
+            ]
+        );
+    }
+
+    #[test]
+    fn paste_metadata_is_json_escaped_before_it_reaches_javascript() {
+        let files = vec![(
+            "bad\"name\\\n.png".to_string(),
+            "image/png".to_string(),
+            Vec::<String>::new(),
+        )];
+
+        let script = paste_begin_script(&files);
+
+        assert!(script.contains("bad\\\"name"), "{script}");
+        assert!(!script.contains("\"bad\"name"), "{script}");
     }
 
     #[test]

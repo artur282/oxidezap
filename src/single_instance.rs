@@ -129,6 +129,12 @@ pub enum InstanceMessage {
     OpenDownloads,
     Status,
     ListAccounts,
+    /// Attaches a local file to the given account (or the active account when
+    /// `account` is `None`). The receiving instance validates the path again.
+    Share {
+        account: Option<String>,
+        path: PathBuf,
+    },
 }
 
 impl InstanceMessage {
@@ -164,10 +170,29 @@ impl InstanceMessage {
         if let Some(rest) = line.strip_prefix("chat ") {
             return Self::parse_chat(rest);
         }
+        if let Some(rest) = line.strip_prefix("share\t") {
+            return Self::parse_share(rest);
+        }
         if let Some(mode) = line.strip_prefix("dnd ").and_then(DndMode::parse) {
             return Some(Self::SetDoNotDisturb(mode));
         }
         None
+    }
+
+    fn parse_share(rest: &str) -> Option<Self> {
+        let (account, path) = rest.split_once('\t')?;
+        let account = match account {
+            "" => return None,
+            "-" => None,
+            value => Some(value.to_string()),
+        };
+        if path.is_empty() || path.chars().any(char::is_control) {
+            return None;
+        }
+        Some(Self::Share {
+            account,
+            path: PathBuf::from(path),
+        })
     }
 
     fn parse_chat(rest: &str) -> Option<Self> {
@@ -203,6 +228,11 @@ impl InstanceMessage {
             Self::OpenDownloads => "downloads".to_string(),
             Self::Status => "status".to_string(),
             Self::ListAccounts => "list-accounts".to_string(),
+            Self::Share { account, path } => format!(
+                "share\t{}\t{}",
+                account.as_deref().unwrap_or("-"),
+                path.display()
+            ),
         }
     }
 
@@ -562,6 +592,20 @@ mod tests {
             InstanceMessage::parse("list-accounts"),
             Some(InstanceMessage::ListAccounts)
         );
+        assert_eq!(
+            InstanceMessage::parse("share\t-\t/home/user/photo one.png"),
+            Some(InstanceMessage::Share {
+                account: None,
+                path: PathBuf::from("/home/user/photo one.png"),
+            })
+        );
+        assert_eq!(
+            InstanceMessage::parse("share\tWork Phone\t/home/user/report.pdf"),
+            Some(InstanceMessage::Share {
+                account: Some("Work Phone".to_string()),
+                path: PathBuf::from("/home/user/report.pdf"),
+            })
+        );
         assert_eq!(InstanceMessage::parse("nonsense"), None);
     }
 
@@ -587,6 +631,18 @@ mod tests {
             InstanceMessage::OpenDownloads,
             InstanceMessage::Status,
             InstanceMessage::ListAccounts,
+            InstanceMessage::Share {
+                account: None,
+                path: PathBuf::from("/home/user/photo one.png"),
+            },
+            InstanceMessage::Share {
+                account: Some("Work".to_string()),
+                path: PathBuf::from("/home/user/report.pdf"),
+            },
+            InstanceMessage::Share {
+                account: Some("Work Phone".to_string()),
+                path: PathBuf::from("/home/user/photo one.png"),
+            },
         ];
         for message in messages {
             assert_eq!(
@@ -607,6 +663,11 @@ mod tests {
         assert_eq!(InstanceMessage::parse("chat - 123456@lid"), None);
         assert_eq!(InstanceMessage::parse("dnd maybe"), None);
         assert_eq!(InstanceMessage::parse("account "), None);
+        assert_eq!(InstanceMessage::parse("share\t-"), None);
+        assert_eq!(InstanceMessage::parse("share\t-\t"), None);
+        assert_eq!(InstanceMessage::parse("share"), None);
+        assert_eq!(InstanceMessage::parse("share\t-\t/tmp/a\nb"), None);
+        assert_eq!(InstanceMessage::parse("share\t-\t/tmp/\0file"), None);
     }
 
     #[test]

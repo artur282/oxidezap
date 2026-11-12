@@ -22,23 +22,29 @@ use zbus::message::Type as MessageType;
 
 use crate::autostart;
 use crate::badge::Badge;
+use crate::diagnostics::{self, DiagnosticLevel, DiagnosticsContext, ErrorLog, RuntimeSummary};
 use crate::hotkey::{HotkeyAction, HotkeyBindings, HotkeyHandle};
 use crate::links;
 use crate::lock;
 use crate::notify;
 use crate::paths::{APP_ID, Paths};
+use crate::settings::performance::{
+    POWER_POLL_INTERVAL, PerformanceCadence, PerformanceStatus, PowerState, detect_power_state,
+    effective_memory,
+};
 use crate::settings::storage::{self, StorageOperation, StorageSnapshot};
 use crate::settings::{
-    Account, AppearanceSettings, DoNotDisturbSettings, LockSettings, MemorySettings,
+    Account, AppearanceSettings, DoNotDisturbSettings, LockSettings, MemorySettings, MonitorArea,
     ONBOARDING_VERSION, ProxySettings, SETTINGS_SAVE_DEBOUNCE, SaveDebounce, SavedBounds, Settings,
-    SettingsWriter, WritingSettings, should_show_onboarding, validate_custom_css,
+    SettingsWriter, WritingSettings, monitor_for_bounds, restore_account_bounds,
+    should_show_onboarding, validate_custom_css,
 };
 use crate::shortcut::Shortcut;
 use crate::single_instance::{
     ChatTarget, DndMode, InstanceListener, InstanceMessage, InstanceReply, InstanceRequest,
 };
 use crate::theme::Theme;
-use crate::tray::{TrayAction, TrayDndState, TrayHandle};
+use crate::tray::{TrayAction, TrayDndState, TrayHandle, TrayWindowState};
 use crate::ui::account_window::AccountWindow;
 use crate::ui::command_palette::{
     COMMAND_PALETTE_HEIGHT, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH, CommandAccount,
@@ -71,11 +77,173 @@ impl AppModelEntityExt for Entity<AppModel> {
 
 const ACCOUNT_TAG_ATTEMPTS: usize = 40;
 const ACCOUNT_TAG_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+const DEFAULT_WINDOW_WIDTH: f32 = 1180.0;
+const DEFAULT_WINDOW_HEIGHT: f32 = 780.0;
+const NORMAL_MIN_WIDTH: f32 = 760.0;
+const NORMAL_MIN_HEIGHT: f32 = 520.0;
+const MINI_WINDOW_WIDTH: f32 = 420.0;
+const MINI_WINDOW_HEIGHT: f32 = 620.0;
+const MINI_MIN_WIDTH: f32 = 360.0;
+const MINI_MIN_HEIGHT: f32 = 420.0;
 
 enum AccountTag {
     Tagged,
     Pending,
     Closed,
+}
+
+fn saved_bounds(bounds: Bounds<Pixels>) -> SavedBounds {
+    SavedBounds {
+        x: f32::from(bounds.origin.x),
+        y: f32::from(bounds.origin.y),
+        width: f32::from(bounds.size.width),
+        height: f32::from(bounds.size.height),
+    }
+}
+
+fn window_bounds(bounds: &SavedBounds) -> WindowBounds {
+    WindowBounds::Windowed(Bounds::new(
+        point(px(bounds.x), px(bounds.y)),
+        size(px(bounds.width), px(bounds.height)),
+    ))
+}
+
+fn default_saved_bounds(monitors: &[MonitorArea]) -> SavedBounds {
+    let area = monitors
+        .first()
+        .map(|monitor| monitor.bounds.clone())
+        .unwrap_or(SavedBounds {
+            x: 0.0,
+            y: 0.0,
+            width: DEFAULT_WINDOW_WIDTH,
+            height: DEFAULT_WINDOW_HEIGHT,
+        });
+    let width = DEFAULT_WINDOW_WIDTH.min(area.width);
+    let height = DEFAULT_WINDOW_HEIGHT.min(area.height);
+    SavedBounds {
+        x: area.x + (area.width - width).max(0.0) / 2.0,
+        y: area.y + (area.height - height).max(0.0) / 2.0,
+        width,
+        height,
+    }
+}
+
+fn mini_bounds(source: Option<&SavedBounds>, monitors: &[MonitorArea]) -> SavedBounds {
+    let area = source
+        .and_then(|bounds| monitor_for_bounds(bounds, monitors))
+        .map(|monitor| monitor.bounds.clone())
+        .or_else(|| monitors.first().map(|monitor| monitor.bounds.clone()))
+        .unwrap_or(SavedBounds {
+            x: 0.0,
+            y: 0.0,
+            width: DEFAULT_WINDOW_WIDTH,
+            height: DEFAULT_WINDOW_HEIGHT,
+        });
+    SavedBounds {
+        x: source.map(|bounds| bounds.x).unwrap_or(area.x),
+        y: source.map(|bounds| bounds.y).unwrap_or(area.y),
+        width: MINI_WINDOW_WIDTH,
+        height: MINI_WINDOW_HEIGHT,
+    }
+    .clamp_to(&area)
+}
+
+fn clamp_to_available_monitors(bounds: &SavedBounds, monitors: &[MonitorArea]) -> SavedBounds {
+    if monitors.is_empty() {
+        return bounds.clone();
+    }
+    monitor_for_bounds(bounds, monitors)
+        .map(|monitor| bounds.clamp_to(&monitor.bounds))
+        .unwrap_or_else(|| bounds.clamp_to(&monitors[0].bounds))
+}
+
+/// The monitor list GPUI exposes. X11 reports one screen for the whole virtual
+/// desktop, so `restore_account_bounds` treats it as a single monitor there and
+/// still clamps windows into it; platforms with several displays get one entry
+/// per display and are restored per monitor.
+fn monitor_areas(cx: &App) -> Vec<MonitorArea> {
+    cx.displays()
+        .iter()
+        .enumerate()
+        .map(|(index, display)| {
+            let key = display
+                .uuid()
+                .map(|uuid| uuid.to_string())
+                .unwrap_or_else(|_| format!("display-{index}"));
+            MonitorArea {
+                key,
+                bounds: saved_bounds(display.bounds()),
+            }
+        })
+        .collect()
+}
+
+/// Sends an EWMH `_NET_WM_STATE` client message to add or remove up to two
+/// states. It is used for always-on-top and to leave maximized mode before a
+/// mini window is resized.
+fn set_wm_state(
+    x11: &X11,
+    window: u32,
+    enabled: bool,
+    first: &[u8],
+    second: Option<&[u8]>,
+) -> Result<()> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    use x11rb::protocol::xproto::{ClientMessageEvent, EventMask};
+
+    let state_atom = x11.conn.intern_atom(false, b"_NET_WM_STATE")?.reply()?.atom;
+    let first_atom = x11.conn.intern_atom(false, first)?.reply()?.atom;
+    let second_atom = match second {
+        Some(name) => x11.conn.intern_atom(false, name)?.reply()?.atom,
+        None => 0,
+    };
+    // 0 removes, 1 adds, 2 toggles. Source indication 1 is a normal application.
+    let action = u32::from(enabled);
+    let event = ClientMessageEvent::new(
+        32,
+        window,
+        state_atom,
+        [action, first_atom, second_atom, 1, 0],
+    );
+    x11.conn.send_event(
+        false,
+        x11.root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )?;
+    x11.conn.flush()?;
+    Ok(())
+}
+
+fn set_always_on_top_state(x11: &X11, window: u32, enabled: bool) -> Result<()> {
+    set_wm_state(x11, window, enabled, b"_NET_WM_STATE_ABOVE", None)
+}
+
+fn leave_maximized_state(x11: &X11, window: u32) -> Result<()> {
+    set_wm_state(
+        x11,
+        window,
+        false,
+        b"_NET_WM_STATE_MAXIMIZED_VERT",
+        Some(b"_NET_WM_STATE_MAXIMIZED_HORZ"),
+    )
+}
+
+fn set_window_min_size(x11: &X11, window: u32, width: f32, height: f32) -> Result<()> {
+    use x11rb::connection::Connection as _;
+    use x11rb::properties::WmSizeHints;
+
+    let mut hints = WmSizeHints::get_normal_hints(&x11.conn, window)?
+        .reply()?
+        .unwrap_or_default();
+    hints.min_size = Some((
+        width.round().max(1.0) as i32,
+        height.round().max(1.0) as i32,
+    ));
+    hints.set_normal_hints(&x11.conn, window)?.check()?;
+    x11.conn.flush()?;
+    Ok(())
 }
 
 /// Why the application lock is being requested. Manual locks always act;
@@ -354,11 +522,6 @@ fn crash_decision(quitting: bool, recovery: &mut CrashRecovery, now: Instant) ->
     recovery.on_crash(now)
 }
 
-/// How often the automatic low-memory sweep runs. Hiding an account does not
-/// start a dedicated timer; the sweep uses the recorded hide time instead, so a
-/// restart or a burst of hide/show events cannot postpone or duplicate it.
-const MEMORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Conservative estimate of the memory a single suspended WebKit web process
 /// releases. WebKit does not expose per-view RSS, so the Settings window labels
 /// this as an estimate instead of pretending it is a measurement.
@@ -492,8 +655,8 @@ impl HiddenSince {
     }
 }
 
-fn memory_sweep_due(last_sweep: Instant, now: Instant) -> bool {
-    now.saturating_duration_since(last_sweep) >= MEMORY_SWEEP_INTERVAL
+fn memory_sweep_due(last_sweep: Instant, now: Instant, interval: Duration) -> bool {
+    now.saturating_duration_since(last_sweep) >= interval
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -611,10 +774,10 @@ pub enum ConnectionState {
 impl ConnectionState {
     pub fn label(self) -> &'static str {
         match self {
-            ConnectionState::Connecting => "Connecting…",
-            ConnectionState::Connected => "Connected",
-            ConnectionState::Offline => "Offline",
-            ConnectionState::Reconnecting => "Reconnecting…",
+            ConnectionState::Connecting => t!("Connecting…"),
+            ConnectionState::Connected => t!("Connected"),
+            ConnectionState::Offline => t!("Offline"),
+            ConnectionState::Reconnecting => t!("Reconnecting…"),
         }
     }
 
@@ -967,6 +1130,12 @@ pub struct AppModel {
     startup_url: Option<String>,
     initial_action: Option<InstanceMessage>,
     pending_urls: HashMap<String, String>,
+    /// Files forwarded by `--share` or the instance socket before the account
+    /// page finished loading. They are drained on `LoadState::Finished`.
+    pending_shares: HashMap<String, Vec<PathBuf>>,
+    /// Accounts whose page finished loading at least once. A share sent before
+    /// this point waits instead of racing the WhatsApp Web attachment inputs.
+    page_ready: HashSet<String>,
     start_hidden: bool,
     first_run: bool,
     pending_accounts: HashSet<String>,
@@ -989,9 +1158,15 @@ pub struct AppModel {
     last_dnd_check: Instant,
     last_dnd_active: bool,
     last_dnd_status: String,
+    /// Last kernel power-source read. Battery changes resolve on the next poll.
+    last_power_check: Instant,
+    power: PowerState,
+    /// Performance policy last pushed to the GTK/WebKit thread.
+    performance: PerformanceStatus,
     last_memory_sweep: Instant,
     last_notifications: Vec<(String, Instant)>,
     lock_events: Receiver<SystemLockEvent>,
+    errors: ErrorLog,
     boss_hidden: Option<HashSet<String>>,
     boss_settings_hidden: bool,
     boss_onboarding_hidden: bool,
@@ -1035,6 +1210,10 @@ impl AppModel {
             start_system_lock_watchers(lock_event_tx);
         }
         let last_dnd_active = settings.do_not_disturb.is_active(SystemTime::now());
+        crate::i18n::set_language(settings.language);
+        let power = detect_power_state();
+        let performance = settings.performance.resolve(power);
+        gtk.set_performance(performance.battery_saver, performance.cadence());
         Self {
             paths,
             settings,
@@ -1071,6 +1250,8 @@ impl AppModel {
             startup_url,
             initial_action,
             pending_urls: HashMap::new(),
+            pending_shares: HashMap::new(),
+            page_ready: HashSet::new(),
             start_hidden,
             first_run,
             pending_accounts: HashSet::new(),
@@ -1093,9 +1274,13 @@ impl AppModel {
             last_dnd_check: Instant::now(),
             last_dnd_active,
             last_dnd_status: String::new(),
+            last_power_check: Instant::now(),
+            power,
+            performance,
             last_memory_sweep: Instant::now(),
             last_notifications: Vec::new(),
             lock_events: lock_event_rx,
+            errors: ErrorLog::default(),
             boss_hidden: None,
             boss_settings_hidden: false,
             boss_onboarding_hidden: false,
@@ -1106,13 +1291,26 @@ impl AppModel {
         let weak = cx.weak_entity();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(Duration::from_millis(100)).await;
+                let interval = weak
+                    .update(cx, |model, _| model.poll_interval())
+                    .unwrap_or(PerformanceCadence::NORMAL.pump);
+                Timer::after(interval).await;
                 if weak.update(cx, |model, cx| model.poll(cx)).is_err() {
                     break;
                 }
             }
         })
         .detach();
+    }
+
+    /// Performance status last applied from the persisted mode and power
+    /// source. The settings window uses it for the status and reason.
+    pub fn performance_status(&self) -> PerformanceStatus {
+        self.performance
+    }
+
+    fn poll_interval(&self) -> Duration {
+        self.performance.cadence().pump
     }
 
     pub fn start(&mut self, cx: &mut Context<Self>) {
@@ -1147,6 +1345,19 @@ impl AppModel {
             if let Some(account_id) = account_id {
                 self.settings.active_account = Some(account_id.clone());
                 self.pending_urls.insert(account_id, chat.web_url());
+            }
+        }
+        if let Some(InstanceMessage::Share { account, path }) = &initial_action {
+            let account_id = match account {
+                Some(query) => resolve_account(&self.settings, query).ok(),
+                None => self.settings.active_account_id(),
+            };
+            if let Some(account_id) = account_id {
+                self.settings.active_account = Some(account_id.clone());
+                self.pending_shares
+                    .entry(account_id)
+                    .or_default()
+                    .push(path.clone());
             }
         }
         if let Some(InstanceMessage::OpenUrl(url)) = &initial_action {
@@ -1221,11 +1432,57 @@ impl AppModel {
         Theme::resolve(self.settings.theme, window.appearance())
     }
 
+    /// Snapshot of the runtime state that appears in the diagnostics report.
+    /// Account ids and names are reduced to counts before they leave the
+    /// model, so the report cannot include them.
+    pub fn diagnostics_context(&self) -> DiagnosticsContext {
+        let mut runtime = RuntimeSummary {
+            locked: self.locked,
+            active_downloads: self.active_downloads.values().copied().sum::<u32>() as usize,
+            ..RuntimeSummary::default()
+        };
+        runtime.loaded_views = self
+            .account_windows
+            .keys()
+            .filter(|account_id| self.views.state(account_id.as_str()).is_loaded())
+            .count();
+        for state in self.views.states.values() {
+            match state {
+                AccountViewState::Loaded => {}
+                AccountViewState::Suspended => runtime.suspended_views += 1,
+                AccountViewState::Resuming => runtime.resuming_views += 1,
+            }
+        }
+        for connection in self.connection.values() {
+            match connection.state() {
+                ConnectionState::Connecting => runtime.connecting += 1,
+                ConnectionState::Connected => runtime.connected += 1,
+                ConnectionState::Offline => runtime.offline += 1,
+                ConnectionState::Reconnecting => runtime.reconnecting += 1,
+            }
+        }
+        for recovery in self.crash_recovery.values() {
+            runtime.crash_tracking += 1;
+            runtime.crash_attempts = runtime.crash_attempts.saturating_add(recovery.attempts);
+            if recovery.failed {
+                runtime.crash_failed += 1;
+            }
+        }
+        DiagnosticsContext {
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            settings: self.settings.clone(),
+            paths: self.paths.clone(),
+            home_dir: diagnostics::current_home(),
+            runtime,
+            errors: self.errors.to_vec(),
+        }
+    }
+
     pub fn account_name(&self, id: &str) -> String {
         self.settings
             .account(id)
             .map(|account| account.name.clone())
-            .unwrap_or_else(|| "Account".to_string())
+            .unwrap_or_else(|| t!("Account").to_string())
     }
 
     pub fn account_unread(&self, id: &str) -> u32 {
@@ -1271,7 +1528,22 @@ impl AppModel {
             self.handle_tray_action(action, cx);
         }
 
-        if memory_sweep_due(self.last_memory_sweep, Instant::now()) {
+        if self.last_power_check.elapsed() >= POWER_POLL_INTERVAL {
+            self.last_power_check = Instant::now();
+            let power = detect_power_state();
+            if power != self.power {
+                debug!(
+                    previous = self.power.label(),
+                    current = power.label(),
+                    "power source changed"
+                );
+                self.power = power;
+                self.apply_performance(cx);
+            }
+        }
+
+        let cadence = self.performance_status().cadence();
+        if memory_sweep_due(self.last_memory_sweep, Instant::now(), cadence.memory_sweep) {
             self.last_memory_sweep = Instant::now();
             self.suspend_idle_accounts(false, cx);
         }
@@ -1290,7 +1562,7 @@ impl AppModel {
             }
         }
 
-        if self.last_scale_check.elapsed() >= Duration::from_secs(1) {
+        if self.last_scale_check.elapsed() >= cadence.scale_check {
             self.last_scale_check = Instant::now();
             let windows: Vec<(String, WindowHandle<AccountWindow>)> = self
                 .account_windows
@@ -1322,15 +1594,15 @@ impl AppModel {
             self.poll_smoke(cx);
         }
 
-        if self.last_dnd_check.elapsed() >= Duration::from_secs(1) {
+        if self.last_dnd_check.elapsed() >= cadence.dnd_check {
             self.last_dnd_check = Instant::now();
             self.refresh_do_not_disturb(cx);
         }
     }
 
-    /// Re-evaluates the DND schedule at least once per second. The pump also
-    /// runs after resume from suspend, so a long wall-clock jump cannot leave
-    /// the mode stuck or the tray stale.
+    /// Re-evaluates the DND schedule on every pump cadence. The pump also runs
+    /// after resume from suspend, so a long wall-clock jump cannot leave the
+    /// mode stuck or the tray stale.
     fn refresh_do_not_disturb(&mut self, cx: &mut Context<Self>) {
         let now = SystemTime::now();
         let expired = self.settings.do_not_disturb.expire(now);
@@ -1445,10 +1717,13 @@ impl AppModel {
         let now = Instant::now();
         let active_account = self.settings.active_account_id();
         let account_ids: Vec<String> = self.account_windows.keys().cloned().collect();
+        // Battery saver only shortens an already enabled low-memory delay; the
+        // master switch and every guard in `suspend_decision` stay in charge.
+        let memory = effective_memory(&self.settings.memory, self.performance.battery_saver);
         let mut suspended = 0;
         for account_id in account_ids {
             let context = SuspendContext {
-                memory: &self.settings.memory,
+                memory: &memory,
                 state: self.views.state(&account_id),
                 hidden: self.hidden_accounts.contains(&account_id),
                 active_account: active_account.as_deref() == Some(account_id.as_str()),
@@ -1484,6 +1759,8 @@ impl AppModel {
         self.crash_recovery.remove(account_id);
         self.active_downloads.remove(account_id);
         self.capture_active.remove(account_id);
+        self.page_ready.remove(account_id);
+        self.pending_shares.remove(account_id);
         self.gtk.suspend(account_id);
         info!(account_id = %account_id, "releasing the WebKit view of a hidden account");
         self.refresh_account_window(account_id, cx);
@@ -1598,9 +1875,10 @@ impl AppModel {
             ConnectionDecision::Offline => {
                 if notify_enabled {
                     notify::notify(
-                        "WhatsApp Web is offline",
-                        &format!(
-                            "{name} lost its connection. OxideZap will reconnect when the network returns."
+                        t!("WhatsApp Web is offline"),
+                        &tr!(
+                            "{name} lost its connection. OxideZap will reconnect when the network returns.",
+                            name = name
                         ),
                         Some(&icon),
                     );
@@ -1609,8 +1887,8 @@ impl AppModel {
             ConnectionDecision::Reconnected => {
                 if notify_enabled {
                     notify::notify(
-                        "Connection restored",
-                        &format!("{name} is connected again."),
+                        t!("Connection restored"),
+                        &tr!("{name} is connected again.", name = name),
                         Some(&icon),
                     );
                 }
@@ -1618,20 +1896,29 @@ impl AppModel {
             ConnectionDecision::LoginPageBlocked => {
                 if notify_enabled {
                     notify::notify(
-                        "Connection restored",
-                        &format!(
-                            "{name} is on the WhatsApp login page. OxideZap did not reload it automatically; use Retry now if the page is stuck."
+                        t!("Connection restored"),
+                        &tr!(
+                            "{name} is on the WhatsApp login page. OxideZap did not reload it automatically; use Retry now if the page is stuck.",
+                            name = name
                         ),
                         Some(&icon),
                     );
                 }
             }
             ConnectionDecision::Exhausted => {
+                self.errors.record(
+                    DiagnosticLevel::Warning,
+                    format!(
+                        "WhatsApp Web could not reconnect after {MAX_RECONNECT_ATTEMPTS} attempts"
+                    ),
+                );
                 if !notify::do_not_disturb_suppressed(&self.settings, SystemTime::now()) {
                     notify::notify(
-                        "Could not reconnect WhatsApp Web",
-                        &format!(
-                            "OxideZap stopped automatic reconnects for {name} after {MAX_RECONNECT_ATTEMPTS} attempts. Use Retry now in the account window."
+                        t!("Could not reconnect WhatsApp Web"),
+                        &tr!(
+                            "OxideZap stopped automatic reconnects for {name} after {attempts} attempts. Use Retry now in the account window.",
+                            name = name,
+                            attempts = MAX_RECONNECT_ATTEMPTS
                         ),
                         Some(&icon),
                     );
@@ -1651,8 +1938,10 @@ impl AppModel {
             );
             if notify::notifications_allowed(&self.settings, SystemTime::now()) {
                 notify::notify(
-                    "Download in progress",
-                    "OxideZap did not reload WhatsApp Web while a download is active. Retry when the download finishes.",
+                    t!("Download in progress"),
+                    t!(
+                        "OxideZap did not reload WhatsApp Web while a download is active. Retry when the download finishes."
+                    ),
                     Some(&self.paths.runtime_icon()),
                 );
             }
@@ -1679,6 +1968,176 @@ impl AppModel {
         }
     }
 
+    pub fn account_always_on_top(&self, account_id: &str) -> bool {
+        self.settings
+            .account(account_id)
+            .is_some_and(|account| account.always_on_top)
+    }
+
+    pub fn account_mini_mode(&self, account_id: &str) -> bool {
+        self.settings
+            .account(account_id)
+            .is_some_and(|account| account.mini_mode)
+    }
+
+    /// Applies the persisted window modes after the GPUI window is tagged. Until
+    /// then there is no X11 id to configure, so the modes wait for this call.
+    fn apply_window_modes(&self, account_id: &str, xid: u32) {
+        let Some(account) = self.settings.account(account_id) else {
+            return;
+        };
+        if let Err(error) = set_always_on_top_state(&self.x11, xid, account.always_on_top) {
+            warn!(%error, "could not update the always-on-top state");
+        }
+        self.gtk
+            .set_always_on_top(account_id, account.always_on_top);
+        let (min_width, min_height) = if account.mini_mode {
+            (MINI_MIN_WIDTH, MINI_MIN_HEIGHT)
+        } else {
+            (NORMAL_MIN_WIDTH, NORMAL_MIN_HEIGHT)
+        };
+        if let Err(error) = set_window_min_size(&self.x11, xid, min_width, min_height) {
+            warn!(%error, "could not update the window minimum size");
+        }
+    }
+
+    pub fn set_always_on_top(&mut self, account_id: &str, enabled: bool, cx: &mut Context<Self>) {
+        let Some(account) = self.settings.account_mut(account_id) else {
+            return;
+        };
+        if account.always_on_top == enabled {
+            return;
+        }
+        account.always_on_top = enabled;
+        if let Some(xid) = self.account_xids.get(account_id).copied()
+            && let Err(error) = set_always_on_top_state(&self.x11, xid, enabled)
+        {
+            warn!(%error, "could not update the always-on-top state");
+        }
+        self.gtk.set_always_on_top(account_id, enabled);
+        self.save_settings(cx);
+        self.update_tray();
+        self.refresh_account_window(account_id, cx);
+        cx.refresh_windows();
+    }
+
+    /// Switches between the normal window and a compact single-pane window.
+    /// The normal bounds are saved first so disabling mini mode restores the
+    /// previous size and position.
+    pub fn set_mini_mode(&mut self, account_id: &str, enabled: bool, cx: &mut Context<Self>) {
+        let Some(account) = self.settings.account(account_id).cloned() else {
+            return;
+        };
+        if account.mini_mode == enabled {
+            return;
+        }
+        let monitors = monitor_areas(cx);
+        let handle = self.account_windows.get(account_id).copied();
+        let current = handle.and_then(|handle| {
+            handle
+                .update(cx, |_, window, _| saved_bounds(window.bounds()))
+                .ok()
+        });
+
+        if enabled {
+            let normal = current
+                .clone()
+                .filter(SavedBounds::is_valid)
+                .or(account.bounds.clone());
+            let mini = mini_bounds(current.as_ref().or(normal.as_ref()), &monitors);
+            if let Some(account) = self.settings.account_mut(account_id) {
+                account.mini_mode = true;
+                account.maximized = false;
+                account.mini_bounds = Some(mini.clone());
+                if let Some(normal) = &normal {
+                    account.bounds = Some(normal.clone());
+                    account.normal_bounds = Some(normal.clone());
+                    account.remember_bounds_for_monitor(&monitors, normal);
+                }
+            }
+            if let Some(xid) = self.account_xids.get(account_id).copied() {
+                let _ = leave_maximized_state(&self.x11, xid);
+                if let Err(error) =
+                    set_window_min_size(&self.x11, xid, MINI_MIN_WIDTH, MINI_MIN_HEIGHT)
+                {
+                    warn!(%error, "could not shrink the window minimum size");
+                }
+                self.configure_window(account_id, &mini);
+            }
+            if let Some(handle) = handle {
+                let _ = handle.update(cx, |_, window, _| {
+                    window.resize(size(px(mini.width), px(mini.height)));
+                });
+            }
+        } else {
+            let fallback = default_saved_bounds(&monitors);
+            let restore = restore_account_bounds(&account, &monitors, &fallback);
+            if let Some(account) = self.settings.account_mut(account_id) {
+                account.mini_mode = false;
+            }
+            if let Some(xid) = self.account_xids.get(account_id).copied() {
+                if let Err(error) =
+                    set_window_min_size(&self.x11, xid, NORMAL_MIN_WIDTH, NORMAL_MIN_HEIGHT)
+                {
+                    warn!(%error, "could not restore the window minimum size");
+                }
+                self.configure_window(account_id, &restore);
+            }
+            if let Some(handle) = handle {
+                let _ = handle.update(cx, |_, window, _| {
+                    window.resize(size(px(restore.width), px(restore.height)));
+                });
+            }
+        }
+
+        self.save_settings(cx);
+        self.update_tray();
+        self.refresh_account_window(account_id, cx);
+        cx.refresh_windows();
+    }
+
+    fn configure_window(&self, account_id: &str, bounds: &SavedBounds) {
+        let Some(xid) = self.account_xids.get(account_id).copied() else {
+            return;
+        };
+        // Saved and GPUI bounds are logical pixels; X11 configure requests use
+        // physical pixels.
+        let scale = self.scales.get(account_id).copied().unwrap_or(1.0).max(1.0);
+        if let Err(error) = self.x11.configure(
+            xid,
+            (bounds.x * scale).round() as i32,
+            (bounds.y * scale).round() as i32,
+            (bounds.width * scale).round().max(1.0) as u32,
+            (bounds.height * scale).round().max(1.0) as u32,
+        ) {
+            warn!(%error, "could not configure the account window");
+        }
+    }
+
+    /// Persists the live window geometry. Mini windows keep their own size so
+    /// toggling mini mode off restores the normal bounds instead of a tiny
+    /// window.
+    fn remember_window_bounds(
+        &mut self,
+        account_id: &str,
+        bounds: Bounds<Pixels>,
+        maximized: bool,
+        monitors: &[MonitorArea],
+    ) {
+        let saved = saved_bounds(bounds);
+        let Some(account) = self.settings.account_mut(account_id) else {
+            return;
+        };
+        if account.mini_mode {
+            account.mini_bounds = Some(saved);
+        } else {
+            account.bounds = Some(saved.clone());
+            account.normal_bounds = Some(saved.clone());
+            account.maximized = maximized;
+            account.remember_bounds_for_monitor(monitors, &saved);
+        }
+    }
+
     fn handle_gtk_event(&mut self, event: GtkEvent, cx: &mut Context<Self>) {
         match event {
             GtkEvent::Ready { account_id, xid } => {
@@ -1692,6 +2151,7 @@ impl AppModel {
             }
             GtkEvent::LoadState { account_id, state } => match state {
                 LoadState::Started => {
+                    self.page_ready.remove(&account_id);
                     self.connection
                         .entry(account_id.clone())
                         .or_default()
@@ -1700,6 +2160,7 @@ impl AppModel {
                 }
                 LoadState::Finished => {
                     self.views.mark_loaded(&account_id);
+                    self.page_ready.insert(account_id.clone());
                     let recovered = self
                         .crash_recovery
                         .remove(&account_id)
@@ -1714,6 +2175,9 @@ impl AppModel {
                         .or_default()
                         .on_load_finished(Instant::now());
                     self.announce_connection(&account_id, decision);
+                    if let Some(paths) = self.pending_shares.remove(&account_id) {
+                        self.gtk.paste_paths(&account_id, paths);
+                    }
                     self.refresh_account_window(&account_id, cx);
                     if let Some(smoke) = &mut self.smoke {
                         if smoke.account_id == account_id && smoke.loaded_at.is_none() {
@@ -1732,6 +2196,10 @@ impl AppModel {
                     debug!(%account_id, %uri, %message, "ignored a load failure outside WhatsApp Web");
                 } else {
                     warn!(%account_id, %uri, %message, "WhatsApp Web is in a load error state");
+                    self.errors.record(
+                        DiagnosticLevel::Error,
+                        format!("WhatsApp Web load failed: {message}"),
+                    );
                     let decision = self
                         .connection
                         .entry(account_id.clone())
@@ -1762,13 +2230,17 @@ impl AppModel {
                     account_id = %account_id,
                     "the GTK thread refused a reload during an active download"
                 );
+                self.errors.record(
+                    DiagnosticLevel::Warning,
+                    "A WhatsApp Web reload was blocked by an active download",
+                );
                 if let Some(tracker) = self.connection.get_mut(&account_id) {
                     tracker.on_reload_blocked();
                 }
                 if notify::notifications_allowed(&self.settings, SystemTime::now()) {
                     notify::notify(
-                        "Download in progress",
-                        "OxideZap did not reload WhatsApp Web while a download is active.",
+                        t!("Download in progress"),
+                        t!("OxideZap did not reload WhatsApp Web while a download is active."),
                         Some(&self.paths.runtime_icon()),
                     );
                 }
@@ -1838,8 +2310,12 @@ impl AppModel {
                         .map(|parent| parent.display().to_string())
                         .unwrap_or_else(|| self.downloads_base_dir().display().to_string());
                     notify::notify(
-                        "Downloading",
-                        &format!("{filename}\nSaving to {folder}"),
+                        t!("Downloading"),
+                        &tr!(
+                            "{filename}\nSaving to {folder}",
+                            filename = filename,
+                            folder = folder
+                        ),
                         Some(&self.paths.runtime_icon()),
                     );
                 }
@@ -1897,19 +2373,27 @@ impl AppModel {
                 reason,
             } => {
                 warn!(%account_id, %filename, %reason, "download could not start");
+                self.errors.record(
+                    DiagnosticLevel::Warning,
+                    format!("A download could not start: {reason}"),
+                );
                 if notify::notifications_allowed(&self.settings, SystemTime::now()) {
                     notify::notify(
-                        "Download could not start",
-                        &format!("{filename}\n{reason}"),
+                        t!("Download could not start"),
+                        &tr!("{filename}\n{reason}", filename = filename, reason = reason),
                         Some(&self.paths.runtime_icon()),
                     );
                 }
             }
             GtkEvent::DownloadRetryFailed { id, message } => {
                 debug!(%id, %message, "download retry failed");
+                self.errors.record(
+                    DiagnosticLevel::Warning,
+                    format!("A download retry failed: {message}"),
+                );
                 if notify::notifications_allowed(&self.settings, SystemTime::now()) {
                     notify::notify(
-                        "Download could not be retried",
+                        t!("Download could not be retried"),
                         &message,
                         Some(&self.paths.runtime_icon()),
                     );
@@ -1920,9 +2404,13 @@ impl AppModel {
                 message,
             } => {
                 warn!(%account_id, %message, "a media action failed");
+                self.errors.record(
+                    DiagnosticLevel::Warning,
+                    format!("A media action failed: {message}"),
+                );
                 if self.settings.notifications {
                     notify::notify(
-                        "Media action failed",
+                        t!("Media action failed"),
                         &message,
                         Some(&self.paths.runtime_icon()),
                     );
@@ -1932,11 +2420,34 @@ impl AppModel {
                 debug!(%account_id, "copied a WhatsApp image to the clipboard");
                 if self.settings.notifications {
                     notify::notify(
-                        "Image copied",
-                        "The image is on the clipboard.",
+                        t!("Image copied"),
+                        t!("The image is on the clipboard."),
                         Some(&self.paths.runtime_icon()),
                     );
                 }
+            }
+            GtkEvent::ShareAttached { account_id, count } => {
+                let name = self.account_name(&account_id);
+                let noun = if count == 1 { "file" } else { "files" };
+                notify::notify(
+                    "Attached for review",
+                    &format!(
+                        "{count} {noun} attached to {name}. Check the WhatsApp preview before sending."
+                    ),
+                    Some(&self.paths.runtime_icon()),
+                );
+                debug!(%account_id, count, "queued shared files for the attachment preview");
+            }
+            GtkEvent::ShareRejected {
+                account_id,
+                message,
+            } => {
+                warn!(%account_id, "a shared file was rejected");
+                notify::notify(
+                    "Could not attach the file",
+                    &message,
+                    Some(&self.paths.runtime_icon()),
+                );
             }
             GtkEvent::OpenExternal { url } => {
                 Self::open_external(cx, &url);
@@ -1946,6 +2457,8 @@ impl AppModel {
             }
             GtkEvent::Crashed { account_id } => {
                 warn!(account_id = %account_id, "the WebKit web process crashed");
+                self.errors
+                    .record(DiagnosticLevel::Error, "The WebKit web process crashed");
                 if let Some(tracker) = self.connection.get_mut(&account_id) {
                     tracker.on_process_terminated();
                 }
@@ -1962,12 +2475,19 @@ impl AppModel {
                     }
                     CrashDecision::Exhausted => {
                         error!(account_id = %account_id, "WebKit crash recovery exhausted");
+                        self.errors.record(
+                            DiagnosticLevel::Error,
+                            format!(
+                                "WebKit crash recovery exhausted after {MAX_CRASH_ATTEMPTS} attempts"
+                            ),
+                        );
                         self.gtk.hide(&account_id);
                         if !notify::do_not_disturb_suppressed(&self.settings, SystemTime::now()) {
                             notify::notify(
-                                "WhatsApp Web crashed",
-                                &format!(
-                                    "Automatic recovery failed after {MAX_CRASH_ATTEMPTS} attempts. Use \"Retry now\" in the account window."
+                                t!("WhatsApp Web crashed"),
+                                &tr!(
+                                    "Automatic recovery failed after {attempts} attempts. Use “Retry now” in the account window.",
+                                    attempts = MAX_CRASH_ATTEMPTS
                                 ),
                                 Some(&self.paths.runtime_icon()),
                             );
@@ -2002,6 +2522,10 @@ impl AppModel {
                     reason = reason.label(),
                     "kept a WebKit view that could not be suspended safely"
                 );
+                self.errors.record(
+                    DiagnosticLevel::Warning,
+                    format!("A WebKit view could not be suspended: {}", reason.label()),
+                );
                 self.views.mark_active(&account_id);
                 self.refresh_account_window(&account_id, cx);
                 self.update_tray();
@@ -2013,9 +2537,11 @@ impl AppModel {
             } => {
                 self.views.mark_failed(&account_id);
                 error!(account_id = %account_id, message = %message, "WebKit error");
+                self.errors
+                    .record(DiagnosticLevel::Error, format!("WebKit error: {message}"));
                 if !notify::do_not_disturb_suppressed(&self.settings, SystemTime::now()) {
                     notify::notify(
-                        "WhatsApp Web could not start",
+                        t!("WhatsApp Web could not start"),
                         &message,
                         Some(&self.paths.runtime_icon()),
                     );
@@ -2082,6 +2608,9 @@ impl AppModel {
             InstanceMessage::OpenChat { account, chat } => {
                 self.open_chat(account, chat, cx).map(|_| None)
             }
+            InstanceMessage::Share { account, path } => {
+                self.share_paths(account, path, cx).map(Some)
+            }
             InstanceMessage::SetDoNotDisturb(mode) => {
                 self.apply_do_not_disturb(mode, cx);
                 Ok(None)
@@ -2101,7 +2630,7 @@ impl AppModel {
 
     fn request_lock(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         if !lock_is_configured(&self.settings.lock) {
-            return Err("the application lock is not configured".to_string());
+            return Err(t!("the application lock is not configured").to_string());
         }
         self.lock(cx);
         Ok(())
@@ -2114,14 +2643,14 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         if self.locked {
-            return Err("the application is locked; unlock it first".to_string());
+            return Err(t!("the application is locked; unlock it first").to_string());
         }
         let account_id = match account {
             Some(query) => resolve_account(&self.settings, &query)?,
             None => self
                 .settings
                 .active_account_id()
-                .ok_or_else(|| "no active account; pass --account".to_string())?,
+                .ok_or_else(|| t!("no active account; pass --account").to_string())?,
         };
         let url = chat.web_url();
         if self.account_windows.contains_key(&account_id) {
@@ -2132,6 +2661,79 @@ impl AppModel {
             self.open_account_window(&account_id, cx);
         }
         Ok(())
+    }
+
+    /// Validates files dropped on the native titlebar or window margins. Drops
+    /// over the WebKit content take the GTK path; both end in the same paste
+    /// queue and keep WhatsApp's unsent attachment preview.
+    pub fn attach_dropped_paths(
+        &mut self,
+        account_id: &str,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        match crate::webview::validate_share_paths(&paths) {
+            Ok(_) => {
+                self.show_account_window(account_id, cx);
+                if self.page_ready.contains(account_id) {
+                    self.gtk.paste_paths(account_id, paths);
+                } else {
+                    self.pending_shares
+                        .entry(account_id.to_string())
+                        .or_default()
+                        .extend(paths);
+                }
+            }
+            Err(message) => {
+                notify::notify(
+                    "Could not attach the file",
+                    &message,
+                    Some(&self.paths.runtime_icon()),
+                );
+            }
+        }
+    }
+
+    /// Queues a validated local file for the account's WhatsApp attachment
+    /// preview. Nothing is sent: WhatsApp keeps the normal composer preview,
+    /// and the user has to press send.
+    fn share_paths(
+        &mut self,
+        account: Option<String>,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        if self.locked {
+            return Err("the application is locked; unlock it first".to_string());
+        }
+        let account_id = match account {
+            Some(query) => resolve_account(&self.settings, &query)?,
+            None => self
+                .settings
+                .active_account_id()
+                .ok_or_else(|| "no active account; pass --account".to_string())?,
+        };
+        let files = crate::webview::validate_share_paths(std::slice::from_ref(&path))?;
+        let name = self.account_name(&account_id);
+        if self.settings.active_account.as_deref() != Some(account_id.as_str()) {
+            self.settings.active_account = Some(account_id.clone());
+            self.save_settings(cx);
+        }
+        self.show_account_window(&account_id, cx);
+        if self.account_windows.contains_key(&account_id) && self.page_ready.contains(&account_id) {
+            self.gtk.paste_paths(&account_id, vec![path]);
+        } else {
+            self.pending_shares
+                .entry(account_id.clone())
+                .or_default()
+                .push(path);
+            self.open_account_window(&account_id, cx);
+        }
+        let count = files.len();
+        Ok(format!(
+            "Attached {count} file{} to {name}. Check the WhatsApp preview before sending.",
+            if count == 1 { "" } else { "s" }
+        ))
     }
 
     fn open_downloads(&mut self, cx: &mut Context<Self>) {
@@ -2198,8 +2800,10 @@ impl AppModel {
         let Some(url) = record.retry_url().map(str::to_string) else {
             if !notify::do_not_disturb_suppressed(&self.settings, SystemTime::now()) {
                 notify::notify(
-                    "Retry unavailable",
-                    "This download has no reusable source URL. Start it again from WhatsApp Web.",
+                    t!("Retry unavailable"),
+                    t!(
+                        "This download has no reusable source URL. Start it again from WhatsApp Web."
+                    ),
                     Some(&self.paths.runtime_icon()),
                 );
             }
@@ -2257,19 +2861,23 @@ impl AppModel {
             if let Some(path) = record.path.as_deref() {
                 notify::notify_download(&record.filename, path, Some(&icon));
             } else {
-                notify::notify("Download complete", &record.filename, Some(&icon));
+                notify::notify(t!("Download complete"), &record.filename, Some(&icon));
             }
         } else if cancelled {
-            notify::notify("Download cancelled", &record.filename, Some(&icon));
+            notify::notify(t!("Download cancelled"), &record.filename, Some(&icon));
         } else {
             let hint = if record.retry_url().is_some() {
-                "Open the Download Center to retry."
+                t!("Open the Download Center to retry.")
             } else {
-                "Reopen the media and use the save action to retry."
+                t!("Reopen the media and use the save action to retry.")
             };
             notify::notify(
-                "Download failed",
-                &format!("{}\n{hint}", record.filename),
+                t!("Download failed"),
+                &tr!(
+                    "{filename}\n{hint}",
+                    filename = record.filename,
+                    hint = hint
+                ),
                 Some(&icon),
             );
         }
@@ -2391,6 +2999,14 @@ impl AppModel {
                 self.update_do_not_disturb(cx, |dnd| {
                     dnd.override_current_period(now);
                 });
+            }
+            TrayAction::ToggleAlwaysOnTop(account_id) => {
+                let enabled = !self.account_always_on_top(&account_id);
+                self.set_always_on_top(&account_id, enabled, cx);
+            }
+            TrayAction::ToggleMiniMode(account_id) => {
+                let enabled = !self.account_mini_mode(&account_id);
+                self.set_mini_mode(&account_id, enabled, cx);
             }
             TrayAction::Quit => self.quit(cx),
         }
@@ -2521,6 +3137,11 @@ impl AppModel {
             appearance: self.settings.appearance.clone(),
             media_actions: self.settings.media_actions,
         });
+        // A recreated WebKit window loses GTK-only state such as keep-above.
+        // Reapply it when the GPUI window is already tagged.
+        if let Some(xid) = self.account_xids.get(account_id).copied() {
+            self.apply_window_modes(account_id, xid);
+        }
     }
 
     pub fn open_settings_window(&mut self, cx: &mut Context<Self>) {
@@ -3088,16 +3709,11 @@ impl AppModel {
     ) {
         let bounds = window.bounds();
         let maximized = window.is_maximized();
-        if let Some(account) = self.settings.account_mut(account_id) {
-            account.bounds = Some(SavedBounds {
-                x: f32::from(bounds.origin.x),
-                y: f32::from(bounds.origin.y),
-                width: f32::from(bounds.size.width),
-                height: f32::from(bounds.size.height),
-            });
-            account.maximized = maximized;
-        }
+        let monitors = monitor_areas(cx);
+        self.remember_window_bounds(account_id, bounds, maximized, &monitors);
         self.save_settings(cx);
+        self.pending_shares.remove(account_id);
+        self.page_ready.remove(account_id);
 
         if self.settings.close_to_tray {
             self.hide_account_window(account_id, cx);
@@ -3114,6 +3730,8 @@ impl AppModel {
         self.hidden_since.forget(account_id);
         self.capture_active.remove(account_id);
         self.scales.remove(account_id);
+        self.page_ready.remove(account_id);
+        self.pending_shares.remove(account_id);
         self.gtk.close(account_id);
         window.remove_window();
         if self.account_windows.is_empty() {
@@ -3177,6 +3795,8 @@ impl AppModel {
         self.hidden_since.forget(account_id);
         self.capture_active.remove(account_id);
         self.scales.remove(account_id);
+        self.page_ready.remove(account_id);
+        self.pending_shares.remove(account_id);
         self.gtk.close(account_id);
         self.settings.remove_account(account_id);
     }
@@ -3241,9 +3861,9 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) {
         if self.storage.running.is_some() {
-            self.storage.notice = Some(StorageNotice::error(
-                "Another storage operation is already running.",
-            ));
+            self.storage.notice = Some(StorageNotice::error(t!(
+                "Another storage operation is already running."
+            )));
             cx.refresh_windows();
             return;
         }
@@ -3252,7 +3872,9 @@ impl AppModel {
             self.settings.accounts.len(),
             self.settings.account(account_id).is_some(),
         ) {
-            self.storage.notice = Some(StorageNotice::error(error.to_string()));
+            self.storage.notice = Some(StorageNotice::error(crate::i18n::translate_owned(
+                &error.to_string(),
+            )));
             cx.refresh_windows();
             return;
         }
@@ -3281,29 +3903,37 @@ impl AppModel {
                 match operation {
                     StorageOperation::RemoveData => {
                         self.forget_account(&account_id, cx);
-                        StorageNotice::success(format!(
-                            "Deleted the account data and removed the account ({} freed).",
-                            storage::format_bytes(freed)
+                        StorageNotice::success(tr!(
+                            "Deleted the account data and removed the account ({freed} freed).",
+                            freed = storage::format_bytes(freed)
                         ))
                     }
                     StorageOperation::ClearCache => {
                         self.recreate_account_webview(&account_id);
-                        StorageNotice::success(format!(
-                            "Cache cleared ({} freed). The WhatsApp session was kept.",
-                            storage::format_bytes(freed)
+                        StorageNotice::success(tr!(
+                            "Cache cleared ({freed} freed). The WhatsApp session was kept.",
+                            freed = storage::format_bytes(freed)
                         ))
                     }
                     StorageOperation::ClearSession => {
                         self.recreate_account_webview(&account_id);
-                        StorageNotice::success(
-                            "Signed out. The account was kept; open it and scan the QR code again.",
-                        )
+                        StorageNotice::success(t!(
+                            "Signed out. The account was kept; open it and scan the QR code again."
+                        ))
                     }
                 }
             }
             Err(error) => {
                 self.recreate_account_webview(&account_id);
-                StorageNotice::error(format!("Could not {}: {error}", operation.label()))
+                self.errors.record(
+                    DiagnosticLevel::Error,
+                    format!("A storage operation failed: {error}"),
+                );
+                StorageNotice::error(tr!(
+                    "Could not {operation}: {error}",
+                    operation = crate::i18n::translate_dynamic(operation.label()),
+                    error = error
+                ))
             }
         };
         self.storage.notice = Some(notice);
@@ -3334,6 +3964,7 @@ impl AppModel {
             .unwrap_or_else(|| WHATSAPP_URL.to_string());
         self.crash_recovery.remove(account_id);
         self.connection.remove(account_id);
+        self.page_ready.remove(account_id);
         self.send_create(account_id, url, None, show);
     }
 
@@ -3411,16 +4042,17 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         if Shortcut::parse(&self.settings.boss_key).ok().as_ref() == Some(&shortcut) {
-            return Err("The show/hide shortcut must differ from the boss key.".to_string());
+            return Err(t!("The show/hide shortcut must differ from the boss key.").to_string());
         }
         if Shortcut::parse(&self.settings.command_palette_shortcut)
             .ok()
             .as_ref()
             == Some(&shortcut)
         {
-            return Err(
-                "The show/hide shortcut must differ from the command palette shortcut.".to_string(),
-            );
+            return Err(t!(
+                "The show/hide shortcut must differ from the command palette shortcut."
+            )
+            .to_string());
         }
         self.settings.shortcut = shortcut.to_string();
         self.apply_settings(cx);
@@ -3433,14 +4065,16 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         if Shortcut::parse(&self.settings.shortcut).ok().as_ref() == Some(&shortcut) {
-            return Err("The boss key must differ from the show/hide shortcut.".to_string());
+            return Err(t!("The boss key must differ from the show/hide shortcut.").to_string());
         }
         if Shortcut::parse(&self.settings.command_palette_shortcut)
             .ok()
             .as_ref()
             == Some(&shortcut)
         {
-            return Err("The boss key must differ from the command palette shortcut.".to_string());
+            return Err(
+                t!("The boss key must differ from the command palette shortcut.").to_string(),
+            );
         }
         self.settings.boss_key = shortcut.to_string();
         self.apply_settings(cx);
@@ -3454,14 +4088,14 @@ impl AppModel {
     ) -> Result<(), String> {
         if let Some(shortcut) = shortcut {
             if Shortcut::parse(&self.settings.shortcut).ok().as_ref() == Some(&shortcut) {
-                return Err(
+                return Err(t!(
                     "The command palette shortcut must differ from the show/hide shortcut."
-                        .to_string(),
-                );
+                )
+                .to_string());
             }
             if Shortcut::parse(&self.settings.boss_key).ok().as_ref() == Some(&shortcut) {
                 return Err(
-                    "The command palette shortcut must differ from the boss key.".to_string(),
+                    t!("The command palette shortcut must differ from the boss key.").to_string(),
                 );
             }
             self.settings.command_palette_shortcut = shortcut.to_string();
@@ -3473,7 +4107,21 @@ impl AppModel {
     }
 
     pub fn set_password(&mut self, password: &str, cx: &mut Context<Self>) -> Result<(), String> {
-        lock::validate_password(password)?;
+        lock::validate_password(password).map_err(|error| {
+            if error
+                == format!(
+                    "Use at least {} characters.",
+                    crate::lock::MIN_PASSWORD_LENGTH
+                )
+            {
+                tr!(
+                    "Use at least {count} characters.",
+                    count = crate::lock::MIN_PASSWORD_LENGTH
+                )
+            } else {
+                crate::i18n::translate_owned(&error)
+            }
+        })?;
         let hash = lock::hash_password(password).map_err(|error| error.to_string())?;
         self.settings.lock.hash = Some(hash);
         self.settings.lock.enabled = true;
@@ -3594,6 +4242,7 @@ impl AppModel {
 
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
         self.save_settings(cx);
+        crate::i18n::set_language(self.settings.language);
         if let Err(error) = autostart::apply(self.settings.start_at_login, &self.paths) {
             warn!(%error, "could not update the autostart entry");
         }
@@ -3609,6 +4258,7 @@ impl AppModel {
         self.gtk.set_proxy(self.settings.network.proxy.clone());
         self.gtk.set_appearance(self.settings.appearance.clone());
         self.gtk.set_media_actions(self.settings.media_actions);
+        self.apply_performance(cx);
         // Turning low-memory mode off must not strand accounts in the
         // suspended placeholder. Re-enabling it never suspends immediately:
         // each account has to stay hidden for the configured delay first.
@@ -3617,6 +4267,28 @@ impl AppModel {
         }
         self.update_tray();
         cx.refresh_windows();
+    }
+
+    /// Pushes the resolved policy to the GTK/WebKit thread. Calling this on
+    /// every settings change is cheap: the thread applies the stylesheet only
+    /// when the saver state actually changes.
+    fn apply_performance(&mut self, cx: &mut Context<Self>) {
+        let status = self.settings.performance.resolve(self.power);
+        self.gtk
+            .set_performance(status.battery_saver, status.cadence());
+        if status == self.performance {
+            return;
+        }
+        self.performance = status;
+        debug!(
+            battery_saver = status.battery_saver,
+            power = status.power.label(),
+            reason = status.status_text(),
+            "performance mode changed"
+        );
+        if let Some(handle) = self.settings_window {
+            let _ = handle.update(cx, |_, _, cx| cx.notify());
+        }
     }
 
     fn apply_hotkeys(&self) {
@@ -3697,9 +4369,26 @@ impl AppModel {
         self.last_dnd_status = dnd.status.clone();
         let unread = self.settings.total_unread();
         let visible = self.any_account_visible();
+        let window = self.settings.active_account_id().and_then(|account_id| {
+            self.settings
+                .account(&account_id)
+                .map(|account| TrayWindowState {
+                    account_id: account.id.clone(),
+                    name: account.name.clone(),
+                    always_on_top: account.always_on_top,
+                    mini_mode: account.mini_mode,
+                })
+        });
         if let Some(tray) = &self.tray {
             let suspended: HashSet<String> = self.views.suspended_ids().into_iter().collect();
-            tray.update(&self.settings.accounts, unread, visible, dnd, &suspended);
+            tray.update(
+                &self.settings.accounts,
+                unread,
+                visible,
+                dnd,
+                &suspended,
+                window,
+            );
         }
         self.badge.set(unread);
     }
@@ -3750,6 +4439,7 @@ impl AppModel {
 
         self.x11.tag_account(xid, account_id)?;
         self.account_xids.insert(account_id.to_string(), xid);
+        self.apply_window_modes(account_id, xid);
         if self.hidden_accounts.contains(account_id) {
             if let Err(error) = self.x11.unmap(xid) {
                 warn!(account_id = %account_id, %error, "could not hide the tagged GPUI window");
@@ -3808,19 +4498,12 @@ impl AppModel {
             .iter()
             .map(|(id, handle)| (id.clone(), *handle))
             .collect();
+        let monitors = monitor_areas(cx);
         for (id, handle) in windows {
             if let Ok((bounds, maximized)) =
                 handle.update(cx, |_, window, _| (window.bounds(), window.is_maximized()))
             {
-                if let Some(account) = self.settings.account_mut(&id) {
-                    account.bounds = Some(SavedBounds {
-                        x: f32::from(bounds.origin.x),
-                        y: f32::from(bounds.origin.y),
-                        width: f32::from(bounds.size.width),
-                        height: f32::from(bounds.size.height),
-                    });
-                    account.maximized = maximized;
-                }
+                self.remember_window_bounds(&id, bounds, maximized, &monitors);
             }
         }
         self.save_settings_now();
@@ -4045,25 +4728,37 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
         return;
     };
 
-    let window_bounds = if remember_bounds {
-        account
-            .bounds
-            .as_ref()
-            .filter(|bounds| bounds.is_valid())
-            .map(|bounds| {
-                let bounds = Bounds::new(
-                    point(px(bounds.x), px(bounds.y)),
-                    size(px(bounds.width), px(bounds.height)),
-                );
-                if account.maximized {
-                    WindowBounds::Maximized(bounds)
-                } else {
-                    WindowBounds::Windowed(bounds)
-                }
-            })
-            .unwrap_or_else(|| WindowBounds::centered(size(px(1180.0), px(780.0)), cx))
+    let monitors = monitor_areas(cx);
+    let window_bounds = if account.mini_mode {
+        let mini = account
+            .mini_bounds
+            .clone()
+            .filter(SavedBounds::is_usable)
+            .map(|bounds| clamp_to_available_monitors(&bounds, &monitors))
+            .unwrap_or_else(|| mini_bounds(account.bounds.as_ref(), &monitors));
+        window_bounds(&mini)
+    } else if remember_bounds {
+        let fallback = default_saved_bounds(&monitors);
+        let saved = restore_account_bounds(&account, &monitors, &fallback);
+        let bounds = Bounds::new(
+            point(px(saved.x), px(saved.y)),
+            size(px(saved.width), px(saved.height)),
+        );
+        if account.maximized {
+            WindowBounds::Maximized(bounds)
+        } else {
+            WindowBounds::Windowed(bounds)
+        }
     } else {
-        WindowBounds::centered(size(px(1180.0), px(780.0)), cx)
+        WindowBounds::centered(
+            size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+            cx,
+        )
+    };
+    let (min_width, min_height) = if account.mini_mode {
+        (MINI_MIN_WIDTH, MINI_MIN_HEIGHT)
+    } else {
+        (NORMAL_MIN_WIDTH, NORMAL_MIN_HEIGHT)
     };
 
     let options = WindowOptions {
@@ -4082,7 +4777,7 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
         display_id: None,
         window_background: WindowBackgroundAppearance::Opaque,
         app_id: Some(APP_ID.to_string()),
-        window_min_size: Some(size(px(760.0), px(520.0))),
+        window_min_size: Some(size(px(min_width), px(min_height))),
         window_decorations: Some(WindowDecorations::Client),
         tabbing_identifier: None,
     };
@@ -4124,7 +4819,7 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
             };
             if notify_allowed {
                 notify::notify(
-                    "Could not open the account window",
+                    t!("Could not open the account window"),
                     &error.to_string(),
                     Some(&icon),
                 );
@@ -4155,7 +4850,7 @@ fn open_settings_window_deferred(model: Entity<AppModel>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(920.0), px(660.0)), cx)),
         titlebar: Some(TitlebarOptions {
-            title: Some(SharedString::from("OxideZap Settings")),
+            title: Some(SharedString::from(t!("OxideZap Settings"))),
             appears_transparent: false,
             traffic_light_position: None,
         }),
@@ -4206,7 +4901,7 @@ fn open_onboarding_window_deferred(model: Entity<AppModel>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(700.0), px(620.0)), cx)),
         titlebar: Some(TitlebarOptions {
-            title: Some(SharedString::from("Welcome to OxideZap")),
+            title: Some(SharedString::from(t!("Welcome to OxideZap"))),
             appears_transparent: false,
             traffic_light_position: None,
         }),
@@ -4257,7 +4952,7 @@ fn open_downloads_window_deferred(model: Entity<AppModel>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1040.0), px(640.0)), cx)),
         titlebar: Some(TitlebarOptions {
-            title: Some(SharedString::from("OxideZap Downloads")),
+            title: Some(SharedString::from(t!("OxideZap Downloads"))),
             appears_transparent: false,
             traffic_light_position: None,
         }),
@@ -4298,7 +4993,7 @@ fn open_lock_window_deferred(model: Entity<AppModel>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(460.0), px(420.0)), cx)),
         titlebar: Some(TitlebarOptions {
-            title: Some(SharedString::from("OxideZap Locked")),
+            title: Some(SharedString::from(t!("OxideZap Locked"))),
             appears_transparent: false,
             traffic_light_position: None,
         }),
@@ -4645,17 +5340,60 @@ mod tests {
 
     #[test]
     fn the_sweep_runs_at_most_once_per_interval() {
+        let interval = PerformanceCadence::NORMAL.memory_sweep;
         let start = Instant::now();
-        assert!(!memory_sweep_due(start, start));
+        assert!(!memory_sweep_due(start, start, interval));
         assert!(!memory_sweep_due(
             start,
-            start + MEMORY_SWEEP_INTERVAL - Duration::from_millis(1)
+            start + interval - Duration::from_millis(1),
+            interval
         ));
-        assert!(memory_sweep_due(start, start + MEMORY_SWEEP_INTERVAL));
+        assert!(memory_sweep_due(start, start + interval, interval));
         assert!(memory_sweep_due(
             start,
-            start + MEMORY_SWEEP_INTERVAL + Duration::from_secs(1)
+            start + interval + Duration::from_secs(1),
+            interval
         ));
+    }
+
+    #[test]
+    fn battery_saver_shortens_the_delay_but_keeps_visible_and_active_guards() {
+        let memory = memory_mode();
+        let saver_memory = effective_memory(&memory, true);
+        assert_eq!(
+            saver_memory.suspend_after_minutes,
+            crate::settings::performance::BATTERY_SUSPEND_MINUTES
+        );
+
+        let mut hidden = suspend_context(&saver_memory);
+        hidden.idle = Duration::from_secs(20 * 60);
+        assert_eq!(suspend_decision(&hidden), SuspendDecision::Suspend);
+
+        let mut visible = hidden;
+        visible.hidden = false;
+        assert_eq!(
+            suspend_decision(&visible),
+            SuspendDecision::Keep(SuspendBlocker::Visible)
+        );
+
+        let mut active = hidden;
+        active.active_account = true;
+        assert_eq!(
+            suspend_decision(&active),
+            SuspendDecision::Keep(SuspendBlocker::ActiveAccount)
+        );
+
+        let disabled = effective_memory(
+            &MemorySettings {
+                suspend_hidden: false,
+                ..memory
+            },
+            true,
+        );
+        assert_eq!(
+            suspend_decision(&suspend_context(&disabled)),
+            SuspendDecision::Keep(SuspendBlocker::Disabled)
+        );
     }
 
     #[test]
@@ -5248,5 +5986,58 @@ mod tests {
         assert!(is_screen_saver_interface("org.kde.screensaver"));
         assert!(!is_screen_saver_interface("org.freedesktop.login1.Manager"));
         assert!(!is_screen_saver_interface("org.freedesktop.Notifications"));
+    }
+
+    fn test_monitors() -> Vec<MonitorArea> {
+        vec![MonitorArea {
+            key: "primary".to_string(),
+            bounds: SavedBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+        }]
+    }
+
+    #[test]
+    fn the_default_window_is_centered_on_the_primary_monitor() {
+        let bounds = default_saved_bounds(&test_monitors());
+
+        assert_eq!(
+            bounds,
+            SavedBounds {
+                x: 370.0,
+                y: 150.0,
+                width: 1180.0,
+                height: 780.0,
+            }
+        );
+    }
+
+    #[test]
+    fn mini_bounds_are_compact_and_clamped_to_the_available_monitor() {
+        let source = SavedBounds {
+            x: 5000.0,
+            y: 0.0,
+            width: 1180.0,
+            height: 780.0,
+        };
+
+        let mini = mini_bounds(Some(&source), &test_monitors());
+
+        assert_eq!(
+            mini,
+            SavedBounds {
+                x: 1500.0,
+                y: 0.0,
+                width: MINI_WINDOW_WIDTH,
+                height: MINI_WINDOW_HEIGHT,
+            }
+        );
+        assert_eq!(
+            clamp_to_available_monitors(&source, &test_monitors()).x,
+            740.0
+        );
     }
 }

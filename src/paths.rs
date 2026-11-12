@@ -212,11 +212,13 @@ impl Paths {
     }
 
     pub fn ensure(&self) -> Result<()> {
+        let logs_dir = self.logs_dir();
         for dir in [
             &self.config_dir,
             &self.data_dir,
             &self.cache_dir,
             &self.accounts_dir,
+            &logs_dir,
         ] {
             create_private_dir(dir)?;
         }
@@ -232,11 +234,13 @@ impl Paths {
     /// owns are touched, and symlinks are skipped so a foreign target is never
     /// chmodded.
     fn migrate_private_permissions(&self) {
+        let logs_dir = self.logs_dir();
         for dir in [
             &self.config_dir,
             &self.data_dir,
             &self.cache_dir,
             &self.accounts_dir,
+            &logs_dir,
         ] {
             if let Err(error) = restrict_directory(dir) {
                 warn!(%error, "could not restrict an application directory");
@@ -316,6 +320,18 @@ impl Paths {
     /// private and easy to back up independently from account data.
     pub fn downloads_index_file(&self) -> PathBuf {
         self.config_dir.join("downloads.json")
+    }
+
+    /// Application log directory. It lives next to the settings file so the
+    /// diagnostics report can point to a stable, private location.
+    pub fn logs_dir(&self) -> PathBuf {
+        self.config_dir.join("logs")
+    }
+
+    /// Application log file. `init_tracing` writes here with `0600`
+    /// permissions and rotates the file when it grows past its limit.
+    pub fn log_file(&self) -> PathBuf {
+        self.logs_dir().join("oxidezap.log")
     }
 
     pub fn write_runtime_assets(&self) -> Result<()> {
@@ -401,6 +417,10 @@ mod tests {
             paths.downloads_index_file(),
             PathBuf::from("/tmp/config/downloads.json")
         );
+        assert_eq!(
+            paths.log_file(),
+            PathBuf::from("/tmp/config/logs/oxidezap.log")
+        );
     }
 
     #[cfg(unix)]
@@ -440,6 +460,7 @@ mod tests {
                 &paths.data_dir,
                 &paths.cache_dir,
                 &paths.accounts_dir,
+                &paths.logs_dir(),
             ] {
                 assert_eq!(mode(dir), 0o700, "{}", dir.display());
             }

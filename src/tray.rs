@@ -54,7 +54,18 @@ pub enum TrayAction {
     DoNotDisturbIndefinite,
     DoNotDisturbSchedule,
     DoNotDisturbSkip,
+    ToggleAlwaysOnTop(String),
+    ToggleMiniMode(String),
     Quit,
+}
+
+/// Window-mode state for the active account, shown as checkable tray entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrayWindowState {
+    pub account_id: String,
+    pub name: String,
+    pub always_on_top: bool,
+    pub mini_mode: bool,
 }
 
 /// Effective Do Not Disturb presentation for the tray. `status` is the compact
@@ -75,9 +86,9 @@ impl TrayDndState {
             return None;
         }
         if self.status.is_empty() {
-            Some("Do not disturb".to_string())
+            Some(t!("Do not disturb").to_string())
         } else {
-            Some(format!("Do not disturb: {}", self.status))
+            Some(tr!("Do not disturb: {status}", status = self.status))
         }
     }
 }
@@ -118,6 +129,7 @@ pub struct OxideTray {
     unread: u32,
     visible: bool,
     dnd: TrayDndState,
+    window: Option<TrayWindowState>,
     icons: IconCache,
 }
 
@@ -131,6 +143,7 @@ impl OxideTray {
             unread: 0,
             visible: true,
             dnd: TrayDndState::default(),
+            window: None,
             icons,
         }
     }
@@ -143,7 +156,11 @@ impl ksni::Tray for OxideTray {
 
     fn title(&self) -> String {
         if self.unread > 0 {
-            format!("OxideZap — {} unread", self.unread)
+            tn!(
+                self.unread,
+                "OxideZap — {count} unread message",
+                "OxideZap — {count} unread messages"
+            )
         } else {
             "OxideZap".to_string()
         }
@@ -179,9 +196,9 @@ impl ksni::Tray for OxideTray {
         items.push(
             StandardItem {
                 label: if self.visible {
-                    "Hide OxideZap".to_string()
+                    t!("Hide OxideZap").to_string()
                 } else {
-                    "Show OxideZap".to_string()
+                    t!("Show OxideZap").to_string()
                 },
                 icon_name: "view-restore".to_string(),
                 activate: Box::new(|tray: &mut Self| {
@@ -193,7 +210,7 @@ impl ksni::Tray for OxideTray {
         );
         items.push(
             StandardItem {
-                label: "Lock OxideZap".to_string(),
+                label: t!("Lock OxideZap").to_string(),
                 icon_name: "system-lock-screen".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.try_send(TrayAction::Lock);
@@ -215,7 +232,7 @@ impl ksni::Tray for OxideTray {
                     account.name.clone()
                 };
                 if account.suspended {
-                    label.push_str(" (suspended)");
+                    label.push_str(&format!(" ({})", t!("suspended")));
                 }
                 StandardItem {
                     label,
@@ -235,7 +252,7 @@ impl ksni::Tray for OxideTray {
 
         items.push(
             SubMenu {
-                label: "Accounts".to_string(),
+                label: t!("Accounts").to_string(),
                 submenu: account_items,
                 ..Default::default()
             }
@@ -244,7 +261,7 @@ impl ksni::Tray for OxideTray {
         if self.accounts.iter().any(|account| account.suspended) {
             items.push(
                 StandardItem {
-                    label: "Resume all suspended accounts".to_string(),
+                    label: t!("Resume all suspended accounts").to_string(),
                     icon_name: "view-restore".to_string(),
                     activate: Box::new(|tray: &mut Self| {
                         let _ = tray.tx.try_send(TrayAction::ResumeAll);
@@ -254,9 +271,53 @@ impl ksni::Tray for OxideTray {
                 .into(),
             );
         }
+        if let Some(window) = &self.window {
+            let account = window.account_id.clone();
+            let top_account = account.clone();
+            let mini_account = account;
+            items.push(
+                SubMenu {
+                    label: format!("Window: {}", window.name),
+                    submenu: vec![
+                        StandardItem {
+                            label: if window.always_on_top {
+                                "✓ Always on top".to_string()
+                            } else {
+                                "Always on top".to_string()
+                            },
+                            icon_name: "view-pin".to_string(),
+                            activate: Box::new(move |tray: &mut Self| {
+                                let _ = tray
+                                    .tx
+                                    .try_send(TrayAction::ToggleAlwaysOnTop(top_account.clone()));
+                            }),
+                            ..Default::default()
+                        }
+                        .into(),
+                        StandardItem {
+                            label: if window.mini_mode {
+                                "✓ Mini mode".to_string()
+                            } else {
+                                "Mini mode".to_string()
+                            },
+                            icon_name: "window-restore".to_string(),
+                            activate: Box::new(move |tray: &mut Self| {
+                                let _ = tray
+                                    .tx
+                                    .try_send(TrayAction::ToggleMiniMode(mini_account.clone()));
+                            }),
+                            ..Default::default()
+                        }
+                        .into(),
+                    ],
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         items.push(
             StandardItem {
-                label: "Add account…".to_string(),
+                label: t!("Add account…").to_string(),
                 icon_name: "list-add".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.try_send(TrayAction::AddAccount);
@@ -267,7 +328,7 @@ impl ksni::Tray for OxideTray {
         );
         items.push(
             StandardItem {
-                label: "Downloads…".to_string(),
+                label: t!("Downloads…").to_string(),
                 icon_name: "folder-download".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.try_send(TrayAction::Downloads);
@@ -279,7 +340,7 @@ impl ksni::Tray for OxideTray {
         items.push(self.dnd_menu().into());
         items.push(
             StandardItem {
-                label: "Settings…".to_string(),
+                label: t!("Settings…").to_string(),
                 icon_name: "preferences-system".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.try_send(TrayAction::Settings);
@@ -291,7 +352,7 @@ impl ksni::Tray for OxideTray {
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {
-                label: "Quit OxideZap".to_string(),
+                label: t!("Quit OxideZap").to_string(),
                 icon_name: "application-exit".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.try_send(TrayAction::Quit);
@@ -307,9 +368,9 @@ impl ksni::Tray for OxideTray {
 impl OxideTray {
     fn dnd_menu(&self) -> SubMenu<Self> {
         let label = if self.dnd.active {
-            format!("Do not disturb: {}", self.dnd.status)
+            tr!("Do not disturb: {status}", status = self.dnd.status)
         } else {
-            "Do not disturb".to_string()
+            t!("Do not disturb").to_string()
         };
         let wake = if self.dnd.wake_time.is_empty() {
             "07:00"
@@ -317,14 +378,14 @@ impl OxideTray {
             self.dnd.wake_time.as_str()
         };
         let schedule_label = if self.dnd.follows_schedule {
-            "✓ Follow quiet hours".to_string()
+            format!("✓ {}", t!("Follow quiet hours"))
         } else {
-            "Follow quiet hours".to_string()
+            t!("Follow quiet hours").to_string()
         };
         let mut items: Vec<MenuItem<Self>> = Vec::new();
         items.push(
             StandardItem {
-                label: "Off".to_string(),
+                label: t!("Off").to_string(),
                 icon_name: "notifications-disabled".to_string(),
                 enabled: self.dnd.active,
                 activate: Box::new(|tray: &mut Self| {
@@ -336,7 +397,7 @@ impl OxideTray {
         );
         items.push(
             StandardItem {
-                label: "On for 1 hour".to_string(),
+                label: t!("On for 1 hour").to_string(),
                 icon_name: "notifications-disabled".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.try_send(TrayAction::DoNotDisturbOneHour);
@@ -347,7 +408,7 @@ impl OxideTray {
         );
         items.push(
             StandardItem {
-                label: format!("Until tomorrow ({wake})"),
+                label: tr!("Until tomorrow ({wake})", wake = wake),
                 icon_name: "notifications-disabled".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.try_send(TrayAction::DoNotDisturbTomorrow);
@@ -358,7 +419,7 @@ impl OxideTray {
         );
         items.push(
             StandardItem {
-                label: "Until I turn it off".to_string(),
+                label: t!("Until I turn it off").to_string(),
                 icon_name: "notifications-disabled".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.try_send(TrayAction::DoNotDisturbIndefinite);
@@ -381,7 +442,7 @@ impl OxideTray {
         );
         items.push(
             StandardItem {
-                label: "Skip this quiet period".to_string(),
+                label: t!("Skip this quiet period").to_string(),
                 icon_name: "alarm-symbolic".to_string(),
                 enabled: self.dnd.schedule_active,
                 activate: Box::new(|tray: &mut Self| {
@@ -427,6 +488,7 @@ impl TrayHandle {
         visible: bool,
         dnd: TrayDndState,
         suspended: &HashSet<String>,
+        window: Option<TrayWindowState>,
     ) {
         let accounts = accounts
             .iter()
@@ -443,6 +505,7 @@ impl TrayHandle {
             tray.unread = unread;
             tray.visible = visible;
             tray.dnd = dnd;
+            tray.window = window;
             tray.icons
                 .refresh(TrayIconState::for_unread(unread, active));
         });
@@ -460,25 +523,27 @@ fn tooltip_description(accounts: &[TrayAccount], unread: u32, dnd_status: Option
     }
     if unread == 0 {
         lines.push(if dnd_status.is_some() {
-            "No unread messages".to_string()
+            t!("No unread messages").to_string()
         } else {
-            "WhatsApp Web for Linux".to_string()
+            t!("WhatsApp Web for Linux").to_string()
         });
     } else {
-        let noun = if unread == 1 { "message" } else { "messages" };
-        lines.push(format!("{unread} unread {noun}"));
+        lines.push(tn!(
+            unread,
+            "{count} unread message",
+            "{count} unread messages"
+        ));
         for account in accounts.iter().filter(|account| account.unread > 0) {
             lines.push(format!("{}: {}", account.name, account.unread));
         }
     }
     let suspended = accounts.iter().filter(|account| account.suspended).count();
     if suspended > 0 {
-        let noun = if suspended == 1 {
-            "account"
-        } else {
-            "accounts"
-        };
-        lines.push(format!("{suspended} suspended {noun}"));
+        lines.push(tn!(
+            suspended as u32,
+            "{count} suspended account",
+            "{count} suspended accounts"
+        ));
     }
     lines.join("\n")
 }

@@ -48,17 +48,19 @@ impl CommandKind {
     /// Short group label shown on the right side of a palette row.
     pub fn category(self) -> &'static str {
         match self {
-            CommandKind::ShowOrHide | CommandKind::ShowAll | CommandKind::HideAll => "Window",
-            CommandKind::OpenSettings => "App",
-            CommandKind::AddAccount | CommandKind::SwitchAccount => "Accounts",
-            CommandKind::OpenDownloadsWindow | CommandKind::OpenDownloadsFolder => "Downloads",
-            CommandKind::OpenStorageFolder => "Storage",
-            CommandKind::Lock => "Security",
-            CommandKind::SetDoNotDisturb => "Notifications",
-            CommandKind::SetTheme => "Appearance",
-            CommandKind::ZoomIn | CommandKind::ZoomOut | CommandKind::ZoomReset => "Display",
-            CommandKind::RetryConnection => "Connection",
-            CommandKind::Quit => "App",
+            CommandKind::ShowOrHide | CommandKind::ShowAll | CommandKind::HideAll => t!("Window"),
+            CommandKind::OpenSettings => t!("App"),
+            CommandKind::AddAccount | CommandKind::SwitchAccount => t!("Accounts"),
+            CommandKind::OpenDownloadsWindow | CommandKind::OpenDownloadsFolder => {
+                t!("Downloads")
+            }
+            CommandKind::OpenStorageFolder => t!("Storage"),
+            CommandKind::Lock => t!("Security"),
+            CommandKind::SetDoNotDisturb => t!("Notifications"),
+            CommandKind::SetTheme => t!("Appearance"),
+            CommandKind::ZoomIn | CommandKind::ZoomOut | CommandKind::ZoomReset => t!("Display"),
+            CommandKind::RetryConnection => t!("Connection"),
+            CommandKind::Quit => t!("App"),
         }
     }
 }
@@ -227,31 +229,31 @@ pub fn build_commands(context: &CommandContext) -> Vec<Command> {
     let mut commands = vec![
         command(
             CommandKind::ShowOrHide,
-            "Show or hide OxideZap",
+            t!("Show or hide OxideZap"),
             &["window", "visibility", "toggle", "unhide"],
             CommandAction::ToggleVisibility,
         ),
         command(
             CommandKind::ShowAll,
-            "Show all account windows",
+            t!("Show all account windows"),
             &["restore", "windows", "unhide"],
             CommandAction::ShowAll,
         ),
         command(
             CommandKind::HideAll,
-            "Hide all account windows",
+            t!("Hide all account windows"),
             &["minimize", "windows", "privacy"],
             CommandAction::HideAll,
         ),
         command(
             CommandKind::OpenSettings,
-            "Open settings",
+            t!("Open settings"),
             &["preferences", "options", "configure"],
             CommandAction::OpenSettings,
         ),
         command(
             CommandKind::AddAccount,
-            "Add account",
+            t!("Add account"),
             &["new", "profile", "whatsapp"],
             CommandAction::AddAccount,
         ),
@@ -261,9 +263,17 @@ pub fn build_commands(context: &CommandContext) -> Vec<Command> {
         let position = index + 1;
         let current = context.active_account.as_deref() == Some(account.id.as_str());
         let title = if current {
-            format!("Switch to account {position}: {} (current)", account.name)
+            tr!(
+                "Switch to account {position}: {name} (current)",
+                position = position,
+                name = account.name
+            )
         } else {
-            format!("Switch to account {position}: {}", account.name)
+            tr!(
+                "Switch to account {position}: {name}",
+                position = position,
+                name = account.name
+            )
         };
         commands.push(command(
             CommandKind::SwitchAccount,
@@ -279,19 +289,19 @@ pub fn build_commands(context: &CommandContext) -> Vec<Command> {
     commands.extend([
         command(
             CommandKind::OpenDownloadsWindow,
-            "Open download center",
+            t!("Open download center"),
             &["downloads", "files", "history"],
             CommandAction::OpenDownloadsWindow,
         ),
         command(
             CommandKind::OpenDownloadsFolder,
-            "Open downloads folder",
+            t!("Open downloads folder"),
             &["downloads", "folder", "files"],
             CommandAction::OpenDownloadsFolder,
         ),
         command(
             CommandKind::OpenStorageFolder,
-            "Open storage folder",
+            t!("Open storage folder"),
             &["data", "profile", "storage"],
             CommandAction::OpenStorageFolder,
         ),
@@ -300,7 +310,7 @@ pub fn build_commands(context: &CommandContext) -> Vec<Command> {
     if context.lock_available {
         commands.push(command(
             CommandKind::Lock,
-            "Lock OxideZap",
+            t!("Lock OxideZap"),
             &["security", "password", "privacy"],
             CommandAction::Lock,
         ));
@@ -308,12 +318,12 @@ pub fn build_commands(context: &CommandContext) -> Vec<Command> {
 
     let (dnd_title, dnd_action) = if context.do_not_disturb {
         (
-            "Turn off Do Not Disturb",
+            t!("Turn off Do Not Disturb"),
             CommandAction::SetDoNotDisturb(false),
         )
     } else {
         (
-            "Turn on Do Not Disturb",
+            t!("Turn on Do Not Disturb"),
             CommandAction::SetDoNotDisturb(true),
         )
     };
@@ -326,37 +336,37 @@ pub fn build_commands(context: &CommandContext) -> Vec<Command> {
     commands.extend([
         command(
             CommandKind::SetTheme,
-            "Use light theme",
+            t!("Use light theme"),
             &["theme", "appearance", "color"],
             CommandAction::SetTheme(ThemeMode::Light),
         ),
         command(
             CommandKind::SetTheme,
-            "Use dark theme",
+            t!("Use dark theme"),
             &["theme", "appearance", "color"],
             CommandAction::SetTheme(ThemeMode::Dark),
         ),
         command(
             CommandKind::SetTheme,
-            "Follow the system theme",
+            t!("Follow the system theme"),
             &["theme", "appearance", "color"],
             CommandAction::SetTheme(ThemeMode::System),
         ),
         command(
             CommandKind::ZoomIn,
-            "Zoom in",
+            t!("Zoom in"),
             &["zoom", "scale", "text", "larger"],
             CommandAction::ZoomIn,
         ),
         command(
             CommandKind::ZoomOut,
-            "Zoom out",
+            t!("Zoom out"),
             &["zoom", "scale", "text", "smaller"],
             CommandAction::ZoomOut,
         ),
         command(
             CommandKind::ZoomReset,
-            "Reset zoom",
+            t!("Reset zoom"),
             &["zoom", "scale", "normal", "100"],
             CommandAction::ZoomReset,
         ),
@@ -367,7 +377,7 @@ pub fn build_commands(context: &CommandContext) -> Vec<Command> {
     {
         commands.push(command(
             CommandKind::RetryConnection,
-            "Retry connection",
+            t!("Retry connection"),
             &["reconnect", "reload", "offline", "network"],
             CommandAction::RetryConnection {
                 account_id: account_id.clone(),
@@ -377,7 +387,7 @@ pub fn build_commands(context: &CommandContext) -> Vec<Command> {
 
     commands.push(command(
         CommandKind::Quit,
-        "Quit OxideZap",
+        t!("Quit OxideZap"),
         &["exit", "close", "shutdown"],
         CommandAction::Quit,
     ));
@@ -525,14 +535,13 @@ pub struct CommandPalette {
     state: PaletteState,
     scroll_handle: ScrollHandle,
     appearance_subscription: Option<Subscription>,
-    title_set: bool,
 }
 
 impl CommandPalette {
     pub fn new(model: Entity<AppModel>, account_id: String, cx: &mut Context<Self>) -> Self {
         let commands = build_commands(&model.read(cx).command_palette_context(&account_id));
         let state = PaletteState::new(commands);
-        let search = cx.new(|cx| TextField::new("Search commands…", cx));
+        let search = cx.new(|cx| TextField::new(t!("Search commands…"), cx));
         register_field_tab_stop(&search, cx);
 
         let poll_search = search.clone();
@@ -568,7 +577,6 @@ impl CommandPalette {
             state,
             scroll_handle: ScrollHandle::new(),
             appearance_subscription: None,
-            title_set: false,
         }
     }
 
@@ -652,10 +660,7 @@ impl CommandPalette {
 
 impl Render for CommandPalette {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.title_set {
-            window.set_window_title("OxideZap command palette");
-            self.title_set = true;
-        }
+        window.set_window_title(t!("OxideZap command palette"));
         if self.appearance_subscription.is_none() {
             self.appearance_subscription =
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
@@ -822,22 +827,18 @@ fn empty_state(theme: Theme) -> impl IntoElement {
             div()
                 .text_size(px(14.))
                 .text_color(theme.text)
-                .child("No matching commands"),
+                .child(t!("No matching commands")),
         )
         .child(
             div()
                 .text_size(px(12.))
                 .text_color(theme.text_muted)
-                .child("Try a different search."),
+                .child(t!("Try a different search.")),
         )
 }
 
 fn footer(count: usize, theme: Theme) -> impl IntoElement {
-    let count_label = if count == 1 {
-        "1 command".to_string()
-    } else {
-        format!("{count} commands")
-    };
+    let count_label = tn!(count as u32, "{count} command", "{count} commands");
     div()
         .flex()
         .items_center()
@@ -856,7 +857,7 @@ fn footer(count: usize, theme: Theme) -> impl IntoElement {
             div()
                 .text_size(px(11.))
                 .text_color(theme.text_faint)
-                .child("↑/↓ Move · Enter Run · Esc Close"),
+                .child(t!("↑/↓ Move · Enter Run · Esc Close")),
         )
 }
 

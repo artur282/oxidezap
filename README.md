@@ -49,6 +49,7 @@ That split matters:
 - **Private on-disk data.** The settings file and each account's WebKit profile are created with `0600`/`0700` permissions. Existing installations are migrated on startup without following symlinks; the process runs with a restrictive `umask` so WebKit's cookies, local storage, IndexedDB, and caches inherit private modes.
 - **Storage manager.** Settings > Storage lists how much data and cache every account uses, the total, the free disk space, and the time of the last cleanup. Clear the cache without signing out, sign out while keeping the account, or delete an account's data after typing its name. The scan runs on a worker thread and every cleanup closes and recreates the affected webview so WebKit never writes into a directory that is being deleted.
 - **Low-memory mode (off by default).** Settings > Performance can release an account's WebKit view and web process after it stays hidden for 15, 30, or 60 minutes. The account, its profile, cookies, and WhatsApp login stay on disk; showing the account again recreates the view and reloads WhatsApp Web with a native loading state. The policy never releases a visible account, the most recently active account (unless you turn that guard off), an account with an active download, call, or recording, or any account while the app is locked or quitting. A tray entry and **Resume all suspended accounts** command show what is currently released, and **Release hidden accounts now** performs the sweep on demand.
+- **Performance and battery saver (off by default).** Settings > Performance offers **Automatic**, **Normal**, and **Battery saver**. Automatic reads `/sys/class/power_supply` and enables the saver only while the machine is on battery; systems without a readable battery stay in normal mode. Battery saver pauses WhatsApp Web animation and CSS transitions, checks the connection/QR state every 5 s instead of 2 s, slows native overlay synchronization, and, when low-memory mode is already enabled, shortens the suspension delay to 15 minutes and sweeps more often. Notifications, downloads, calls, the app lock, and security checks stay enabled.
 
 ### Native shell
 
@@ -57,6 +58,8 @@ That split matters:
 - **Clipboard paste.** Copy a file, photo, video, or a screenshot/image from the clipboard and press `Ctrl+V` in a chat: OxideZap injects it into WhatsApp's attachment flow. Screenshots and image data are encoded as PNG and sent as photos, never as stickers. Files over 64 MB should use the attach button.
 - **Media action menu (experimental).** Right-click a normal image, video, audio, or document attachment that is already visible in a chat to open a small OxideZap menu: **Save to Downloads**, **Open in system viewer**, and, for images, **Copy image**. The menu is injected as a WebKit user script and only inspects the element under the pointer; it never scans chats or observes mutations. View-once, stickers, avatars, and media from non-WhatsApp origins are never offered. Saved files go through the normal download pipeline, so they appear in the Download Center with account, date, and size. Disable the menu in Settings > General. `Esc` closes it and the arrow keys move between its items.
 - **Settings window** with Accounts, Storage, Appearance, Notifications, Network, General, Performance, Security, and About sections.
+- **English and Spanish native UI.** The shell detects the desktop locale and can be overridden in Settings -> General -> Interface language. The change applies to open native windows without a restart. WhatsApp Web keeps its own language and is never modified. See [Interface language](#interface-language).
+- **Diagnostics report.** Settings -> About can preview, copy, or save a privacy-scrubbed text report with the OxideZap, GTK, WebKitGTK, distribution, kernel, CPU, RAM, and session details; settings states; runtime counts; redacted paths; and the last warnings and errors from the current session. It never includes chats, account names or ids, cookies, proxy credentials, the app-lock hash, tokens, or full home paths.
 - **First-run guide.** A five-page native window explains the WhatsApp Web QR login, account isolation, tray and close behavior, notifications, the app lock, view-once limits, and where data lives. It opens once on a new installation, is never modal, and can be skipped, closed, or reopened from Settings -> General.
 - **Themes**: System, Light, and Dark for the native shell.
 - **WhatsApp zoom** from 80% to 150%.
@@ -71,16 +74,16 @@ That split matters:
 
 ### Desktop integration
 
-- **System tray** through StatusNotifierItem, with show/hide, account list, add account, settings, lock, and quit.
+- **System tray** through StatusNotifierItem, with show/hide, account list, add account, settings, lock, per-account window modes, and quit.
 - **Unread badge** in the tray icon (`1`-`9`, `9+`, and a dimmed DND state), in the per-account tooltip breakdown, and, on supported desktops, on the launcher icon through the Unity LauncherEntry D-Bus interface.
 - **Native notifications** for new messages, with sender and message preview, a global Do Not Disturb switch with timed and recurring quiet hours, and per-account mute/sound controls.
-- **Single instance** through a Unix socket. Launching OxideZap again forwards the request to the running instance. The socket is created with `0600` permissions and never listens on the network; CLI actions only pass validated account ids, chat targets, and built-in action names.
+- **Single instance** through a Unix socket. Launching OxideZap again forwards the request to the running instance. The socket is created with `0600` permissions and never listens on the network; CLI actions only pass validated account ids, chat targets, local file paths, and built-in action names.
 - **Global show/hide shortcut** through X11 `XGrabKey`, default `Ctrl+Shift+W`, configurable in Settings. A second configurable shortcut (the **boss key**, default `Ctrl+Shift+H`) hides every window immediately and restores them on the next press. Both are X11/XWayland-only.
 - **Lock on session events.** OxideZap listens for logind's `PrepareForSleep` signal and for `ActiveChanged` from the desktop ScreenSaver D-Bus service, and locks with the same privacy screen as a manual lock. Both integrations are best effort: desktops and sandboxes that do not expose the signals fall back to manual, hide, and idle locking.
 - **Launch at login** through an XDG autostart entry at `~/.config/autostart/oxidezap.desktop`.
 - **Link handling.** External `http(s)`, `mailto:`, and `tel:` links open in the system browser or application. `wa.me`, `chat.whatsapp.com`, and `web.whatsapp.com` links stay inside OxideZap. WhatsApp's internal `whatsapp.net` utility pages (such as the Flows cache manager) stay in the webview and never open a system browser tab. `whatsapp://` URLs are translated to their WhatsApp Web equivalents.
 - **Native Download Center.** WebKit downloads are tracked with live progress, status, account, size, timestamps, and destination in a bounded 500-entry history. Media saved from the media action menu is recorded the same way, so the Download Center doubles as the downloaded-media gallery per account. Cancel an active transfer, retry a failed one when WebKit exposed an HTTP(S) source, open the file or its folder, copy the path, or remove finished rows. Set a custom base folder and optionally organize files into per-account and `YYYY-MM` subfolders. Names are sanitized, collisions get a numbered suffix, and existing files are never overwritten. Open it from the tray or Settings.
-- **CLI control** with `--toggle`, `--hide`, `--lock`, `--quit`, `--account`, `--chat`, `--dnd`, `--downloads`, `--status`, and `--list-accounts`, plus URL forwarding to a running instance.
+- **CLI control** with `--toggle`, `--hide`, `--lock`, `--quit`, `--account`, `--chat`, `--share`, `--dnd`, `--downloads`, `--status`, and `--list-accounts`, plus URL forwarding to a running instance.
 
 ## Requirements
 
@@ -249,9 +252,13 @@ chmod +x oxidezap-v0.1.0-x86_64.AppImage
 | Release memory from hidden accounts | Settings -> Performance |
 | Configure a proxy | Settings -> Network |
 | Test proxy connectivity | Settings -> Network -> **Test connection** |
+| Preview, copy, or save diagnostics | Settings -> About -> Diagnostics |
 | Quit | Tray -> **Quit**, or `oxidezap --quit` |
 | Open an account | `oxidezap --account <id\|name>` |
 | Open a chat | `oxidezap --chat <phone\|chat-id>` |
+| Share a file to the active account | `oxidezap --share <path>`, or drag it onto an account window |
+| Keep an account above other windows | Titlebar **Pin**, `Ctrl+Shift+T`, tray **Window**, or Settings -> Accounts |
+| Toggle mini mode | Titlebar **Mini**, `Ctrl+Shift+M`, tray **Window**, or Settings -> Accounts |
 | Toggle Do Not Disturb | `oxidezap --dnd [on\|off\|1h\|tomorrow]`, the tray menu, or Settings -> Notifications |
 | Schedule quiet hours | Settings -> Notifications -> Quiet hours |
 | Open the downloads folder | `oxidezap --downloads` |
@@ -311,6 +318,7 @@ Actions:
   --quit                  Quit the running instance
   --account <id|name>     Open or focus an account
   --chat <phone|id>       Open a chat in the active account (never sends)
+  --share <path>          Attach a file to the active account (never sends)
   --dnd [MODE]            Set Do Not Disturb: on, off, 1h, or tomorrow
   --downloads             Open the downloads folder
   --status                Print version, accounts, DND, and window count
@@ -325,7 +333,7 @@ Other options:
 URLs: whatsapp://send?phone=..., https://wa.me/..., https://chat.whatsapp.com/...
 ```
 
-Every action is forwarded to the running instance over the local single-instance socket and exits with status 0 on success or non-zero with a clear message when the account or chat is invalid. When no instance is running, action commands start OxideZap and apply the action to the new instance. `--status` and `--list-accounts` are the exception: they read the settings file when the app is closed, so scripts can query them without a display.
+Every action is forwarded to the running instance over the local single-instance socket and exits with status 0 on success or non-zero with a clear message when the account, chat, or shared file is invalid. When no instance is running, action commands start OxideZap and apply the action to the new instance. `--status` and `--list-accounts` are the exception: they read the settings file when the app is closed, so scripts can query them without a display.
 
 `--status` prints stable `key: value` lines:
 
@@ -344,6 +352,14 @@ windows: 1
 
 `--dnd 1h` silences notifications until one hour from now. `--dnd tomorrow` silences them until the next quiet-hours end time (07:00 by default), and `--dnd on` keeps Do Not Disturb active until it is turned off. Every mode is also available from the tray menu. `--downloads` still opens the downloads folder; open the native Download Center from the tray or Settings.
 
+### Sharing files, drag and drop, and window modes
+
+`oxidezap --share <path>` validates the path on the calling side, resolves it to an absolute path, and forwards it over the single-instance socket. The running instance resolves the target account (the active account, or `--account <id|name>` when supplied), opens it if needed, and queues the file for WhatsApp's normal attachment preview. If OxideZap is not running, the command starts it and applies the share after the page finishes loading. A file must be a regular, non-empty file and the batch must stay within the 64 MB clipboard-paste limit; directories, missing paths, and oversized files are rejected with a message and nothing is attached. File paths are never written to the log, and no file content is evaluated as JavaScript: the existing static helper receives only base64-encoded bytes and metadata.
+
+Drag files from a file manager onto an account window. The GTK/WebKit content area shows a **Drop to attach** overlay while a local file URI is dragged over it; dropping validates the same rules and queues the attachment. Drops on the native titlebar and exposed window margins go through the GPUI drop target and the same queue. In both cases WhatsApp keeps its own composer preview, so the user still has to press send, and unsupported drops are reported with a native notification.
+
+Window modes are stored per account in `settings.json` as `always_on_top`, `mini_mode`, `normal_bounds`, `mini_bounds`, and `bounds_by_monitor`. **Pin** applies the EWMH `_NET_WM_STATE_ABOVE` state to the account window and keeps the WebKit overlay above it; **Mini** saves the current normal bounds and resizes the window to the compact single-pane layout. Turning mini mode off restores the saved normal bounds. The GTK overlay follows every move and resize on its next synchronization tick, including when mini mode changes the window size. Bounds are saved per monitor and clamped to an available monitor on the next open.
+
 `--smoke-test` starts the application under X11 with a local HTML page, verifies that the GPUI window and the WebKit transient overlay have the expected geometry, prints `SMOKE OK`, and exits with status 0.
 
 ## Configuration
@@ -358,6 +374,7 @@ windows: 1
 | `$XDG_RUNTIME_DIR/oxidezap-<uid>.sock` | Single-instance socket |
 | `~/Downloads` | Default download directory |
 | `~/.config/oxidezap/downloads.json` | Bounded download history (newest 500 records, `0600`) |
+| `~/.config/oxidezap/logs/oxidezap.log` | Application log (`0600`; rotated at 4 MiB, one previous file kept) |
 
 OxideZap follows `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_RUNTIME_DIR` when they are set. Removing an account from Settings also removes its WebKit profile directory.
 
@@ -370,6 +387,22 @@ Settings -> Storage reads the account directories without following symlinks. Th
 - **Delete account data** removes the complete account directory and the account entry. It requires typing the account name, cannot be undone, and is refused for the last remaining account.
 
 Every action first closes the account's `WebKitWebView` on the GTK thread, deletes the directory on a worker, and recreates the webview only when the account window is still open. The last successful cleanup timestamp is stored in `settings.json` as `last_storage_cleanup`. The **Open data folder** button opens the directory that contains every profile (`~/.local/share/oxidezap/` by default).
+
+### Diagnostics
+
+Settings -> About -> **Diagnostics** builds a local report that can be previewed, copied to the clipboard, or saved as a `.txt` file:
+
+- OxideZap, GTK, and WebKitGTK versions; distribution, kernel, architecture, CPU model and thread count, and total RAM.
+- Session type (X11, Wayland, or unknown), desktop environment, whether `DISPLAY` and `WAYLAND_DISPLAY` are set, the requested `GDK_BACKEND`, and the names (never the values) of `WEBKIT_*` environment variables.
+- The number of configured accounts and whether an active account is selected. Account names and ids are never included.
+- Settings states such as theme, zoom, notification and DND modes, tray and startup behavior, spell checking, the app lock (enabled or disabled only), the proxy mode and redacted endpoint, low-memory mode, download layout, and the last storage cleanup. Secrets are never included: no proxy username or password, no app-lock hash, and no experimental CSS.
+- Runtime aggregate counts: loaded, suspended, and restoring WebKit views; connection states; crash-recovery attempts; active downloads; and whether the app is locked.
+- The config, data, cache, downloads, settings, and log paths with the home directory shortened to `~`.
+- The last 50 warnings and errors recorded in the current session. They are scrubbed of home paths, account UUIDs, WhatsApp ids, and secret-like assignments before they are stored.
+
+Generation runs on a background worker, so previewing or saving the report never blocks the interface. The report contains no WhatsApp message content, cookies, session data, tokens, account names or ids, proxy credentials, or app-lock hash.
+
+OxideZap also writes `~/.config/oxidezap/logs/oxidezap.log` with `0600` permissions and rotates it at 4 MiB, keeping the previous file as `oxidezap.log.1`. The log is more detailed than the report and may contain account ids, WhatsApp URLs, and file paths; review it before sharing. It is never attached to the diagnostics report automatically.
 
 ### Low-memory mode
 
@@ -390,6 +423,26 @@ The sweep runs at most once a minute. Hiding an account records the first hide t
 
 Trade-offs: reactivating takes a few seconds and reloads WhatsApp Web, so the current scroll position and an unsent draft can be lost; the session, chats, and login are preserved. The released-memory figure in Settings is an estimate based on a conservative per-web-process value because WebKitGTK does not expose per-view RSS. Destroying the view does not force-kill a WebKit process; WebKit decides when to exit it.
 
+### Performance and battery saver
+
+Settings -> Performance also has a **Battery saver mode** with three choices:
+
+- **Automatic** enables the saver only while the device reports battery power. OxideZap reads only `type` and `status` from `/sys/class/power_supply/*/`; if the directory is missing or unreadable, it stays in normal mode. The power source is re-read every 30 seconds, so plugging in or unplugging applies without a restart.
+- **Normal** (default) never reduces animation or polling. This is what an existing `settings.json` gets when it has no `performance` field.
+- **Battery saver** stays on regardless of the power source.
+
+The setting is stored as `performance.mode` with the values `automatic`, `normal`, or `battery_saver`. Battery saver changes:
+
+- CSS animations and transitions in WhatsApp Web are collapsed to a single near-instant frame;
+- the injected connection/QR report runs every 5 s instead of every 2 s, while `online`/`offline` events still report immediately;
+- the native WebKit overlay is synchronized 4 times per second instead of 10;
+- the GPUI event pump and noncritical Do Not Disturb and display-scale checks run at a lower cadence;
+- when low-memory mode is **already** enabled, the hidden-account delay is capped at 15 minutes and the sweep runs every 30 s instead of every 60 s.
+
+Battery saver never turns off notifications, downloads, calls or recordings, the app lock, security checks, or the WhatsApp login, and it never enables low-memory mode by itself. Reactivating a released account, scanning the QR code, and downloading files work exactly as in normal mode.
+
+These effects are **qualitative cadence reductions, not benchmarked FPS or watt savings**. WebKitGTK does not expose per-view CPU, GPU, or power use, so OxideZap does not claim a measured percentage improvement: WhatsApp Web and WebKit still dominate the machine's power consumption. Disabling hardware acceleration, which can make things slower, is not part of this mode.
+
 ### Backup and restore
 
 Settings -> General includes **Export settings**, **Import settings**, and **Reset settings**. The export is a readable JSON document with a `version`, an `exported_at` UTC timestamp, and a `settings` object. An import validates the version and size, ignores unknown fields, normalizes out-of-range values such as zoom, shows a summary of the changes, and applies nothing until you confirm. Invalid or oversized files leave the current configuration untouched.
@@ -402,6 +455,16 @@ Exports contain preferences only:
 - **no app-lock password hash**. The lock is disabled in an export, so after importing or resetting you must set the password again in Settings -> Security.
 
 Every import and reset writes a dated backup of the current `settings.json` to `~/.config/oxidezap/backups/` **before** changing anything, with `0600` permissions. If the backup cannot be written, the operation is cancelled. A reset restores preference defaults but keeps the configured accounts and their local sessions. It also clears the first-run guide status and opens the guide again.
+
+### Interface language
+
+Settings -> General -> **Interface language** offers **System** (default), **English**, and **Spanish**. System reads `LC_ALL`, `LC_MESSAGES`, `LANG`, and then `LANGUAGE`; `es_*` selects Spanish, `en_*` selects English, and unsupported or placeholder locales (`C`, `POSIX`) fall back to English. An explicit choice overrides the locale.
+
+The value is stored as `"language"` in `settings.json` (`"system"`, `"english"`, or `"spanish"`), is included in settings exports and imports, and returns to `System` when preferences are reset. Applying a language re-renders the open native windows immediately; the tray menu and the next notifications use the new language as well.
+
+Only the OxideZap shell is translated: titlebars and tooltips, account loading/error/retry states, the lock window, every Settings section, the tray menu, the Download Center, the command palette, the first-run guide, and native notifications. Account names, WhatsApp message content and previews, contact names, URLs, proxy values, technical log messages, CLI identifiers, and WhatsApp Web internals are deliberately left untouched. Relative dates and quiet-hours day/month names follow the interface language; file sizes keep binary units.
+
+The implementation has no external dependency. `src/i18n.rs` maps the English source text to Spanish; a missing entry falls back to readable English instead of failing at runtime. To add a language, add a variant to `i18n::Language`, teach `Language::resolved`/`parse_locale` about its locale prefix, and add a translation table. The unit tests scan every `t!`, `tr!`, and `tn!` call in the scoped UI sources and fail when a key has no translation, when a placeholder is missing, or when a plural key is absent.
 
 ### Network and proxy
 
@@ -467,6 +530,7 @@ Storage cleanup uses the same channel protocol. The GPUI side asks the GTK threa
 - Account data stays on your machine under `~/.local/share/oxidezap/`. OxideZap does not run a server and does not include telemetry or analytics.
 - **Files and directories are private by default.** Settings are written atomically to a `0600` temporary file and renamed into place; the settings directory, account directories, and WebKit data/cache roots are `0700`. Startup applies `umask(0o077)` before WebKit creates its cookies, local storage, IndexedDB, and caches. Existing installations are migrated without following symlinks, and the app never changes permissions on the download directory.
 - **Settings exports contain no secrets.** Exported files omit the app-lock password hash and every piece of WebKit session data. They also reset active DND state (timed countdown, indefinite manual mode, and one-period override) while keeping the quiet-hours schedule. Automatic backups do contain the full settings, including the hash, so they are written to a `0700` directory as `0600` files.
+- **The diagnostics report is scrubbed and local.** It summarizes versions, system details, settings states, and recent warnings without chats, account names or ids, cookies, tokens, proxy credentials, the app-lock hash, or full home paths. Nothing is uploaded; the report only reaches the clipboard or a file the user chooses.
 - **WebKit permissions are scoped to WhatsApp.** Only `whatsapp.com`, `wa.me`, `chat.whatsapp.com`, and WhatsApp's `whatsapp.net` utility pages may request permissions. Camera and microphone access always shows a native confirmation dialog; notifications are allowed only when the Settings notification toggle is on; every other permission type and origin is denied.
 - **Media actions do not bypass WhatsApp's protections.** The menu is only reachable from an explicit right-click on media the signed-in page already decrypted and displayed. Every transfer is revalidated in Rust: the URL must be a `blob:` URL whose inner origin is WhatsApp, a media `data:` URL, or a WhatsApp host; view-once transfers are rejected; only images may be copied; and the action is size-capped. OxideZap does not intercept network traffic, decrypt media itself, extract view-once content, or add hidden download controls for restricted content. Saving still depends on WhatsApp exposing the decrypted bytes to the page, and the menu never scans chats in the background. As with any unofficial client, you remain responsible for complying with WhatsApp's terms and with the rights of the people who sent the media; the menu saves only content you can already view and does not grant access to anything else.
 - The optional app lock hashes the password with **Argon2id** and verifies it locally. The lock protects access to the running UI; it does not encrypt the WebKit profile on disk.
@@ -478,11 +542,17 @@ Storage cleanup uses the same channel protocol. The GPUI side asks the GTK threa
 ## Limitations
 
 - **X11 or XWayland only.** Native Wayland is not implemented. On Wayland sessions the application relies on XWayland.
+- **File-manager "Open with OxideZap" depends on the packaged desktop entry.** The application implements the receiver (`--share`, validation, single-instance forwarding, drag and drop), but the packaged desktop entries currently register only the `whatsapp://` scheme. To add **Open with**, the installed desktop entry needs `MimeType=image/*;video/*;application/pdf;` and `Exec=oxidezap --share %F`, followed by `update-desktop-database`; distribution and Flatpak packagers own that registration. Until then, drag and drop and the `--share` CLI provide the same behavior.
+- **Drag and drop is an X11/XWayland feature.** The GTK drop target accepts local `text/uri-list` file URIs. Native Wayland drag sources, remote URLs, and file managers that do not publish URI lists are not handled. A dropped file still uses WhatsApp Web's own attachment input, so the composer preview remains the confirmation step.
+- **Mini mode relies on WhatsApp Web's responsive layout.** The native window becomes narrow enough for WhatsApp's single-pane view, but the sidebar itself is rendered by the page, not hidden by injected CSS or JavaScript. WhatsApp Web can change its breakpoint or refuse the narrow layout; use the normal window if the composer becomes unusable.
+- **Always-on-top uses the window manager's EWMH state.** Desktops that do not honor `_NET_WM_STATE_ABOVE` (or tiling compositors that override stacking) may ignore the pin.
+- **Per-monitor bounds on X11 use the virtual desktop.** GPUI exposes one X11 screen for all monitors, so OxideZap persists absolute bounds and clamps them into the available desktop; the usual multi-monitor restore works because the coordinates are absolute, but a completely rearranged layout may land on the nearest visible area rather than the original monitor.
 - **The global shortcuts use X11 `XGrabKey`.** They do not work on a pure Wayland session and can conflict with shortcuts registered by the desktop environment.
-- **The command palette is native and separate from the web content.** WhatsApp Web runs in a transient WebKitGTK X11 window that owns the keyboard whenever it is focused. The in-window `Ctrl+K` and `Ctrl+1`..`Ctrl+9` shortcuts therefore only reach GPUI when the native window has focus. The optional global palette shortcut uses the same X11 grab and is empty by default because grabbing `Ctrl+K` system-wide would take precedence over WhatsApp Web's own chat search. The palette restores focus to the account webview after it closes.
+- **The command palette is native and separate from the web content.** WhatsApp Web runs in a transient WebKitGTK X11 window that owns the keyboard whenever it is focused. The in-window `Ctrl+K`, `Ctrl+Shift+T`, `Ctrl+Shift+M`, and `Ctrl+1`..`Ctrl+9` shortcuts therefore only reach GPUI when the native window has focus. The optional global palette shortcut uses the same X11 grab and is empty by default because grabbing `Ctrl+K` system-wide would take precedence over WhatsApp Web's own chat search. The palette restores focus to the account webview after it closes.
 - **Lock on suspend and screen lock depend on the desktop exposing its D-Bus signals.** GNOME, KDE, Cinnamon, MATE, and XFCE normally publish a ScreenSaver service, but some Wayland compositors, minimal window managers, and sandboxed packages do not. Lock on suspend needs logind on the system bus; Flatpak builds may not be allowed to receive that signal. If the signals are unavailable, OxideZap logs the reason and manual, lock-on-hide, and idle locking still work; the desktop's own lock screen remains the fallback. This limitation is inherent to the desktop and is not masked by claiming support.
 - **WhatsApp Web dominates memory use.** OxideZap keeps the native shell small, not the web content. The opt-in low-memory mode can release hidden accounts, but the released-memory figure is an estimate; WebKit decides when the web process actually exits.
 - **Low-memory reactivation is not instant and can lose transient state.** Showing a suspended account recreates its WebKit view and reloads WhatsApp Web, which takes a few seconds. The login, chats, and settings survive, but the current scroll position and an unsent draft may not. Suspension is opt-in and is refused while a download, call, or recording is active.
+- **Battery saver is not a benchmark.** It reduces animation, polling, and synchronization work, but OxideZap cannot measure per-view CPU, GPU, or power use and does not claim a percentage saving. Automatic mode depends on `/sys/class/power_supply`; a missing, unreadable, or unusual power supply falls back to normal mode. Battery saver cannot make WhatsApp Web or WebKit use less power than the page itself demands.
 - **Calls and voice notes** depend on WebKitGTK's WebRTC support and on the desktop portal configuration. They are not guaranteed on every distribution.
 - **Notifications** require a notification daemon. **The tray** requires a StatusNotifier host; desktops without one will not show the tray icon. Notification sounds depend on the daemon and sound theme, and some hosts ignore dynamic tray pixmaps, in which case the per-account tooltip remains available. Quiet hours follow the system timezone and the desktop's DST rules; a time that falls in a DST gap is normalized forward by the platform.
 - **Spell checking depends on system dictionaries and WhatsApp Web.** WebKitGTK checks only languages whose hunspell dictionaries are installed, and WhatsApp Web owns the composer, so it can override spellcheck attributes or Enter-to-send behavior. Language changes apply to open accounts immediately, but the composer may need focus or a reload before it shows new underlines.
@@ -495,6 +565,7 @@ Storage cleanup uses the same channel protocol. The GPUI side asks the GTK threa
 - **Downloads depend on WebKit's delivery mode.** Files served as ordinary HTTP(S) responses can be tracked, cancelled, and retried. `blob:` and `data:` media saved through the media action menu also appear in the Download Center, but they cannot be retried later because the page revokes those URLs. Encrypted media that never becomes a normal download and view-once media do not appear in the Download Center; view-once downloads are deliberately unsupported.
 - **The media action menu is experimental and DOM-dependent.** It recognizes media from the element under the pointer and a bounded set of view-once, sticker, and avatar markers. WhatsApp Web can change its markup at any time; the menu then stops appearing for the affected media instead of breaking the chat. It is enabled by default, can be turned off in Settings > General, and only handles media the page already decrypted for the signed-in account. A single transfer is capped at 64 MB; larger images, videos, or audio must use WhatsApp's own download control. Document attachments keep working through WhatsApp's own download button, which also feeds the Download Center. Bulk download of a selection is not implemented: WhatsApp Web forwards or deletes selected messages but does not expose their media as file URLs, so every media action remains an explicit per-item gesture.
 - **No auto-update.** Reinstall or replace the binary to update.
+- **Diagnostics are best effort.** GTK and WebKitGTK versions come from the loaded libraries, and CPU, memory, distribution, and session details come from `/proc`, `/etc/os-release`, and environment variables; a sandbox may hide some of them. The session log is written at info level and can contain account ids, WhatsApp URLs, and file paths, so review it before sharing. It is never included in the report automatically.
 - **The app lock does not encrypt data at rest.** It gates the UI, not the files on disk.
 - **Proxy changes may need an account reopen.** WebKitGTK applies the new proxy configuration to the account's data manager, but an already-established HTTP/2 or WebSocket connection may keep the previous route until the account is reopened. Manual proxy credentials are stored as plain text in `settings.json`; see [Network and proxy](#network-and-proxy).
 - **The proxy test does not validate an HTTPS proxy's TLS handshake.** It verifies that the proxy host and port are reachable; opening an account exercises the full TLS proxy path.

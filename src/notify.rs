@@ -138,8 +138,12 @@ fn apply_sound_preference(notification: &mut notify_rust::Notification, sound: b
 
 pub fn notify_download(filename: &str, destination: &Path, icon: Option<&Path>) {
     notify(
-        "Download complete",
-        &format!("{filename}\nSaved to {}", destination.display()),
+        t!("Download complete"),
+        &tr!(
+            "{filename}\nSaved to {destination}",
+            filename = filename,
+            destination = destination.display()
+        ),
         icon,
     );
 }

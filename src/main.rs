@@ -1,7 +1,10 @@
+#[macro_use]
+mod i18n;
 mod app;
 mod assets;
 mod autostart;
 mod badge;
+mod diagnostics;
 mod hotkey;
 mod links;
 mod lock;
@@ -18,8 +21,10 @@ mod updates;
 mod webview;
 mod x11;
 
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -27,6 +32,7 @@ use crossbeam_channel::unbounded;
 use gpui::{AppContext, Application};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 use crate::app::{AppModel, SmokeState};
 use crate::assets::Assets;
@@ -74,6 +80,7 @@ struct Cli {
     action: Option<Action>,
     account: Option<String>,
     chat: Option<String>,
+    share: Option<String>,
 }
 
 impl Cli {
@@ -112,6 +119,14 @@ impl Cli {
                         .ok_or("--chat requires a phone number or chat id")?;
                     cli.set_chat(value)?;
                 }
+                "--share" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                        .ok_or("--share requires a file path")?;
+                    cli.set_share(value)?;
+                }
                 "--dnd" => {
                     let mut mode = DndMode::On;
                     if let Some(value) = args.get(index + 1) {
@@ -127,6 +142,9 @@ impl Cli {
                 }
                 other if other.starts_with("--chat=") => {
                     cli.set_chat(&other["--chat=".len()..])?;
+                }
+                other if other.starts_with("--share=") => {
+                    cli.set_share(&other["--share=".len()..])?;
                 }
                 other if other.starts_with("--dnd=") => {
                     cli.set_action(Action::Dnd(parse_dnd(&other["--dnd=".len()..])?))?;
@@ -145,8 +163,15 @@ impl Cli {
             index += 1;
         }
 
-        if cli.action.is_some() && (cli.account.is_some() || cli.chat.is_some()) {
-            return Err("--account and --chat cannot be combined with another action".to_string());
+        if cli.action.is_some()
+            && (cli.account.is_some() || cli.chat.is_some() || cli.share.is_some())
+        {
+            return Err(
+                "--account, --chat, and --share cannot be combined with another action".to_string(),
+            );
+        }
+        if cli.chat.is_some() && cli.share.is_some() {
+            return Err("--chat and --share cannot be combined".to_string());
         }
         Ok(cli)
     }
@@ -186,7 +211,45 @@ impl Cli {
         Ok(())
     }
 
+    fn set_share(&mut self, value: &str) -> Result<(), String> {
+        if value.is_empty() {
+            return Err("--share requires a file path".to_string());
+        }
+        if value.chars().any(char::is_control) {
+            return Err("the shared file path must be a single line".to_string());
+        }
+        if self.share.is_some() {
+            return Err("--share was supplied more than once".to_string());
+        }
+        self.share = Some(value.to_string());
+        Ok(())
+    }
+
+    /// Validates the shared path and stores its canonical form, so a relative
+    /// path means the same file for the CLI and the running instance.
+    fn validate_share(&mut self) -> Result<(), String> {
+        let Some(raw) = self.share.clone() else {
+            return Ok(());
+        };
+        let files = crate::webview::validate_share_paths(&[PathBuf::from(raw)])?;
+        let canonical = files[0]
+            .path
+            .canonicalize()
+            .map_err(|error| format!("could not resolve the shared file: {error}"))?;
+        let value = canonical
+            .to_str()
+            .ok_or("the shared file path must be valid UTF-8")?;
+        self.share = Some(value.to_string());
+        Ok(())
+    }
+
     fn requested_message(&self) -> Result<InstanceMessage, String> {
+        if let Some(raw) = &self.share {
+            return Ok(InstanceMessage::Share {
+                account: self.account.clone(),
+                path: PathBuf::from(raw),
+            });
+        }
         if let Some(raw) = &self.chat {
             let chat = ChatTarget::parse(raw)?;
             return Ok(InstanceMessage::OpenChat {
@@ -225,10 +288,9 @@ fn parse_dnd(value: &str) -> Result<DndMode, String> {
 
 fn main() -> Result<()> {
     restrict_process_umask();
-    init_tracing();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cli = match Cli::parse(&args) {
+    let mut cli = match Cli::parse(&args) {
         Ok(cli) => cli,
         Err(error) => {
             eprintln!("oxidezap: {error}");
@@ -247,6 +309,10 @@ fn main() -> Result<()> {
 
     let smoke = cli.smoke_test;
     let autostart = cli.autostart;
+    if let Err(error) = cli.validate_share() {
+        eprintln!("oxidezap: {error}");
+        std::process::exit(2);
+    }
 
     let paths = if smoke {
         smoke_paths()?
@@ -260,10 +326,12 @@ fn main() -> Result<()> {
     };
 
     if !smoke && message.is_query() {
+        init_tracing(None);
         return print_query(&paths, &message);
     }
 
     paths.ensure()?;
+    init_tracing((!smoke).then(|| paths.log_file()));
     paths.write_runtime_assets()?;
 
     let _instance_lock = if !smoke {
@@ -454,6 +522,17 @@ fn validate_initial_action(message: &InstanceMessage, paths: &Paths) {
                 Err("no active account; pass --account".to_string())
             }
         }
+        InstanceMessage::Share {
+            account: Some(query),
+            ..
+        } => app::resolve_account(&settings, query).map(|_| ()),
+        InstanceMessage::Share { account: None, .. } => {
+            if settings.active_account_id().is_some() {
+                Ok(())
+            } else {
+                Err("no active account; pass --account".to_string())
+            }
+        }
         InstanceMessage::Lock => {
             if settings.lock.enabled && settings.lock.hash.is_some() {
                 Ok(())
@@ -477,13 +556,125 @@ fn fail(message: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-fn init_tracing() {
+fn init_tracing(log_file: Option<PathBuf>) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("oxidezap=info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let console = tracing_subscriber::fmt::layer()
         .with_target(false)
-        .try_init();
+        .with_filter(filter.clone());
+    let subscriber = tracing_subscriber::registry().with(console);
+    match log_file {
+        Some(path) => match LogWriter::open(path) {
+            Ok(writer) => {
+                let file = tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_target(false)
+                    .with_writer(writer)
+                    .with_filter(filter);
+                let _ = subscriber.with(file).try_init();
+            }
+            Err(error) => {
+                let _ = subscriber.try_init();
+                eprintln!("oxidezap: could not open the log file: {error}");
+            }
+        },
+        None => {
+            let _ = subscriber.try_init();
+        }
+    }
+}
+
+/// Upper bound for one log file. When it is reached, the current file is moved
+/// to `oxidezap.log.1` (replacing the previous backup) and a new file starts.
+const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Clone)]
+struct LogWriter {
+    state: Arc<Mutex<LogState>>,
+}
+
+struct LogState {
+    path: PathBuf,
+    file: File,
+    written: u64,
+}
+
+impl LogWriter {
+    fn open(path: PathBuf) -> io::Result<Self> {
+        let file = open_log_file(&path, MAX_LOG_BYTES)?;
+        let written = file.metadata()?.len();
+        Ok(Self {
+            state: Arc::new(Mutex::new(LogState {
+                path,
+                file,
+                written,
+            })),
+        })
+    }
+}
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.written.saturating_add(bytes.len() as u64) > MAX_LOG_BYTES {
+            if let Ok(file) = open_log_file(&state.path, MAX_LOG_BYTES) {
+                state.file = file;
+                state.written = 0;
+            }
+        }
+        let written = state.file.write(bytes)?;
+        state.written = state.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.file.flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn open_log_file(path: &Path, max_bytes: u64) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        crate::paths::create_private_dir(parent).map_err(io::Error::other)?;
+    }
+    if max_bytes > 0 {
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            if metadata.is_file() && metadata.len() >= max_bytes {
+                let rotated = path.with_extension("log.1");
+                let _ = fs::rename(path, rotated);
+            }
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(crate::paths::PRIVATE_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(fs::Permissions::from_mode(crate::paths::PRIVATE_FILE_MODE));
+    }
+    Ok(file)
 }
 
 /// Apply a restrictive file creation mask before any thread or file is
@@ -542,6 +733,7 @@ fn print_help() {
            --quit                  Quit the running instance\n\
            --account <id|name>     Open or focus an account\n\
            --chat <phone|id>       Open a chat in the active account (never sends)\n\
+           --share <path>          Attach a file to the active account (never sends)\n\
            --dnd [MODE]            Set Do Not Disturb: on, off, 1h, or tomorrow\n\
            --downloads             Open the downloads folder\n\
            --status                Print version, accounts, DND, and window count\n\
@@ -556,6 +748,8 @@ fn print_help() {
          --dnd 1h enables Do Not Disturb for one hour and --dnd tomorrow until\n\
          the next local midnight. Use Settings or the tray for recurring quiet hours.\n\
          --chat accepts a phone number or <number>@c.us and never sends a message.\n\
+         --share accepts a regular file up to 64 MB and leaves it in WhatsApp's\n\
+         attachment preview; combine it with --account to choose the account.\n\
          URLs: whatsapp://send?phone=..., https://wa.me/..., https://chat.whatsapp.com/...\n\
          The application requires WebKitGTK 4.1 and an X11 or XWayland session.",
         env!("CARGO_PKG_VERSION")
@@ -616,6 +810,73 @@ mod tests {
         let cli = Cli::parse(&args(&["--account=acc-1", "--chat=5491112345678@c.us"])).unwrap();
         assert_eq!(cli.account.as_deref(), Some("acc-1"));
         assert_eq!(cli.chat.as_deref(), Some("5491112345678@c.us"));
+    }
+
+    #[test]
+    fn share_accepts_a_path_and_an_optional_account() {
+        let cli = Cli::parse(&args(&["--share", "/tmp/photo one.png"])).unwrap();
+        assert_eq!(cli.share.as_deref(), Some("/tmp/photo one.png"));
+        assert_eq!(cli.action, None);
+
+        let cli = Cli::parse(&args(&["--account=Work", "--share=/tmp/report.pdf"])).unwrap();
+        assert_eq!(cli.account.as_deref(), Some("Work"));
+        assert_eq!(cli.share.as_deref(), Some("/tmp/report.pdf"));
+    }
+
+    #[test]
+    fn share_builds_a_share_message_with_the_selected_account() {
+        let cli = Cli::parse(&args(&["--account", "Work", "--share", "/tmp/clip.mp4"])).unwrap();
+
+        assert_eq!(
+            cli.requested_message().unwrap(),
+            InstanceMessage::Share {
+                account: Some("Work".to_string()),
+                path: PathBuf::from("/tmp/clip.mp4"),
+            }
+        );
+        let cli = Cli::parse(&args(&["--share", "/tmp/clip.mp4"])).unwrap();
+        assert_eq!(
+            cli.requested_message().unwrap(),
+            InstanceMessage::Share {
+                account: None,
+                path: PathBuf::from("/tmp/clip.mp4"),
+            }
+        );
+    }
+
+    #[test]
+    fn share_values_are_validated_before_forwarding() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("photo.png");
+        std::fs::write(&file, b"png").unwrap();
+        let mut cli = Cli::parse(&args(&["--share", file.to_str().unwrap()])).unwrap();
+
+        cli.validate_share().unwrap();
+
+        assert_eq!(
+            cli.share.as_deref(),
+            Some(file.canonicalize().unwrap().to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn share_rejects_missing_files_and_conflicting_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut missing = Cli::parse(&args(&[
+            "--share",
+            dir.path().join("missing.png").to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(missing.validate_share().is_err());
+
+        let mut directory = Cli::parse(&args(&["--share", dir.path().to_str().unwrap()])).unwrap();
+        assert!(directory.validate_share().is_err());
+
+        assert!(Cli::parse(&args(&["--share"])).is_err());
+        assert!(Cli::parse(&args(&["--share="])).is_err());
+        assert!(Cli::parse(&args(&["--share", "--toggle"])).is_err());
+        assert!(Cli::parse(&args(&["--share", "/tmp/a", "--chat", "123456"])).is_err());
+        assert!(Cli::parse(&args(&["--share=a\nb"])).is_err());
     }
 
     #[test]

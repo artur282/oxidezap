@@ -60,6 +60,7 @@ impl Render for DownloadsWindow {
         if window.focused(cx).is_none() {
             window.focus(&self.focus_handle);
         }
+        window.set_window_title(t!("OxideZap Downloads"));
         if self.appearance_subscription.is_none() {
             self.appearance_subscription =
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
@@ -76,12 +77,15 @@ impl Render for DownloadsWindow {
         };
 
         let subtitle = if records.is_empty() {
-            "Downloads appear here as they start.".to_string()
+            t!("Downloads appear here as they start.").to_string()
         } else if active == 0 {
-            let noun = if records.len() == 1 { "item" } else { "items" };
-            format!("{} {noun}", records.len())
+            tn!(records.len() as u32, "{count} item", "{count} items")
         } else {
-            format!("{} items · {active} in progress", records.len())
+            tr!(
+                "{count} items · {active} in progress",
+                count = records.len(),
+                active = active
+            )
         };
 
         let header = div()
@@ -105,7 +109,7 @@ impl Render for DownloadsWindow {
                                     .text_size(px(20.))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(theme.text)
-                                    .child("Downloads"),
+                                    .child(t!("Downloads")),
                             )
                             .child(
                                 div()
@@ -122,7 +126,7 @@ impl Render for DownloadsWindow {
                     .gap(px(8.))
                     .child(button(
                         "downloads-open-folder",
-                        "Open folder",
+                        t!("Open folder"),
                         theme,
                         false,
                         cx.listener(|this, _event, _window, cx| {
@@ -132,7 +136,7 @@ impl Render for DownloadsWindow {
                     ))
                     .child(button(
                         "downloads-close",
-                        "Close",
+                        t!("Close"),
                         theme,
                         false,
                         cx.listener(|_this, _event, window, _cx| {
@@ -147,7 +151,7 @@ impl Render for DownloadsWindow {
             .gap(px(6.))
             .text_size(px(11.))
             .text_color(theme.text_faint)
-            .child("Saving to")
+            .child(t!("Saving to"))
             .child(
                 div()
                     .text_color(theme.text_muted)
@@ -202,9 +206,7 @@ impl Render for DownloadsWindow {
                     .py(px(8.))
                     .text_size(px(10.))
                     .text_color(theme.text_faint)
-                    .child(
-                        "Downloads are written straight to disk. In-progress rows can be cancelled; finished rows can be retried when WebKit exposed a source URL.",
-                    ),
+                    .child(t!("Downloads are written straight to disk. In-progress rows can be cancelled; finished rows can be retried when WebKit exposed a source URL.")),
             )
     }
 }
@@ -215,16 +217,16 @@ fn columns_header(theme: Theme) -> impl IntoElement {
         .border_b_1()
         .border_color(theme.border)
         .child(
-            column_label("File", theme)
+            column_label(t!("File"), theme)
                 .flex_1()
                 .min_w(px(FILE_COLUMN_MIN_WIDTH)),
         )
-        .child(column_label("Account", theme).w(px(ACCOUNT_COLUMN_WIDTH)))
-        .child(column_label("Size", theme).w(px(SIZE_COLUMN_WIDTH)))
-        .child(column_label("Progress", theme).w(px(PROGRESS_COLUMN_WIDTH)))
-        .child(column_label("Status", theme).w(px(STATUS_COLUMN_WIDTH)))
-        .child(column_label("Started", theme).w(px(DATE_COLUMN_WIDTH)))
-        .child(column_label("Actions", theme).w(px(ACTIONS_COLUMN_WIDTH)))
+        .child(column_label(t!("Account"), theme).w(px(ACCOUNT_COLUMN_WIDTH)))
+        .child(column_label(t!("Size"), theme).w(px(SIZE_COLUMN_WIDTH)))
+        .child(column_label(t!("Progress"), theme).w(px(PROGRESS_COLUMN_WIDTH)))
+        .child(column_label(t!("Status"), theme).w(px(STATUS_COLUMN_WIDTH)))
+        .child(column_label(t!("Started"), theme).w(px(DATE_COLUMN_WIDTH)))
+        .child(column_label(t!("Actions"), theme).w(px(ACTIONS_COLUMN_WIDTH)))
 }
 
 fn download_row(record: DownloadRecord, theme: Theme, model: Entity<AppModel>) -> impl IntoElement {
@@ -339,7 +341,7 @@ fn download_row(record: DownloadRecord, theme: Theme, model: Entity<AppModel>) -
                 .text_size(px(11.))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(status_color)
-                .child(record.status.label()),
+                .child(crate::i18n::translate_dynamic(record.status.label())),
         )
         .child(
             div()
@@ -376,7 +378,7 @@ fn row_actions(record: &DownloadRecord, theme: Theme, model: Entity<AppModel>) -
             let id = id.clone();
             style.child(row_action(
                 format!("download-open-{id}"),
-                "Open",
+                t!("Open"),
                 theme,
                 true,
                 move |_event, _window, cx| {
@@ -389,7 +391,7 @@ fn row_actions(record: &DownloadRecord, theme: Theme, model: Entity<AppModel>) -
             let id = id.clone();
             style.child(row_action(
                 format!("download-folder-{id}"),
-                "Folder",
+                t!("Folder"),
                 theme,
                 false,
                 move |_event, _window, cx| {
@@ -405,7 +407,7 @@ fn row_actions(record: &DownloadRecord, theme: Theme, model: Entity<AppModel>) -
                 .unwrap_or_default();
             style.child(row_action(
                 format!("download-copy-{id}"),
-                "Copy",
+                t!("Copy"),
                 theme,
                 false,
                 move |_event, _window, cx| {
@@ -418,7 +420,7 @@ fn row_actions(record: &DownloadRecord, theme: Theme, model: Entity<AppModel>) -
             let id = id.clone();
             style.child(row_action(
                 format!("download-cancel-{id}"),
-                "Cancel",
+                t!("Cancel"),
                 theme,
                 false,
                 move |_event, _window, cx| {
@@ -431,7 +433,7 @@ fn row_actions(record: &DownloadRecord, theme: Theme, model: Entity<AppModel>) -
             let id = id.clone();
             style.child(row_action(
                 format!("download-retry-{id}"),
-                "Retry",
+                t!("Retry"),
                 theme,
                 false,
                 move |_event, _window, cx| {
@@ -444,7 +446,7 @@ fn row_actions(record: &DownloadRecord, theme: Theme, model: Entity<AppModel>) -
             let id = id.clone();
             style.child(row_action(
                 format!("download-remove-{id}"),
-                "Remove",
+                t!("Remove"),
                 theme,
                 false,
                 move |_event, _window, cx| {
@@ -516,7 +518,7 @@ fn empty_state(
                 .text_size(px(16.))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.text)
-                .child("No downloads yet"),
+                .child(t!("No downloads yet")),
         )
         .child(
             div()
@@ -524,13 +526,10 @@ fn empty_state(
                 .text_center()
                 .text_size(px(12.))
                 .text_color(theme.text_muted)
-                .child(
-                    "Files saved from WhatsApp Web show their progress and history here. Blob and view-once media never reach this list.",
-                ),
+                .child(t!("Files saved from WhatsApp Web show their progress and history here. Blob and view-once media never reach this list.")),
         )
         .child(button(
-            "downloads-empty-open-folder",
-            "Open download folder",
+            "downloads-empty-open-folder",t!("Open download folder"),
             theme,
             false,
             cx.listener(move |_this, _event, _window, cx| {
@@ -578,16 +577,16 @@ fn size_label(record: &DownloadRecord) -> String {
 fn progress_label(record: &DownloadRecord) -> String {
     if record.is_active() {
         match (record.progress(), record.total_bytes) {
-            (Some(fraction), Some(total)) => format!(
-                "{}% · {} of {}",
-                (fraction * 100.0).round() as u32,
-                format_size(record.received_bytes),
-                format_size(total)
+            (Some(fraction), Some(total)) => tr!(
+                "{percent}% · {received} of {total}",
+                percent = (fraction * 100.0).round() as u32,
+                received = format_size(record.received_bytes),
+                total = format_size(total)
             ),
             _ => format_size(record.received_bytes),
         }
     } else if record.status == DownloadStatus::Completed {
-        "Complete".to_string()
+        t!("Complete").to_string()
     } else {
         "—".to_string()
     }
@@ -601,11 +600,11 @@ fn format_started_at(millis: u64) -> String {
         .unwrap_or(0);
     let age = now.saturating_sub(seconds);
     if age < 60 {
-        "Just now".to_string()
+        t!("Just now").to_string()
     } else if age < 3600 {
-        format!("{} min ago", age / 60)
+        tr!("{minutes} min ago", minutes = age / 60)
     } else if age < 86_400 {
-        format!("{} h ago", age / 3600)
+        tr!("{hours} h ago", hours = age / 3600)
     } else {
         let stamp = format_timestamp(UNIX_EPOCH + Duration::from_secs(seconds));
         stamp.chars().take(16).collect::<String>().replace('T', " ")

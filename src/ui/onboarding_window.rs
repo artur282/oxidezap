@@ -43,11 +43,11 @@ impl OnboardingPage {
 
     pub fn title(self) -> &'static str {
         match self {
-            OnboardingPage::Welcome => "Welcome to OxideZap",
-            OnboardingPage::LinkPhone => "Link your phone",
-            OnboardingPage::Accounts => "Accounts and data",
-            OnboardingPage::Privacy => "Windows and privacy",
-            OnboardingPage::Ready => "You're ready",
+            OnboardingPage::Welcome => t!("Welcome to OxideZap"),
+            OnboardingPage::LinkPhone => t!("Link your phone"),
+            OnboardingPage::Accounts => t!("Accounts and data"),
+            OnboardingPage::Privacy => t!("Windows and privacy"),
+            OnboardingPage::Ready => t!("You're ready"),
         }
     }
 
@@ -163,6 +163,7 @@ impl Render for OnboardingWindow {
         if window.focused(cx).is_none() {
             window.focus(&self.focus_handle);
         }
+        window.set_window_title(t!("Welcome to OxideZap"));
 
         // The theme is resolved from the window appearance on every render, so
         // a repaint is enough when the system appearance changes. Register once
@@ -251,7 +252,7 @@ fn header(page: OnboardingPage, theme: Theme) -> AnyElement {
                             div()
                                 .text_size(px(10.))
                                 .text_color(theme.text_faint)
-                                .child("FIRST-RUN GUIDE"),
+                                .child(t!("FIRST-RUN GUIDE")),
                         )
                         .child(
                             div()
@@ -266,7 +267,11 @@ fn header(page: OnboardingPage, theme: Theme) -> AnyElement {
             div()
                 .text_size(px(11.))
                 .text_color(theme.text_faint)
-                .child(format!("Step {} of {PAGE_COUNT}", page.index() + 1)),
+                .child(tr!(
+                    "Step {step} of {total}",
+                    step = page.index() + 1,
+                    total = PAGE_COUNT
+                )),
         )
         .into_any_element()
 }
@@ -289,129 +294,163 @@ fn page_content(page: OnboardingPage, theme: Theme, locations: &Locations) -> An
     match page {
         OnboardingPage::Welcome => body
             .child(paragraph(
-                "OxideZap wraps the official WhatsApp Web in a native Linux window. \
+                t!(
+                    "OxideZap wraps the official WhatsApp Web in a native Linux window. \
                  It is an independent, unofficial project, not affiliated with or \
-                 endorsed by WhatsApp or Meta.",
+                 endorsed by WhatsApp or Meta."
+                ),
                 theme,
             ))
             .child(bullet(
-                "The official login",
-                "WhatsApp keeps handling the account, the QR login, and your messages. \
-                 OxideZap only provides the desktop window around it.",
+                t!("The official login"),
+                t!(
+                    "WhatsApp keeps handling the account, the QR login, and your messages. \
+                 OxideZap only provides the desktop window around it."
+                ),
                 theme,
             ))
             .child(bullet(
-                "No telemetry",
-                "This guide makes no network requests. The app collects no analytics and \
-                 never asks for your phone number or WhatsApp credentials.",
+                t!("No telemetry"),
+                t!(
+                    "This guide makes no network requests. The app collects no analytics and \
+                 never asks for your phone number or WhatsApp credentials."
+                ),
                 theme,
             ))
             .child(path_card(
-                "Your session stays on this computer",
-                &[("Settings", locations.config_dir.as_str())],
+                t!("Your session stays on this computer"),
+                &[(t!("Settings"), locations.config_dir.as_str())],
                 theme,
             )),
         OnboardingPage::LinkPhone => body
             .child(paragraph(
-                "The account window behind this guide shows WhatsApp Web's QR code. \
+                t!(
+                    "The account window behind this guide shows WhatsApp Web's QR code. \
                  Keep the guide open while you pick up your phone, or skip it and come back \
-                 from Settings > General later.",
+                 from Settings > General later."
+                ),
                 theme,
             ))
-            .child(step(1, "Open WhatsApp on your phone.", theme))
-            .child(step(2, "Tap Linked devices, then Link a device.", theme))
+            .child(step(1, t!("Open WhatsApp on your phone."), theme))
+            .child(step(
+                2,
+                t!("Tap Linked devices, then Link a device."),
+                theme,
+            ))
             .child(step(
                 3,
-                "Point the phone at the QR code in the OxideZap window.",
+                t!("Point the phone at the QR code in the OxideZap window."),
                 theme,
             ))
             .child(warning_card(
-                "QR code does not load?",
-                "It can take a few seconds. If the page stays blank, check that \
+                t!("QR code does not load?"),
+                t!(
+                    "It can take a few seconds. If the page stays blank, check that \
                  WebKitGTK 2.46.1 or newer is installed; older versions can hang the QR \
-                 login. OxideZap never waits for the QR before showing this guide.",
+                 login. OxideZap never waits for the QR before showing this guide."
+                ),
                 theme,
             )),
         OnboardingPage::Accounts => body
             .child(paragraph(
-                "Every account gets its own window and its own WebKit profile, so two \
-                 WhatsApp accounts never share cookies, local storage, or caches.",
+                t!(
+                    "Every account gets its own window and its own WebKit profile, so two \
+                 WhatsApp accounts never share cookies, local storage, or caches."
+                ),
                 theme,
             ))
             .child(bullet(
-                "Account isolation",
-                "Log in to a second number from Settings > Accounts > Add account. \
-                 Removing an account also removes its local profile.",
+                t!("Account isolation"),
+                t!(
+                    "Log in to a second number from Settings > Accounts > Add account. \
+                 Removing an account also removes its local profile."
+                ),
                 theme,
             ))
             .child(path_card(
-                "Where your data lives",
+                t!("Where your data lives"),
                 &[
-                    ("Config", locations.config_dir.as_str()),
-                    ("Account data", locations.accounts_dir.as_str()),
-                    ("Downloads", locations.downloads_dir.as_str()),
+                    (t!("Config"), locations.config_dir.as_str()),
+                    (t!("Account data"), locations.accounts_dir.as_str()),
+                    (t!("Downloads"), locations.downloads_dir.as_str()),
                 ],
                 theme,
             ))
             .child(paragraph(
-                "OxideZap creates its files with private 0600/0700 permissions. \
-                 The download folder stays shared with your desktop.",
+                t!(
+                    "OxideZap creates its files with private 0600/0700 permissions. \
+                 The download folder stays shared with your desktop."
+                ),
                 theme,
             )),
         OnboardingPage::Privacy => body
             .child(bullet(
-                "Close to tray",
-                "Closing an account window hides it instead of quitting. Reopen it from \
+                t!("Close to tray"),
+                t!(
+                    "Closing an account window hides it instead of quitting. Reopen it from \
                  the tray icon or the global show/hide shortcut; turn this off in \
-                 Settings > General.",
+                 Settings > General."
+                ),
                 theme,
             ))
             .child(bullet(
-                "Native notifications",
-                "Message previews use your desktop's notification service. Toggle them \
+                t!("Native notifications"),
+                t!(
+                    "Message previews use your desktop's notification service. Toggle them \
                  globally, mute one account, or turn on Do Not Disturb in \
-                 Settings > Notifications.",
+                 Settings > Notifications."
+                ),
                 theme,
             ))
             .child(bullet(
-                "App lock",
-                "Set a password in Settings > Security to hide every window behind a \
+                t!("App lock"),
+                t!(
+                    "Set a password in Settings > Security to hide every window behind a \
                  privacy screen: lock now, on launch, on hide, on suspend, when the \
-                 desktop locks, or after an idle timeout.",
+                 desktop locks, or after an idle timeout."
+                ),
                 theme,
             ))
             .child(bullet(
-                "Global shortcuts",
-                "The default show/hide shortcut is Ctrl+Shift+W. The boss key, \
+                t!("Global shortcuts"),
+                t!(
+                    "The default show/hide shortcut is Ctrl+Shift+W. The boss key, \
                  Ctrl+Shift+H, hides every window immediately for privacy and restores \
-                 them on the next press.",
+                 them on the next press."
+                ),
                 theme,
             )),
         OnboardingPage::Ready => body
             .child(paragraph(
-                "That is everything. Your settings are saved as you change them, and \
-                 you can reopen this guide any time from Settings > General.",
+                t!(
+                    "That is everything. Your settings are saved as you change them, and \
+                 you can reopen this guide any time from Settings > General."
+                ),
                 theme,
             ))
             .child(bullet(
-                "View-once messages",
-                "WhatsApp only lets you open view-once media on your phone. OxideZap does \
+                t!("View-once messages"),
+                t!(
+                    "WhatsApp only lets you open view-once media on your phone. OxideZap does \
                  not bypass that restriction; the desktop window follows WhatsApp Web's \
-                 own rules.",
+                 own rules."
+                ),
                 theme,
             ))
             .child(bullet(
-                "Single-phone account",
-                "A WhatsApp account stays linked to your phone. OxideZap does not run a \
+                t!("Single-phone account"),
+                t!(
+                    "A WhatsApp account stays linked to your phone. OxideZap does not run a \
                  second copy of the account and cannot receive messages while the phone \
-                 is offline, just like WhatsApp Web.",
+                 is offline, just like WhatsApp Web."
+                ),
                 theme,
             ))
             .child(path_card(
-                "Where your data lives",
+                t!("Where your data lives"),
                 &[
-                    ("Settings", locations.config_dir.as_str()),
-                    ("Accounts", locations.accounts_dir.as_str()),
+                    (t!("Settings"), locations.config_dir.as_str()),
+                    (t!("Accounts"), locations.accounts_dir.as_str()),
                 ],
                 theme,
             ))
@@ -419,11 +458,13 @@ fn page_content(page: OnboardingPage, theme: Theme, locations: &Locations) -> An
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_faint)
-                    .child("Prefer the full walkthrough? The README documents the same steps."),
+                    .child(t!(
+                        "Prefer the full walkthrough? The README documents the same steps."
+                    )),
             )
             .child(div().flex().gap(px(8.)).child(button(
                 "onboarding-read-guide",
-                "Read the guide",
+                t!("Read the guide"),
                 theme,
                 false,
                 |_event, _window, _cx| {
@@ -458,7 +499,7 @@ fn footer(
                 .gap(px(2.))
                 .child(button(
                     "onboarding-skip",
-                    "Skip",
+                    t!("Skip"),
                     theme,
                     false,
                     cx.listener(|this, _event, _window, cx| {
@@ -469,7 +510,7 @@ fn footer(
                     div()
                         .text_size(px(10.))
                         .text_color(theme.text_faint)
-                        .child("Skipping hides this guide permanently."),
+                        .child(t!("Skipping hides this guide permanently.")),
                 ),
         )
         .child(
@@ -480,7 +521,7 @@ fn footer(
                 .when(!is_first, |style| {
                     style.child(button(
                         "onboarding-back",
-                        "Back",
+                        t!("Back"),
                         theme,
                         false,
                         cx.listener(|this, _event, _window, cx| {
@@ -490,7 +531,11 @@ fn footer(
                 })
                 .child(button(
                     "onboarding-next",
-                    if is_last { "Open WhatsApp Web" } else { "Next" },
+                    if is_last {
+                        t!("Open WhatsApp Web")
+                    } else {
+                        t!("Next")
+                    },
                     theme,
                     true,
                     cx.listener(|this, _event, _window, cx| {

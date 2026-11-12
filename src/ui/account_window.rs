@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use gpui::{
-    App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    MouseButton, Render, ResizeEdge, SharedString, Subscription, Window, div, prelude::*, px, rgb,
+    App, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, MouseButton, Render, ResizeEdge, SharedString, Subscription, Timer, Window, div,
+    prelude::*, px, rgb, rgba,
 };
 
 use crate::app::{AccountViewState, AppModel, ConnectionState};
@@ -18,6 +21,8 @@ pub struct AccountWindow {
     focus_handle: FocusHandle,
     last_title: String,
     appearance_subscription: Option<Subscription>,
+    drop_hover: bool,
+    drop_poll: bool,
 }
 
 impl AccountWindow {
@@ -28,6 +33,8 @@ impl AccountWindow {
             focus_handle: cx.focus_handle(),
             last_title: String::new(),
             appearance_subscription: None,
+            drop_hover: false,
+            drop_poll: false,
         }
     }
 
@@ -61,6 +68,33 @@ impl AccountWindow {
         });
     }
 
+    fn toggle_always_on_top(&mut self, cx: &mut Context<Self>) {
+        let account_id = self.account_id.clone();
+        let enabled = !self.model.read(cx).account_always_on_top(&account_id);
+        self.model.update(cx, |model, cx| {
+            model.set_always_on_top(&account_id, enabled, cx)
+        });
+    }
+
+    fn toggle_mini_mode(&mut self, cx: &mut Context<Self>) {
+        let account_id = self.account_id.clone();
+        let enabled = !self.model.read(cx).account_mini_mode(&account_id);
+        self.model.update(cx, |model, cx| {
+            model.set_mini_mode(&account_id, enabled, cx)
+        });
+    }
+
+    /// Called for drops over the native titlebar and the exposed window
+    /// margins. Drops over the WebKit content are handled by the GTK layer.
+    fn handle_drop(&mut self, paths: &ExternalPaths, _window: &mut Window, cx: &mut Context<Self>) {
+        self.drop_hover = false;
+        let account_id = self.account_id.clone();
+        let paths = paths.paths().to_vec();
+        self.model.update(cx, |model, cx| {
+            model.attach_dropped_paths(&account_id, paths, cx);
+        });
+    }
+
     /// Ctrl+K opens the palette and Ctrl+1..9 switches accounts while the
     /// native window owns the keyboard. All other keys fall through to the
     /// existing tab traversal.
@@ -71,11 +105,21 @@ impl AccountWindow {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if !keystroke.modifiers.control
-            || keystroke.modifiers.alt
-            || keystroke.modifiers.shift
-            || keystroke.modifiers.platform
-        {
+        if !keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform {
+            return;
+        }
+        if keystroke.modifiers.shift {
+            match keystroke.key.to_ascii_lowercase().as_str() {
+                "t" => {
+                    self.toggle_always_on_top(cx);
+                    cx.stop_propagation();
+                }
+                "m" => {
+                    self.toggle_mini_mode(cx);
+                    cx.stop_propagation();
+                }
+                _ => {}
+            }
             return;
         }
         if keystroke.key == "k" {
@@ -111,7 +155,7 @@ impl Render for AccountWindow {
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
         }
 
-        let (theme, name, unread, crash_failed, connection, view_state) = {
+        let (theme, name, unread, crash_failed, connection, view_state, always_on_top, mini_mode) = {
             let model = self.model.read(cx);
             (
                 model.theme(window),
@@ -120,8 +164,12 @@ impl Render for AccountWindow {
                 model.account_crash_failed(&self.account_id),
                 model.account_connection(&self.account_id),
                 model.account_view_state(&self.account_id),
+                model.account_always_on_top(&self.account_id),
+                model.account_mini_mode(&self.account_id),
             )
         };
+
+        let drop_hover = self.drop_hover || cx.has_active_drag();
 
         let title = if unread > 0 {
             format!("OxideZap — {name} ({unread})")
@@ -135,15 +183,15 @@ impl Render for AccountWindow {
 
         let (connection_message, connection_hint) = match connection {
             ConnectionState::Connecting | ConnectionState::Connected => {
-                ("Loading WhatsApp Web…", None)
+                (t!("Loading WhatsApp Web…"), None)
             }
             ConnectionState::Offline => (
-                "WhatsApp Web is offline.",
-                Some("OxideZap will reconnect when the network returns."),
+                t!("WhatsApp Web is offline."),
+                Some(t!("OxideZap will reconnect when the network returns.")),
             ),
             ConnectionState::Reconnecting => (
-                "Reconnecting…",
-                Some("OxideZap is trying to recover the page."),
+                t!("Reconnecting…"),
+                Some(t!("OxideZap is trying to recover the page.")),
             ),
         };
 
@@ -181,6 +229,42 @@ impl Render for AccountWindow {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::handle_shortcut))
             .on_key_down(handle_focus_traversal)
+            .on_drop::<ExternalPaths>(cx.listener(Self::handle_drop))
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                |this, _event: &gpui::DragMoveEvent<ExternalPaths>, _window, cx| {
+                    if !this.drop_hover {
+                        this.drop_hover = true;
+                        cx.notify();
+                    }
+                    if this.drop_poll {
+                        return;
+                    }
+                    this.drop_poll = true;
+                    let view = cx.weak_entity();
+                    cx.spawn(async move |_, cx| {
+                        loop {
+                            Timer::after(Duration::from_millis(100)).await;
+                            let keep_polling = view
+                                .update(cx, |this, cx| {
+                                    if cx.has_active_drag() {
+                                        return true;
+                                    }
+                                    this.drop_poll = false;
+                                    if this.drop_hover {
+                                        this.drop_hover = false;
+                                        cx.notify();
+                                    }
+                                    false
+                                })
+                                .unwrap_or(false);
+                            if !keep_polling {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
+                },
+            ))
             .child(
                 div()
                     .flex()
@@ -202,8 +286,7 @@ impl Render for AccountWindow {
                                     .child(connection_badge(connection, theme))
                                     .when(connection.retry_available(), |element| {
                                         element.child(button(
-                                            "account-connection-retry",
-                                            "Retry now",
+                                            "account-connection-retry",t!("Retry now"),
                                             theme,
                                             false,
                                             cx.listener(|this, _event, _window, cx| {
@@ -220,18 +303,34 @@ impl Render for AccountWindow {
                             .h_full()
                             .child(titlebar_button(
                                 "account-command-palette",
-                                ICON_PALETTE,
-                                "Command palette (Ctrl+K)",
+                                ICON_PALETTE,t!("Command palette (Ctrl+K)"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, window, cx| {
                                     this.open_palette(window, cx);
                                 }),
                             ))
+                            .child(button(
+                                "account-pin",
+                                "Pin",
+                                theme,
+                                always_on_top,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.toggle_always_on_top(cx);
+                                }),
+                            ))
+                            .child(button(
+                                "account-mini",
+                                "Mini",
+                                theme,
+                                mini_mode,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.toggle_mini_mode(cx);
+                                }),
+                            ))
                             .child(titlebar_button(
                                 "account-settings",
-                                ICON_GEAR,
-                                "Settings",
+                                ICON_GEAR,t!("Settings"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -240,8 +339,7 @@ impl Render for AccountWindow {
                             ))
                             .child(titlebar_button(
                                 "account-lock",
-                                ICON_LOCK,
-                                "Lock",
+                                ICON_LOCK,t!("Lock"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -250,8 +348,7 @@ impl Render for AccountWindow {
                             ))
                             .child(titlebar_button(
                                 "account-minimize",
-                                ICON_MINUS,
-                                "Minimize",
+                                ICON_MINUS,t!("Minimize"),
                                 theme,
                                 false,
                                 cx.listener(|_this, _event, window, _cx| {
@@ -260,8 +357,7 @@ impl Render for AccountWindow {
                             ))
                             .child(titlebar_button(
                                 "account-maximize",
-                                ICON_SQUARE,
-                                "Maximize",
+                                ICON_SQUARE,t!("Maximize"),
                                 theme,
                                 false,
                                 cx.listener(|_this, _event, window, _cx| {
@@ -270,8 +366,7 @@ impl Render for AccountWindow {
                             ))
                             .child(titlebar_button(
                                 "account-close",
-                                ICON_X,
-                                "Close",
+                                ICON_X,t!("Close"),
                                 theme,
                                 true,
                                 cx.listener(|this, _event, window, cx| {
@@ -302,7 +397,7 @@ impl Render for AccountWindow {
                                             .text_size(px(16.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
-                                            .child("Account suspended"),
+                                            .child(t!("Account suspended")),
                                     )
                                     .child(
                                         div()
@@ -310,9 +405,7 @@ impl Render for AccountWindow {
                                             .text_center()
                                             .text_size(px(13.))
                                             .text_color(theme.text_muted)
-                                            .child(
-                                                "WhatsApp Web is not running, so its memory was released. Your login, chats, and settings stay on disk.",
-                                            ),
+                                            .child(t!("WhatsApp Web is not running, so its memory was released. Your login, chats, and settings stay on disk.")),
                                     )
                                     .child(
                                         div()
@@ -320,13 +413,10 @@ impl Render for AccountWindow {
                                             .text_center()
                                             .text_size(px(12.))
                                             .text_color(theme.text_faint)
-                                            .child(
-                                                "Reactivating reloads WhatsApp Web and can take a few seconds. The current scroll position or an unsent draft may be lost.",
-                                            ),
+                                            .child(t!("Reactivating reloads WhatsApp Web and can take a few seconds. The current scroll position or an unsent draft may be lost.")),
                                     )
                                     .child(button(
-                                        "account-reactivate",
-                                        "Reactivate",
+                                        "account-reactivate",t!("Reactivate"),
                                         theme,
                                         true,
                                         cx.listener(|this, _event, _window, cx| {
@@ -344,7 +434,7 @@ impl Render for AccountWindow {
                                             .text_size(px(16.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
-                                            .child("Restoring WhatsApp Web…"),
+                                            .child(t!("Restoring WhatsApp Web…")),
                                     )
                                     .child(
                                         div()
@@ -352,9 +442,7 @@ impl Render for AccountWindow {
                                             .text_center()
                                             .text_size(px(13.))
                                             .text_color(theme.text_muted)
-                                            .child(
-                                                "Creating a fresh WebKit view. Your session is kept and the page will reconnect automatically.",
-                                            ),
+                                            .child(t!("Creating a fresh WebKit view. Your session is kept and the page will reconnect automatically.")),
                                     )
                             })
                             .when(view_state.is_loaded() && !crash_failed, |element| {
@@ -377,8 +465,7 @@ impl Render for AccountWindow {
                                     })
                                     .when(connection.retry_available(), |element| {
                                             element.child(button(
-                                                "account-connection-content-retry",
-                                                "Retry now",
+                                                "account-connection-content-retry",t!("Retry now"),
                                                 theme,
                                                 true,
                                                 cx.listener(|this, _event, _window, cx| {
@@ -395,7 +482,7 @@ impl Render for AccountWindow {
                                             .text_size(px(16.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
-                                            .child("Could not recover WhatsApp Web"),
+                                            .child(t!("Could not recover WhatsApp Web")),
                                     )
                                     .child(
                                         div()
@@ -403,13 +490,10 @@ impl Render for AccountWindow {
                                             .text_center()
                                             .text_size(px(13.))
                                             .text_color(theme.text_muted)
-                                            .child(
-                                                "The page kept crashing. Your session and messages are safe. Retry when you are ready.",
-                                            ),
+                                            .child(t!("The page kept crashing. Your session and messages are safe. Retry when you are ready.")),
                                     )
                                     .child(button(
-                                        "account-crash-retry",
-                                        "Retry now",
+                                        "account-crash-retry",t!("Retry now"),
                                         theme,
                                         true,
                                         cx.listener(|this, _event, _window, cx| {
@@ -419,6 +503,7 @@ impl Render for AccountWindow {
                             }),
                     ),
             )
+            .when(drop_hover, |element| element.child(drop_overlay(theme)))
             .child(resize_handle(
                 "resize-top",
                 ResizeEdge::Top,
@@ -488,6 +573,44 @@ impl Render for AccountWindow {
                 div().absolute().bottom(px(0.)).right(px(0.)).size(px(8.)),
             ))
     }
+}
+
+fn drop_overlay(theme: Theme) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(0.))
+        .left(px(0.))
+        .right(px(0.))
+        .bottom(px(0.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x0b141ae6))
+        .occlude()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(8.))
+                .p(px(24.))
+                .border_2()
+                .border_color(theme.accent)
+                .rounded_md()
+                .child(
+                    div()
+                        .text_size(px(22.))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text)
+                        .child("Drop to attach"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.text_muted)
+                        .child("Images, videos, PDFs, and files up to 64 MB stay in the preview until you send."),
+                ),
+        )
 }
 
 fn connection_badge(state: ConnectionState, theme: Theme) -> impl IntoElement {

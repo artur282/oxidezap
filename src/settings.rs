@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
@@ -16,6 +17,12 @@ use uuid::Uuid;
 /// and the WebKit thread on the same module without a crate-root declaration.
 #[path = "storage.rs"]
 pub mod storage;
+
+/// Performance and battery-saver policy. Declared here with an explicit path
+/// for the same reason as `storage`: the settings window, the app model, and
+/// the WebKit thread share it without touching the crate root.
+#[path = "performance.rs"]
+pub mod performance;
 
 pub const SETTINGS_VERSION: u32 = 1;
 /// Version of the portable `SettingsExport` file format. It is independent
@@ -43,6 +50,17 @@ pub const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// on every page load, so an unbounded settings value would also make every
 /// settings save unnecessarily large.
 pub const MAX_CUSTOM_CSS_BYTES: usize = 64 * 1024;
+/// Smallest window that still shows the account titlebar and web content
+/// comfortably. Normal (non-mini) windows are never restored below this size.
+pub const MIN_WINDOW_WIDTH: f32 = 480.0;
+pub const MIN_WINDOW_HEIGHT: f32 = 360.0;
+/// Mini mode uses a single-pane WhatsApp Web layout below the responsive
+/// sidebar breakpoint, so the saved size is smaller than a normal window.
+pub const MIN_MINI_WIDTH: f32 = 320.0;
+pub const MIN_MINI_HEIGHT: f32 = 320.0;
+/// Bounds are remembered per monitor. The cap keeps a settings file tiny even
+/// after a user plugs and unplugs many displays over time.
+pub const MAX_SAVED_MONITORS: usize = 8;
 
 /// Experimental WhatsApp Web appearance customization.
 ///
@@ -96,36 +114,38 @@ impl AppearanceSettings {
 /// `<style>` element.
 pub fn validate_custom_css(css: &str) -> Result<(), String> {
     if css.trim().is_empty() {
-        return Err("Add CSS before enabling experimental styles.".to_string());
+        return Err(t!("Add CSS before enabling experimental styles.").to_string());
     }
     if css.len() > MAX_CUSTOM_CSS_BYTES {
-        return Err(format!(
-            "The CSS is too large ({} bytes; the limit is {} KiB).",
-            css.len(),
-            MAX_CUSTOM_CSS_BYTES / 1024
+        return Err(tr!(
+            "The CSS is too large ({bytes} bytes; the limit is {limit} KiB).",
+            bytes = css.len(),
+            limit = MAX_CUSTOM_CSS_BYTES / 1024
         ));
     }
     if css.contains('\0') {
-        return Err("The CSS contains a NUL character.".to_string());
+        return Err(t!("The CSS contains a NUL character.").to_string());
     }
     if css.to_ascii_lowercase().contains("</style") {
-        return Err("The CSS must not contain a </style> tag.".to_string());
+        return Err(t!("The CSS must not contain a </style> tag.").to_string());
     }
 
     // Comments are not part of the cascade. Without removing them, a comment
     // that merely documents `@import` would be rejected as if it were active.
     let code = strip_css_comments(css).to_ascii_lowercase();
     if code.contains("@import") {
-        return Err("The CSS must not use @import. Paste the rules directly instead.".to_string());
+        return Err(
+            t!("The CSS must not use @import. Paste the rules directly instead.").to_string(),
+        );
     }
     if code.contains("javascript:") {
-        return Err("The CSS must not contain javascript: URLs.".to_string());
+        return Err(t!("The CSS must not contain javascript: URLs.").to_string());
     }
     if css_uses_remote_url(&code) {
-        return Err(
+        return Err(t!(
             "The CSS must not load remote resources. Use data: URIs or local rules instead."
-                .to_string(),
-        );
+        )
+        .to_string());
     }
     Ok(())
 }
@@ -185,9 +205,9 @@ pub enum ThemeMode {
 impl ThemeMode {
     pub fn label(self) -> &'static str {
         match self {
-            ThemeMode::System => "System",
-            ThemeMode::Light => "Light",
-            ThemeMode::Dark => "Dark",
+            ThemeMode::System => t!("System"),
+            ThemeMode::Light => t!("Light"),
+            ThemeMode::Dark => t!("Dark"),
         }
     }
 }
@@ -201,8 +221,115 @@ pub struct SavedBounds {
 }
 
 impl SavedBounds {
+    /// Bounds that fit a normal account window.
     pub fn is_valid(&self) -> bool {
-        self.width >= 480.0 && self.height >= 360.0 && self.x.is_finite() && self.y.is_finite()
+        self.is_usable() && self.width >= MIN_WINDOW_WIDTH && self.height >= MIN_WINDOW_HEIGHT
+    }
+
+    /// Bounds that can host the titlebar and web content. Mini mode is allowed
+    /// to be narrower than a normal window.
+    pub fn is_usable(&self) -> bool {
+        self.width >= MIN_MINI_WIDTH
+            && self.height >= MIN_MINI_HEIGHT
+            && self.x.is_finite()
+            && self.y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+    }
+
+    pub fn intersection_area(&self, other: &Self) -> f32 {
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = (self.x + self.width).min(other.x + other.width);
+        let bottom = (self.y + self.height).min(other.y + other.height);
+        if right <= left || bottom <= top {
+            0.0
+        } else {
+            (right - left) * (bottom - top)
+        }
+    }
+
+    /// Moves and shrinks the bounds so the window stays inside `area`.
+    pub fn clamp_to(&self, area: &Self) -> Self {
+        let width = self.width.min(area.width).max(MIN_MINI_WIDTH);
+        let height = self.height.min(area.height).max(MIN_MINI_HEIGHT);
+        let max_x = area.x + (area.width - width).max(0.0);
+        let max_y = area.y + (area.height - height).max(0.0);
+        Self {
+            x: self.x.clamp(area.x.min(max_x), max_x),
+            y: self.y.clamp(area.y.min(max_y), max_y),
+            width,
+            height,
+        }
+    }
+}
+
+/// A display area reported by the windowing system. `key` is stable across
+/// restarts when the platform provides a display UUID; otherwise the index is
+/// used and the bounds themselves still place the window on the right monitor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitorArea {
+    pub key: String,
+    pub bounds: SavedBounds,
+}
+
+/// Returns the monitor that overlaps `bounds` the most, if any.
+pub fn monitor_for_bounds<'a>(
+    bounds: &SavedBounds,
+    monitors: &'a [MonitorArea],
+) -> Option<&'a MonitorArea> {
+    monitors
+        .iter()
+        .map(|monitor| (monitor, bounds.intersection_area(&monitor.bounds)))
+        .filter(|(_, area)| *area > 0.0)
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(monitor, _)| monitor)
+}
+
+/// Picks the saved bounds that belong on the current monitor layout.
+///
+/// A window is restored on the monitor it last occupied. If that monitor is
+/// gone, the nearest saved position is clamped to an available monitor instead
+/// of leaving the window off-screen.
+pub fn restore_account_bounds(
+    account: &Account,
+    monitors: &[MonitorArea],
+    fallback: &SavedBounds,
+) -> SavedBounds {
+    if monitors.is_empty() {
+        return fallback.clone();
+    }
+    let primary = &monitors[0].bounds;
+    let per_monitor = account
+        .bounds_by_monitor
+        .values()
+        .filter(|bounds| bounds.is_valid())
+        .max_by(|left, right| {
+            let left_area = monitor_for_bounds(left, monitors)
+                .map(|monitor| left.intersection_area(&monitor.bounds))
+                .unwrap_or(0.0);
+            let right_area = monitor_for_bounds(right, monitors)
+                .map(|monitor| right.intersection_area(&monitor.bounds))
+                .unwrap_or(0.0);
+            left_area.total_cmp(&right_area)
+        });
+    let candidate = account
+        .bounds
+        .as_ref()
+        .filter(|bounds| bounds.is_valid())
+        .or(per_monitor)
+        .or(account
+            .normal_bounds
+            .as_ref()
+            .filter(|bounds| bounds.is_valid()));
+    match candidate {
+        Some(bounds) => {
+            let monitor = monitor_for_bounds(bounds, monitors)
+                .map(|monitor| &monitor.bounds)
+                .unwrap_or(primary);
+            bounds.clamp_to(monitor)
+        }
+        None => fallback.clamp_to(primary),
     }
 }
 
@@ -220,6 +347,22 @@ pub struct Account {
     pub muted: bool,
     #[serde(default = "notification_sound_default")]
     pub notification_sound: bool,
+    /// Keeps this account's window above other windows through the window
+    /// manager's `_NET_WM_STATE_ABOVE` state.
+    #[serde(default)]
+    pub always_on_top: bool,
+    /// Compact single-pane window. The normal bounds are kept in
+    /// `normal_bounds` so leaving mini mode restores the previous window.
+    #[serde(default)]
+    pub mini_mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_bounds: Option<SavedBounds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mini_bounds: Option<SavedBounds>,
+    /// Last normal-window bounds for each monitor, keyed by the monitor key the
+    /// window manager reported when the window was closed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bounds_by_monitor: BTreeMap<String, SavedBounds>,
 }
 
 fn notification_sound_default() -> bool {
@@ -236,6 +379,11 @@ impl Account {
             maximized: false,
             muted: false,
             notification_sound: true,
+            always_on_top: false,
+            mini_mode: false,
+            normal_bounds: None,
+            mini_bounds: None,
+            bounds_by_monitor: BTreeMap::new(),
         }
     }
 
@@ -248,6 +396,11 @@ impl Account {
             maximized: false,
             muted: false,
             notification_sound: true,
+            always_on_top: false,
+            mini_mode: false,
+            normal_bounds: None,
+            mini_bounds: None,
+            bounds_by_monitor: BTreeMap::new(),
         }
     }
 
@@ -257,6 +410,36 @@ impl Account {
             .find(|ch| !ch.is_whitespace())
             .map(|ch| ch.to_uppercase().to_string())
             .unwrap_or_else(|| "?".to_string())
+    }
+
+    /// Remembers the normal bounds on the monitor that contains the window and
+    /// keeps only the most recent monitors.
+    pub fn remember_bounds_for_monitor(&mut self, monitors: &[MonitorArea], bounds: &SavedBounds) {
+        let Some(monitor) = monitor_for_bounds(bounds, monitors) else {
+            return;
+        };
+        if self.bounds_by_monitor.len() >= MAX_SAVED_MONITORS
+            && !self.bounds_by_monitor.contains_key(&monitor.key)
+            && let Some(oldest) = self.bounds_by_monitor.keys().next().cloned()
+        {
+            self.bounds_by_monitor.remove(&oldest);
+        }
+        self.bounds_by_monitor
+            .insert(monitor.key.clone(), bounds.clamp_to(&monitor.bounds));
+    }
+
+    fn normalize_bounds(&mut self) {
+        self.bounds = self.bounds.take().filter(SavedBounds::is_valid);
+        self.normal_bounds = self.normal_bounds.take().filter(SavedBounds::is_valid);
+        self.mini_bounds = self.mini_bounds.take().filter(SavedBounds::is_usable);
+        self.bounds_by_monitor
+            .retain(|key, bounds| !key.is_empty() && key.len() <= 64 && bounds.is_valid());
+        while self.bounds_by_monitor.len() > MAX_SAVED_MONITORS {
+            let Some(oldest) = self.bounds_by_monitor.keys().next().cloned() else {
+                break;
+            };
+            self.bounds_by_monitor.remove(&oldest);
+        }
     }
 }
 
@@ -362,10 +545,10 @@ pub enum SpellCheckLanguage {
 impl SpellCheckLanguage {
     pub fn label(self) -> &'static str {
         match self {
-            SpellCheckLanguage::Automatic => "Automatic",
-            SpellCheckLanguage::Spanish => "Spanish",
-            SpellCheckLanguage::English => "English",
-            SpellCheckLanguage::Disabled => "Disabled",
+            SpellCheckLanguage::Automatic => t!("Automatic"),
+            SpellCheckLanguage::Spanish => t!("Spanish"),
+            SpellCheckLanguage::English => t!("English"),
+            SpellCheckLanguage::Disabled => t!("Disabled"),
         }
     }
 
@@ -485,17 +668,17 @@ pub enum ProxyMode {
 impl ProxyMode {
     pub fn label(self) -> &'static str {
         match self {
-            ProxyMode::System => "System proxy",
-            ProxyMode::NoProxy => "No proxy",
-            ProxyMode::Manual => "Manual proxy",
+            ProxyMode::System => t!("System proxy"),
+            ProxyMode::NoProxy => t!("No proxy"),
+            ProxyMode::Manual => t!("Manual proxy"),
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            ProxyMode::System => "Use the desktop network settings",
-            ProxyMode::NoProxy => "Always connect directly",
-            ProxyMode::Manual => "Enter an HTTP, HTTPS, or SOCKS proxy",
+            ProxyMode::System => t!("Use the desktop network settings"),
+            ProxyMode::NoProxy => t!("Always connect directly"),
+            ProxyMode::Manual => t!("Enter an HTTP, HTTPS, or SOCKS proxy"),
         }
     }
 }
@@ -574,10 +757,10 @@ impl ManualProxy {
     pub fn validate(&self) -> Result<(), String> {
         validate_proxy_host(&self.host)?;
         if self.port == 0 {
-            return Err("The proxy port must be between 1 and 65535.".to_string());
+            return Err(t!("The proxy port must be between 1 and 65535.").to_string());
         }
         if self.username.is_empty() && !self.password.is_empty() {
-            return Err("Enter a proxy username when a password is set.".to_string());
+            return Err(t!("Enter a proxy username when a password is set.").to_string());
         }
         Ok(())
     }
@@ -598,13 +781,14 @@ impl ManualProxy {
         authority.push(':');
         authority.push_str(&self.port.to_string());
         let uri = format!("{}://{authority}", self.protocol.scheme());
-        url::Url::parse(&uri).map_err(|_| "The proxy address is not a valid URL.".to_string())?;
+        url::Url::parse(&uri)
+            .map_err(|_| t!("The proxy address is not a valid URL.").to_string())?;
         Ok(uri)
     }
 
     pub fn redacted_endpoint(&self) -> String {
         if !self.is_configured() {
-            "not configured".to_string()
+            t!("not configured").to_string()
         } else {
             format!("{}:{}", display_host(&self.host), self.port)
         }
@@ -675,12 +859,12 @@ impl ProxySettings {
     /// Safe for logs and UI summaries: never contains a username or password.
     pub fn redacted_summary(&self) -> String {
         match self.mode {
-            ProxyMode::System => "System proxy".to_string(),
-            ProxyMode::NoProxy => "No proxy".to_string(),
-            ProxyMode::Manual => format!(
-                "{} proxy at {}",
-                self.manual.protocol.label(),
-                self.manual.redacted_endpoint()
+            ProxyMode::System => t!("System proxy").to_string(),
+            ProxyMode::NoProxy => t!("No proxy").to_string(),
+            ProxyMode::Manual => tr!(
+                "{protocol} proxy at {endpoint}",
+                protocol = self.manual.protocol.label(),
+                endpoint = self.manual.redacted_endpoint()
             ),
         }
     }
@@ -689,11 +873,13 @@ impl ProxySettings {
 fn validate_proxy_host(host: &str) -> Result<(), String> {
     let host = host.trim();
     if host.is_empty() {
-        return Err("Enter the proxy host.".to_string());
+        return Err(t!("Enter the proxy host.").to_string());
     }
     if host.starts_with('[') || host.ends_with(']') {
         if !(host.starts_with('[') && host.ends_with(']')) {
-            return Err("Close the IPv6 address with a bracket, for example [::1].".to_string());
+            return Err(
+                t!("Close the IPv6 address with a bracket, for example [::1].").to_string(),
+            );
         }
         let inner = &host[1..host.len() - 1];
         let valid = !inner.is_empty()
@@ -701,20 +887,22 @@ fn validate_proxy_host(host: &str) -> Result<(), String> {
                 .chars()
                 .all(|character| character.is_ascii_hexdigit() || matches!(character, ':' | '.'));
         if !valid {
-            return Err("Enter a valid IPv6 address in brackets, for example [::1].".to_string());
+            return Err(
+                t!("Enter a valid IPv6 address in brackets, for example [::1].").to_string(),
+            );
         }
         return Ok(());
     }
     if host.contains(':') {
-        return Err("Wrap IPv6 addresses in brackets, for example [::1].".to_string());
+        return Err(t!("Wrap IPv6 addresses in brackets, for example [::1].").to_string());
     }
     if host.chars().any(|character| {
         character.is_whitespace() || matches!(character, '/' | '\\' | '@' | '?' | '#')
     }) {
-        return Err(
+        return Err(t!(
             "The proxy host must be a hostname or IP address, without a scheme, path, or credentials."
-                .to_string(),
-        );
+        )
+        .to_string());
     }
     Ok(())
 }
@@ -794,7 +982,7 @@ impl ProxyEndpoint {
 
 fn parse_proxy_uri(uri: &str) -> Result<ProxyEndpoint, String> {
     let url = url::Url::parse(uri)
-        .map_err(|_| "The desktop proxy settings contain an invalid proxy URI.".to_string())?;
+        .map_err(|_| t!("The desktop proxy settings contain an invalid proxy URI.").to_string())?;
     let protocol = match url.scheme() {
         "http" => ProxyProtocol::Http,
         "https" => ProxyProtocol::Https,
@@ -807,7 +995,7 @@ fn parse_proxy_uri(uri: &str) -> Result<ProxyEndpoint, String> {
     };
     let host = url
         .host_str()
-        .ok_or_else(|| "The desktop proxy URI has no host.".to_string())?
+        .ok_or_else(|| t!("The desktop proxy URI has no host.").to_string())?
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_string();
@@ -818,7 +1006,7 @@ fn parse_proxy_uri(uri: &str) -> Result<ProxyEndpoint, String> {
     };
     let port = url.port().unwrap_or(default_port);
     if port == 0 {
-        return Err("The desktop proxy URI uses port 0.".to_string());
+        return Err(t!("The desktop proxy URI uses port 0.").to_string());
     }
     Ok(ProxyEndpoint {
         protocol,
@@ -847,22 +1035,25 @@ pub fn test_proxy_connection(proxy: &ProxySettings) -> Result<String, String> {
                 .next()
                 .transpose()?;
             match endpoint {
-                Some(endpoint) => Ok(format!(
-                    "{} Resolved from the desktop system proxy settings.",
-                    probe_endpoint(&endpoint)?
+                Some(endpoint) => Ok(tr!(
+                    "{result} Resolved from the desktop system proxy settings.",
+                    result = probe_endpoint(&endpoint)?
                 )),
                 None => {
                     direct_probe()?;
-                    Ok(
+                    Ok(t!(
                         "Connected directly to web.whatsapp.com:443. The desktop has no system proxy configured."
-                            .to_string(),
                     )
+                    .to_string())
                 }
             }
         }
         ProxyMode::NoProxy => {
             direct_probe()?;
-            Ok("Connected directly to web.whatsapp.com:443. No proxy is configured.".to_string())
+            Ok(
+                t!("Connected directly to web.whatsapp.com:443. No proxy is configured.")
+                    .to_string(),
+            )
         }
         ProxyMode::Manual => probe_endpoint(&proxy.manual.endpoint()?),
     }
@@ -874,7 +1065,12 @@ fn system_proxy_uris() -> Result<Vec<String>, String> {
     let resolver = gtk::gio::ProxyResolver::default();
     let uris = resolver
         .lookup("https://web.whatsapp.com", gtk::gio::Cancellable::NONE)
-        .map_err(|error| format!("Could not read the desktop proxy settings: {error}"))?;
+        .map_err(|error| {
+            tr!(
+                "Could not read the desktop proxy settings: {error}",
+                error = error
+            )
+        })?;
     Ok(uris.iter().map(ToString::to_string).collect())
 }
 
@@ -882,23 +1078,23 @@ fn probe_endpoint(endpoint: &ProxyEndpoint) -> Result<String, String> {
     match endpoint.protocol {
         ProxyProtocol::Http => {
             http_connect_probe(endpoint)?;
-            Ok(format!(
-                "The HTTP proxy at {} accepted a CONNECT tunnel to web.whatsapp.com:443.",
-                endpoint.redacted_label()
+            Ok(tr!(
+                "The HTTP proxy at {endpoint} accepted a CONNECT tunnel to web.whatsapp.com:443.",
+                endpoint = endpoint.redacted_label()
             ))
         }
         ProxyProtocol::Https => {
-            tcp_connect(&endpoint.host, endpoint.port, "the HTTPS proxy")?;
-            Ok(format!(
-                "The HTTPS proxy at {} is reachable. The test stops before the TLS handshake; opening an account verifies the full connection.",
-                endpoint.redacted_label()
+            tcp_connect(&endpoint.host, endpoint.port, t!("the HTTPS proxy"))?;
+            Ok(tr!(
+                "The HTTPS proxy at {endpoint} is reachable. The test stops before the TLS handshake; opening an account verifies the full connection.",
+                endpoint = endpoint.redacted_label()
             ))
         }
         ProxyProtocol::Socks => {
             socks5_probe(endpoint)?;
-            Ok(format!(
-                "The SOCKS proxy at {} connected to web.whatsapp.com:443.",
-                endpoint.redacted_label()
+            Ok(tr!(
+                "The SOCKS proxy at {endpoint} connected to web.whatsapp.com:443.",
+                endpoint = endpoint.redacted_label()
             ))
         }
     }
@@ -911,9 +1107,14 @@ fn direct_probe() -> Result<(), String> {
 
 fn tcp_connect(host: &str, port: u16, label: &str) -> Result<TcpStream, String> {
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("Could not resolve {label} ({host}): {error}"))?;
+    let addresses = (host, port).to_socket_addrs().map_err(|error| {
+        tr!(
+            "Could not resolve {label} ({host}): {error}",
+            label = label,
+            host = host,
+            error = error
+        )
+    })?;
     let mut last_error = None;
     for address in addresses {
         match TcpStream::connect_timeout(&address, PROXY_TEST_TIMEOUT) {
@@ -925,16 +1126,19 @@ fn tcp_connect(host: &str, port: u16, label: &str) -> Result<TcpStream, String> 
             Err(error) => last_error = Some(error),
         }
     }
-    Err(format!(
-        "Could not reach {label} at {host}:{port}: {}",
-        last_error
+    Err(tr!(
+        "Could not reach {label} at {host}:{port}: {error}",
+        label = label,
+        host = host,
+        port = port,
+        error = last_error
             .map(|error| error.to_string())
-            .unwrap_or_else(|| "no address was returned".to_string())
+            .unwrap_or_else(|| t!("no address was returned").to_string())
     ))
 }
 
 fn http_connect_probe(endpoint: &ProxyEndpoint) -> Result<(), String> {
-    let mut stream = tcp_connect(&endpoint.host, endpoint.port, "the HTTP proxy")?;
+    let mut stream = tcp_connect(&endpoint.host, endpoint.port, t!("the HTTP proxy"))?;
     let mut request = format!(
         "CONNECT {PROXY_TEST_HOST}:{PROXY_TEST_PORT} HTTP/1.1\r\nHost: {PROXY_TEST_HOST}:{PROXY_TEST_PORT}\r\nProxy-Connection: keep-alive\r\n"
     );
@@ -946,16 +1150,22 @@ fn http_connect_probe(endpoint: &ProxyEndpoint) -> Result<(), String> {
         ));
     }
     request.push_str("\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("Could not send the CONNECT request to the proxy: {error}"))?;
+    stream.write_all(request.as_bytes()).map_err(|error| {
+        tr!(
+            "Could not send the CONNECT request to the proxy: {error}",
+            error = error
+        )
+    })?;
 
     let mut response = Vec::with_capacity(1024);
     let mut buffer = [0u8; 512];
     while response.len() < 8192 {
-        let read = stream
-            .read(&mut buffer)
-            .map_err(|error| format!("The proxy did not answer the CONNECT request: {error}"))?;
+        let read = stream.read(&mut buffer).map_err(|error| {
+            tr!(
+                "The proxy did not answer the CONNECT request: {error}",
+                error = error
+            )
+        })?;
         if read == 0 {
             break;
         }
@@ -965,15 +1175,16 @@ fn http_connect_probe(endpoint: &ProxyEndpoint) -> Result<(), String> {
         }
     }
     let status = parse_http_status(&response)
-        .ok_or_else(|| "The proxy returned an unexpected response to CONNECT.".to_string())?;
+        .ok_or_else(|| t!("The proxy returned an unexpected response to CONNECT.").to_string())?;
     match status {
         200..=299 => Ok(()),
         407 if endpoint.username.is_empty() => {
-            Err("The proxy requires a username and password (HTTP 407).".to_string())
+            Err(t!("The proxy requires a username and password (HTTP 407).").to_string())
         }
-        407 => Err("The proxy rejected the credentials (HTTP 407).".to_string()),
-        _ => Err(format!(
-            "The proxy returned HTTP {status} while opening the tunnel to web.whatsapp.com."
+        407 => Err(t!("The proxy rejected the credentials (HTTP 407).").to_string()),
+        _ => Err(tr!(
+            "The proxy returned HTTP {status} while opening the tunnel to web.whatsapp.com.",
+            status = status
         )),
     }
 }
@@ -1013,7 +1224,7 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 fn socks5_probe(endpoint: &ProxyEndpoint) -> Result<(), String> {
-    let mut stream = tcp_connect(&endpoint.host, endpoint.port, "the SOCKS proxy")?;
+    let mut stream = tcp_connect(&endpoint.host, endpoint.port, t!("the SOCKS proxy"))?;
     let has_credentials = !endpoint.username.is_empty();
     let mut greeting = vec![0x05];
     if has_credentials {
@@ -1021,15 +1232,18 @@ fn socks5_probe(endpoint: &ProxyEndpoint) -> Result<(), String> {
     } else {
         greeting.push(0x00);
     }
-    stream
-        .write_all(&greeting)
-        .map_err(|error| format!("Could not start the SOCKS negotiation: {error}"))?;
+    stream.write_all(&greeting).map_err(|error| {
+        tr!(
+            "Could not start the SOCKS negotiation: {error}",
+            error = error
+        )
+    })?;
     let mut selection = [0u8; 2];
     stream
         .read_exact(&mut selection)
-        .map_err(|error| format!("The SOCKS proxy did not answer: {error}"))?;
+        .map_err(|error| tr!("The SOCKS proxy did not answer: {error}", error = error))?;
     if selection[0] != 0x05 {
-        return Err("The proxy did not speak SOCKS5.".to_string());
+        return Err(t!("The proxy did not speak SOCKS5.").to_string());
     }
     match selection[1] {
         0x00 => {}
@@ -1038,49 +1252,65 @@ fn socks5_probe(endpoint: &ProxyEndpoint) -> Result<(), String> {
             let password = endpoint.password.as_bytes();
             if username.len() > 255 || password.len() > 255 {
                 return Err(
-                    "The SOCKS username and password must each be at most 255 bytes.".to_string(),
+                    t!("The SOCKS username and password must each be at most 255 bytes.")
+                        .to_string(),
                 );
             }
             let mut auth = vec![0x01, username.len() as u8];
             auth.extend_from_slice(username);
             auth.push(password.len() as u8);
             auth.extend_from_slice(password);
-            stream
-                .write_all(&auth)
-                .map_err(|error| format!("Could not authenticate with the SOCKS proxy: {error}"))?;
+            stream.write_all(&auth).map_err(|error| {
+                tr!(
+                    "Could not authenticate with the SOCKS proxy: {error}",
+                    error = error
+                )
+            })?;
             let mut reply = [0u8; 2];
-            stream
-                .read_exact(&mut reply)
-                .map_err(|error| format!("The SOCKS proxy did not answer the login: {error}"))?;
+            stream.read_exact(&mut reply).map_err(|error| {
+                tr!(
+                    "The SOCKS proxy did not answer the login: {error}",
+                    error = error
+                )
+            })?;
             if reply[1] != 0x00 {
-                return Err("The SOCKS proxy rejected the username or password.".to_string());
+                return Err(t!("The SOCKS proxy rejected the username or password.").to_string());
             }
         }
         0xff => {
-            return Err("The SOCKS proxy rejected the offered authentication methods.".to_string());
+            return Err(
+                t!("The SOCKS proxy rejected the offered authentication methods.").to_string(),
+            );
         }
         _ if has_credentials => {
             return Err(
-                "The SOCKS proxy did not accept username and password authentication.".to_string(),
+                t!("The SOCKS proxy did not accept username and password authentication.")
+                    .to_string(),
             );
         }
-        _ => return Err("The SOCKS proxy requires authentication.".to_string()),
+        _ => return Err(t!("The SOCKS proxy requires authentication.").to_string()),
     }
 
     let host = PROXY_TEST_HOST.as_bytes();
     let mut request = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
     request.extend_from_slice(host);
     request.extend_from_slice(&PROXY_TEST_PORT.to_be_bytes());
-    stream
-        .write_all(&request)
-        .map_err(|error| format!("Could not send the SOCKS CONNECT request: {error}"))?;
+    stream.write_all(&request).map_err(|error| {
+        tr!(
+            "Could not send the SOCKS CONNECT request: {error}",
+            error = error
+        )
+    })?;
 
     let mut header = [0u8; 4];
-    stream
-        .read_exact(&mut header)
-        .map_err(|error| format!("The SOCKS proxy did not answer CONNECT: {error}"))?;
+    stream.read_exact(&mut header).map_err(|error| {
+        tr!(
+            "The SOCKS proxy did not answer CONNECT: {error}",
+            error = error
+        )
+    })?;
     if header[0] != 0x05 {
-        return Err("The proxy did not speak SOCKS5.".to_string());
+        return Err(t!("The proxy did not speak SOCKS5.").to_string());
     }
     if header[1] != 0x00 {
         return Err(socks_error(header[1]));
@@ -1092,31 +1322,33 @@ fn socks5_probe(endpoint: &ProxyEndpoint) -> Result<(), String> {
             let mut length = [0u8; 1];
             stream
                 .read_exact(&mut length)
-                .map_err(|error| format!("Could not read the SOCKS address: {error}"))?;
+                .map_err(|error| tr!("Could not read the SOCKS address: {error}", error = error))?;
             usize::from(length[0])
         }
-        _ => return Err("The SOCKS proxy returned an unknown address type.".to_string()),
+        _ => {
+            return Err(t!("The SOCKS proxy returned an unknown address type.").to_string());
+        }
     };
     let mut address_and_port = vec![0u8; address_length + 2];
     stream
         .read_exact(&mut address_and_port)
-        .map_err(|error| format!("Could not read the SOCKS reply: {error}"))?;
+        .map_err(|error| tr!("Could not read the SOCKS reply: {error}", error = error))?;
     Ok(())
 }
 
 fn socks_error(code: u8) -> String {
-    let message = match code {
-        0x01 => "The SOCKS proxy reported a general failure.",
-        0x02 => "The SOCKS proxy denied the connection.",
-        0x03 => "The SOCKS proxy could not reach the network.",
-        0x04 => "The SOCKS proxy could not reach web.whatsapp.com.",
-        0x05 => "The SOCKS proxy refused the connection to web.whatsapp.com.",
-        0x06 => "The SOCKS proxy connection timed out.",
-        0x07 => "The SOCKS proxy does not support CONNECT.",
-        0x08 => "The SOCKS proxy does not support this address type.",
-        _ => "The SOCKS proxy returned an unknown error.",
-    };
-    message.to_string()
+    match code {
+        0x01 => t!("The SOCKS proxy reported a general failure."),
+        0x02 => t!("The SOCKS proxy denied the connection."),
+        0x03 => t!("The SOCKS proxy could not reach the network."),
+        0x04 => t!("The SOCKS proxy could not reach web.whatsapp.com."),
+        0x05 => t!("The SOCKS proxy refused the connection to web.whatsapp.com."),
+        0x06 => t!("The SOCKS proxy connection timed out."),
+        0x07 => t!("The SOCKS proxy does not support CONNECT."),
+        0x08 => t!("The SOCKS proxy does not support this address type."),
+        _ => t!("The SOCKS proxy returned an unknown error."),
+    }
+    .to_string()
 }
 
 /// Converts GLib locale names such as `es_AR.UTF-8` into the `lang_COUNTRY`
@@ -1167,9 +1399,9 @@ pub enum DoNotDisturbMode {
 impl DoNotDisturbMode {
     pub fn label(self) -> &'static str {
         match self {
-            DoNotDisturbMode::Off => "Off",
-            DoNotDisturbMode::On => "On",
-            DoNotDisturbMode::Scheduled => "Scheduled",
+            DoNotDisturbMode::Off => t!("Off"),
+            DoNotDisturbMode::On => t!("On"),
+            DoNotDisturbMode::Scheduled => t!("Scheduled"),
         }
     }
 }
@@ -1289,23 +1521,28 @@ impl QuietHours {
 
     pub fn days_label(&self) -> String {
         if self.days == EVERY_DAY {
-            return "every day".to_string();
+            return t!("every day").to_string();
         }
         if self.days == WEEKDAYS {
-            return "weekdays".to_string();
+            return t!("weekdays").to_string();
         }
         if self.days == WEEKENDS {
-            return "weekends".to_string();
+            return t!("weekends").to_string();
         }
+        let names = if crate::i18n::active_language() == crate::i18n::Language::Spanish {
+            ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+        } else {
+            WEEKDAY_NAMES
+        };
         let selected: Vec<&str> = self
             .days
             .iter()
             .enumerate()
             .filter(|(_, selected)| **selected)
-            .map(|(index, _)| WEEKDAY_NAMES[index])
+            .map(|(index, _)| names[index])
             .collect();
         if selected.is_empty() {
-            "no days".to_string()
+            t!("no days").to_string()
         } else {
             selected.join(", ")
         }
@@ -1425,38 +1662,39 @@ impl DoNotDisturbSettings {
 
     pub fn status_text(&self, now: SystemTime) -> String {
         match self.mode {
-            DoNotDisturbMode::Off => "Off".to_string(),
+            DoNotDisturbMode::Off => t!("Off").to_string(),
             DoNotDisturbMode::On => match self.until_time() {
-                None => "On until you turn it off".to_string(),
-                Some(until) if until > now => format!(
-                    "On until {} ({})",
-                    format_local_point(until, now),
-                    format_remaining(until, now)
+                None => t!("On until you turn it off").to_string(),
+                Some(until) if until > now => tr!(
+                    "On until {point} ({remaining})",
+                    point = format_local_point(until, now),
+                    remaining = format_remaining(until, now)
                 ),
-                Some(_) => "Off".to_string(),
+                Some(_) => t!("Off").to_string(),
             },
             DoNotDisturbMode::Scheduled => {
                 if let Some(until) = self.override_time().filter(|until| *until > now) {
-                    return format!(
-                        "Quiet hours skipped until {}",
-                        format_local_point(until, now)
+                    return tr!(
+                        "Quiet hours skipped until {point}",
+                        point = format_local_point(until, now)
                     );
                 }
                 if self.schedule.is_quiet_at(now) {
                     return match self.schedule.next_end(now) {
-                        Some(end) => format!(
-                            "Quiet hours until {} ({})",
-                            format_local_point(end, now),
-                            format_remaining(end, now)
+                        Some(end) => tr!(
+                            "Quiet hours until {point} ({remaining})",
+                            point = format_local_point(end, now),
+                            remaining = format_remaining(end, now)
                         ),
-                        None => "Quiet hours on".to_string(),
+                        None => t!("Quiet hours on").to_string(),
                     };
                 }
                 match self.schedule.next_start(now) {
-                    Some(start) => {
-                        format!("Quiet hours from {}", format_local_point(start, now))
-                    }
-                    None => "Quiet hours have no active days".to_string(),
+                    Some(start) => tr!(
+                        "Quiet hours from {point}",
+                        point = format_local_point(start, now)
+                    ),
+                    None => t!("Quiet hours have no active days").to_string(),
                 }
             }
         }
@@ -1464,10 +1702,10 @@ impl DoNotDisturbSettings {
 
     pub fn summary(&self) -> String {
         match self.mode {
-            DoNotDisturbMode::Off => "off".to_string(),
-            DoNotDisturbMode::On => "on until turned off".to_string(),
+            DoNotDisturbMode::Off => t!("off").to_string(),
+            DoNotDisturbMode::On => t!("on until turned off").to_string(),
             DoNotDisturbMode::Scheduled => {
-                format!("quiet hours {}", self.schedule.summary())
+                tr!("quiet hours {schedule}", schedule = self.schedule.summary())
             }
         }
     }
@@ -1730,9 +1968,16 @@ fn format_local_point(target: SystemTime, now: SystemTime) -> String {
         return time;
     }
     if target.day_number == now.day_number + 1 {
-        return format!("tomorrow {time}");
+        return tr!("tomorrow {time}", time = time);
     }
-    let month = MONTH_NAMES
+    let months = if crate::i18n::active_language() == crate::i18n::Language::Spanish {
+        [
+            "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic",
+        ]
+    } else {
+        MONTH_NAMES
+    };
+    let month = months
         .get(target.month.saturating_sub(1) as usize)
         .copied()
         .unwrap_or("?");
@@ -1746,26 +1991,26 @@ fn format_local_point(target: SystemTime, now: SystemTime) -> String {
 fn format_remaining(target: SystemTime, now: SystemTime) -> String {
     let seconds = target.duration_since(now).unwrap_or_default().as_secs();
     if seconds < 60 {
-        return "less than 1m left".to_string();
+        return t!("less than 1m left").to_string();
     }
     let minutes = seconds / 60;
     if minutes < 60 {
-        return format!("{minutes}m left");
+        return tr!("{minutes}m left", minutes = minutes);
     }
     let hours = minutes / 60;
     let minutes = minutes % 60;
     if hours < 24 {
         if minutes == 0 {
-            return format!("{hours}h left");
+            return tr!("{hours}h left", hours = hours);
         }
-        return format!("{hours}h {minutes}m left");
+        return tr!("{hours}h {minutes}m left", hours = hours, minutes = minutes);
     }
     let days = hours / 24;
     let hours = hours % 24;
     if hours == 0 {
-        format!("{days}d left")
+        tr!("{days}d left", days = days)
     } else {
-        format!("{days}d {hours}h left")
+        tr!("{days}d {hours}h left", days = days, hours = hours)
     }
 }
 
@@ -1797,6 +2042,9 @@ pub struct Settings {
     pub remember_bounds: bool,
     pub shortcut: String,
     pub boss_key: String,
+    /// Interface language of the native shell. WhatsApp Web content keeps its
+    /// own language and is never translated by OxideZap.
+    pub language: crate::i18n::Language,
     /// Optional global shortcut that opens the command palette. Empty means the
     /// palette is only reachable from inside the native window.
     pub command_palette_shortcut: String,
@@ -1804,6 +2052,9 @@ pub struct Settings {
     pub writing: WritingSettings,
     pub network: NetworkSettings,
     pub memory: MemorySettings,
+    /// Battery saver and automatic power-source detection. Older files without
+    /// this field deserialize to `Normal`, preserving their behavior.
+    pub performance: performance::PerformanceSettings,
     /// Experimental WhatsApp Web CSS. Missing fields in older settings files
     /// fall back to the disabled default.
     pub appearance: AppearanceSettings,
@@ -1839,11 +2090,13 @@ impl Default for Settings {
             remember_bounds: true,
             shortcut: DEFAULT_SHORTCUT.to_string(),
             boss_key: DEFAULT_BOSS_KEY.to_string(),
+            language: crate::i18n::Language::System,
             command_palette_shortcut: String::new(),
             lock: LockSettings::default(),
             writing: WritingSettings::default(),
             network: NetworkSettings::default(),
             memory: MemorySettings::default(),
+            performance: performance::PerformanceSettings::default(),
             appearance: AppearanceSettings::default(),
             onboarding_completed: false,
             onboarding_version: 0,
@@ -1947,6 +2200,9 @@ impl Settings {
                 .map(|path| path.to_string_lossy().to_string());
         }
         self.ensure_first_account();
+        for account in &mut self.accounts {
+            account.normalize_bounds();
+        }
         if self
             .active_account
             .as_ref()
@@ -2181,22 +2437,32 @@ impl SettingsExport {
     pub fn from_bytes(bytes: &[u8]) -> Result<Settings> {
         if bytes.len() as u64 > MAX_IMPORT_BYTES {
             bail!(
-                "settings export is too large ({} bytes; the limit is {} bytes)",
-                bytes.len(),
-                MAX_IMPORT_BYTES
+                "{}",
+                tr!(
+                    "The settings export is too large ({bytes} bytes; the limit is {limit} bytes).",
+                    bytes = bytes.len(),
+                    limit = MAX_IMPORT_BYTES
+                )
             );
         }
-        let export: Self = serde_json::from_slice(bytes)
-            .context("the file is not a valid OxideZap settings export")?;
+        let export: Self = serde_json::from_slice(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "{}",
+                t!("The file is not a valid OxideZap settings export.")
+            )
+        })?;
         export.into_settings()
     }
 
     fn into_settings(self) -> Result<Settings> {
         if self.version != SETTINGS_EXPORT_VERSION {
             bail!(
-                "unsupported settings export version {}; this build supports version {}",
-                self.version,
-                SETTINGS_EXPORT_VERSION
+                "{}",
+                tr!(
+                    "Unsupported settings export version {version}; this build supports version {supported}.",
+                    version = self.version,
+                    supported = SETTINGS_EXPORT_VERSION
+                )
             );
         }
         let mut settings = self.settings;
@@ -2258,6 +2524,9 @@ fn exportable_settings(settings: &Settings) -> Settings {
         account.unread = 0;
         account.bounds = None;
         account.maximized = false;
+        account.normal_bounds = None;
+        account.mini_bounds = None;
+        account.bounds_by_monitor.clear();
     }
     settings.normalize();
     settings
@@ -2281,135 +2550,174 @@ impl ImportPreview {
     /// Reads an export from disk, rejecting files larger than
     /// `MAX_IMPORT_BYTES` before they are allocated or parsed.
     pub fn from_path(path: &Path, current: &Settings) -> Result<Self> {
-        let metadata =
-            fs::metadata(path).with_context(|| format!("could not inspect {}", path.display()))?;
+        let metadata = fs::metadata(path).map_err(|error| {
+            anyhow::anyhow!(
+                "{}",
+                tr!(
+                    "Could not inspect {path}: {error}",
+                    path = path.display(),
+                    error = error
+                )
+            )
+        })?;
         if metadata.len() > MAX_IMPORT_BYTES {
             bail!(
-                "settings export is too large ({} bytes; the limit is {} bytes)",
-                metadata.len(),
-                MAX_IMPORT_BYTES
+                "{}",
+                tr!(
+                    "The settings export is too large ({bytes} bytes; the limit is {limit} bytes).",
+                    bytes = metadata.len(),
+                    limit = MAX_IMPORT_BYTES
+                )
             );
         }
-        let data = fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
+        let data = fs::read(path).map_err(|error| {
+            anyhow::anyhow!(
+                "{}",
+                tr!(
+                    "Could not read {path}: {error}",
+                    path = path.display(),
+                    error = error
+                )
+            )
+        })?;
         Self::from_bytes(&data, current)
     }
 }
 
 fn describe_changes(current: &Settings, imported: &Settings) -> Vec<String> {
     let mut changes = Vec::new();
+    if current.language != imported.language {
+        changes.push(tr!(
+            "Interface language: {from} -> {to}",
+            from = current.language.label(),
+            to = imported.language.label()
+        ));
+    }
     if current.theme != imported.theme {
-        changes.push(format!(
-            "Theme: {} -> {}",
-            current.theme.label(),
-            imported.theme.label()
+        changes.push(tr!(
+            "Theme: {from} -> {to}",
+            from = current.theme.label(),
+            to = imported.theme.label()
         ));
     }
     if (current.zoom - imported.zoom).abs() >= 0.001 {
-        changes.push(format!(
-            "Zoom: {}% -> {}%",
-            percent(current.zoom),
-            percent(imported.zoom)
+        changes.push(tr!(
+            "Zoom: {from}% -> {to}%",
+            from = percent(current.zoom),
+            to = percent(imported.zoom)
         ));
     }
     if current.appearance != imported.appearance {
-        changes.push(format!(
-            "Experimental CSS: {} (custom CSS is never imported)",
-            on_off(imported.appearance.experimental_css)
+        changes.push(tr!(
+            "Experimental CSS: {state} (custom CSS is never imported)",
+            state = on_off(imported.appearance.experimental_css)
         ));
     }
     if current.notifications != imported.notifications {
-        changes.push(format!(
-            "Desktop notifications: {}",
-            on_off(imported.notifications)
+        changes.push(tr!(
+            "Desktop notifications: {state}",
+            state = on_off(imported.notifications)
         ));
     }
     if current.connection_notifications != imported.connection_notifications {
-        changes.push(format!(
-            "Connection notifications: {}",
-            on_off(imported.connection_notifications)
+        changes.push(tr!(
+            "Connection notifications: {state}",
+            state = on_off(imported.connection_notifications)
         ));
     }
     if current.do_not_disturb.summary() != imported.do_not_disturb.summary() {
-        changes.push(format!(
-            "Do not disturb: {}",
-            imported.do_not_disturb.summary()
+        changes.push(tr!(
+            "Do not disturb: {state}",
+            state = imported.do_not_disturb.summary()
         ));
     }
     if current.close_to_tray != imported.close_to_tray {
-        changes.push(format!("Close to tray: {}", on_off(imported.close_to_tray)));
+        changes.push(tr!(
+            "Close to tray: {state}",
+            state = on_off(imported.close_to_tray)
+        ));
     }
     if current.start_at_login != imported.start_at_login {
-        changes.push(format!(
-            "Launch at login: {}",
-            on_off(imported.start_at_login)
+        changes.push(tr!(
+            "Launch at login: {state}",
+            state = on_off(imported.start_at_login)
         ));
     }
     if current.remember_bounds != imported.remember_bounds {
-        changes.push(format!(
-            "Remember window bounds: {}",
-            on_off(imported.remember_bounds)
+        changes.push(tr!(
+            "Remember window bounds: {state}",
+            state = on_off(imported.remember_bounds)
         ));
     }
     if current.media_actions != imported.media_actions {
-        changes.push(format!(
-            "Media action menu: {}",
-            on_off(imported.media_actions)
+        changes.push(tr!(
+            "Media action menu: {state}",
+            state = on_off(imported.media_actions)
         ));
     }
     if current.shortcut != imported.shortcut {
-        changes.push(format!(
-            "Global shortcut: {} -> {}",
-            current.shortcut, imported.shortcut
+        changes.push(tr!(
+            "Global shortcut: {from} -> {to}",
+            from = current.shortcut,
+            to = imported.shortcut
         ));
     }
     if current.boss_key != imported.boss_key {
-        changes.push(format!(
-            "Boss key: {} -> {}",
-            current.boss_key, imported.boss_key
+        changes.push(tr!(
+            "Boss key: {from} -> {to}",
+            from = current.boss_key,
+            to = imported.boss_key
         ));
     }
     if current.command_palette_shortcut != imported.command_palette_shortcut {
-        changes.push(format!(
-            "Command palette shortcut: {} -> {}",
-            optional_shortcut(&current.command_palette_shortcut),
-            optional_shortcut(&imported.command_palette_shortcut)
+        changes.push(tr!(
+            "Command palette shortcut: {from} -> {to}",
+            from = optional_shortcut(&current.command_palette_shortcut),
+            to = optional_shortcut(&imported.command_palette_shortcut)
         ));
     }
     if current.memory != imported.memory {
-        changes.push(format!(
-            "Low-memory mode: {}",
-            if imported.memory.suspend_hidden {
-                format!(
-                    "release hidden accounts after {} min",
-                    imported.memory.suspend_after_minutes
+        changes.push(tr!(
+            "Low-memory mode: {state}",
+            state = if imported.memory.suspend_hidden {
+                tr!(
+                    "release hidden accounts after {minutes} min",
+                    minutes = imported.memory.suspend_after_minutes
                 )
             } else {
-                "off".to_string()
+                t!("off").to_string()
             }
         ));
     }
+    if current.performance != imported.performance {
+        changes.push(tr!(
+            "Performance mode: {from} -> {to}",
+            from = current.performance.mode.label(),
+            to = imported.performance.mode.label()
+        ));
+    }
     if current.network.proxy.redacted_summary() != imported.network.proxy.redacted_summary() {
-        changes.push(format!(
-            "Network proxy: {} -> {}",
-            current.network.proxy.redacted_summary(),
-            imported.network.proxy.redacted_summary()
+        changes.push(tr!(
+            "Network proxy: {from} -> {to}",
+            from = current.network.proxy.redacted_summary(),
+            to = imported.network.proxy.redacted_summary()
         ));
     } else if current.network.proxy.manual.username != imported.network.proxy.manual.username
         || current.network.proxy.manual.password != imported.network.proxy.manual.password
     {
-        changes.push("Network proxy credentials: removed".to_string());
+        changes.push(t!("Network proxy credentials: removed").to_string());
     }
     let current_accounts = account_names(current);
     let imported_accounts = account_names(imported);
     if current_accounts != imported_accounts {
-        changes.push(format!(
-            "Accounts: {} -> {}",
-            account_list(&current_accounts),
-            account_list(&imported_accounts)
+        changes.push(tr!(
+            "Accounts: {from} -> {to}",
+            from = account_list(&current_accounts),
+            to = account_list(&imported_accounts)
         ));
     }
     if changes.is_empty() {
-        changes.push("No preference changes.".to_string());
+        changes.push(t!("No preference changes.").to_string());
     }
     changes
 }
@@ -2419,11 +2727,11 @@ fn percent(zoom: f64) -> u32 {
 }
 
 fn on_off(value: bool) -> &'static str {
-    if value { "on" } else { "off" }
+    if value { t!("on") } else { t!("off") }
 }
 
 fn optional_shortcut(value: &str) -> &str {
-    if value.is_empty() { "off" } else { value }
+    if value.is_empty() { t!("off") } else { value }
 }
 
 fn account_names(settings: &Settings) -> Vec<String> {
@@ -3340,6 +3648,57 @@ mod tests {
         settings.save(&path).unwrap();
         let loaded = Settings::load(&path).unwrap();
         assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn interface_language_round_trips_and_invalid_values_fall_back_to_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        assert_eq!(Settings::default().language, crate::i18n::Language::System);
+
+        let settings = Settings {
+            language: crate::i18n::Language::Spanish,
+            ..Settings::default()
+        };
+        settings.save(&path).unwrap();
+        let json = fs::read_to_string(&path).unwrap();
+        assert!(json.contains("\"language\": \"spanish\""));
+        assert_eq!(
+            Settings::load(&path).unwrap().language,
+            crate::i18n::Language::Spanish
+        );
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["language"] = serde_json::Value::String("klingon".to_string());
+        let parsed: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.language, crate::i18n::Language::System);
+    }
+
+    #[test]
+    fn interface_language_is_exported_imported_and_reported() {
+        let current = Settings::default();
+        let imported = Settings {
+            language: crate::i18n::Language::Spanish,
+            ..Settings::default()
+        };
+        let json = SettingsExport::new(&imported, UNIX_EPOCH)
+            .to_json()
+            .unwrap();
+        assert!(json.contains("\"language\": \"spanish\""));
+
+        let restored = SettingsExport::from_bytes(json.as_bytes()).unwrap();
+        assert_eq!(restored.language, crate::i18n::Language::Spanish);
+
+        let preview = ImportPreview::from_bytes(json.as_bytes(), &current).unwrap();
+        assert!(
+            preview
+                .changes
+                .iter()
+                .any(|change| change.starts_with("Interface language:")),
+            "{:?}",
+            preview.changes
+        );
     }
 
     #[test]
@@ -4308,6 +4667,186 @@ mod tests {
             json_path(PathBuf::from("/tmp/settings.JSON")),
             PathBuf::from("/tmp/settings.JSON")
         );
+    }
+
+    fn monitor(key: &str, x: f32, y: f32, width: f32, height: f32) -> MonitorArea {
+        MonitorArea {
+            key: key.to_string(),
+            bounds: SavedBounds {
+                x,
+                y,
+                width,
+                height,
+            },
+        }
+    }
+
+    fn bounds(x: f32, y: f32, width: f32, height: f32) -> SavedBounds {
+        SavedBounds {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn window_mode_preferences_survive_a_round_trip() {
+        let mut account = Account::with_id("acc-1", "Work");
+        account.always_on_top = true;
+        account.mini_mode = true;
+        account.normal_bounds = Some(bounds(10.0, 20.0, 1180.0, 780.0));
+        account.mini_bounds = Some(bounds(40.0, 50.0, 420.0, 620.0));
+        let settings = Settings {
+            accounts: vec![account],
+            active_account: Some("acc-1".to_string()),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+
+        let restored: Settings = serde_json::from_str(&json).unwrap();
+
+        assert!(restored.accounts[0].always_on_top);
+        assert!(restored.accounts[0].mini_mode);
+        assert_eq!(
+            restored.accounts[0].normal_bounds,
+            Some(bounds(10.0, 20.0, 1180.0, 780.0))
+        );
+        assert_eq!(
+            restored.accounts[0].mini_bounds,
+            Some(bounds(40.0, 50.0, 420.0, 620.0))
+        );
+    }
+
+    #[test]
+    fn legacy_settings_default_the_new_window_mode_fields() {
+        let json = br#"{"version":1,"accounts":[{"id":"a","name":"A"}],"active_account":"a"}"#;
+
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+
+        assert!(!settings.accounts[0].always_on_top);
+        assert!(!settings.accounts[0].mini_mode);
+        assert!(settings.accounts[0].normal_bounds.is_none());
+        assert!(settings.accounts[0].bounds_by_monitor.is_empty());
+    }
+
+    #[test]
+    fn bounds_restore_on_the_monitor_that_contained_them() {
+        let monitors = [
+            monitor("left", 0.0, 0.0, 1920.0, 1080.0),
+            monitor("right", 1920.0, 0.0, 1920.0, 1080.0),
+        ];
+        let mut account = Account::with_id("acc-1", "Work");
+        account
+            .bounds_by_monitor
+            .insert("right".to_string(), bounds(2000.0, 100.0, 900.0, 700.0));
+        account
+            .bounds_by_monitor
+            .insert("left".to_string(), bounds(100.0, 100.0, 800.0, 600.0));
+        account.bounds = Some(bounds(2000.0, 100.0, 900.0, 700.0));
+
+        let restored = restore_account_bounds(&account, &monitors, &monitors[0].bounds);
+
+        assert_eq!(restored, bounds(2000.0, 100.0, 900.0, 700.0));
+    }
+
+    #[test]
+    fn removing_a_monitor_clamps_the_saved_bounds_to_an_available_monitor() {
+        let monitors = [monitor("left", 0.0, 0.0, 1920.0, 1080.0)];
+        let mut account = Account::with_id("acc-1", "Work");
+        account
+            .bounds_by_monitor
+            .insert("right".to_string(), bounds(2000.0, 100.0, 1280.0, 800.0));
+        account.bounds = Some(bounds(2000.0, 100.0, 1280.0, 800.0));
+
+        let restored = restore_account_bounds(&account, &monitors, &monitors[0].bounds);
+
+        assert_eq!(restored, bounds(640.0, 100.0, 1280.0, 800.0));
+        assert!(restored.is_valid());
+    }
+
+    #[test]
+    fn monitor_bounds_are_recorded_for_the_monitor_under_the_window() {
+        let monitors = [
+            monitor("left", 0.0, 0.0, 1920.0, 1080.0),
+            monitor("right", 1920.0, 0.0, 1920.0, 1080.0),
+        ];
+        let mut account = Account::with_id("acc-1", "Work");
+
+        account.remember_bounds_for_monitor(&monitors, &bounds(2400.0, 80.0, 1100.0, 760.0));
+
+        assert_eq!(
+            account.bounds_by_monitor.get("right"),
+            Some(&bounds(2400.0, 80.0, 1100.0, 760.0))
+        );
+        assert!(!account.bounds_by_monitor.contains_key("left"));
+    }
+
+    #[test]
+    fn monitor_bounds_are_capped_and_pruned() {
+        let mut account = Account::with_id("acc-1", "Work");
+        for index in 0..(MAX_SAVED_MONITORS + 6) {
+            account.bounds_by_monitor.insert(
+                format!("monitor-{index}"),
+                bounds(index as f32, 0.0, 900.0, 700.0),
+            );
+        }
+        account
+            .bounds_by_monitor
+            .insert("bad".to_string(), bounds(f32::NAN, 0.0, 20.0, 20.0));
+        let mut settings = Settings {
+            accounts: vec![account],
+            active_account: Some("acc-1".to_string()),
+            ..Settings::default()
+        };
+
+        settings.normalize();
+
+        assert_eq!(
+            settings.accounts[0].bounds_by_monitor.len(),
+            MAX_SAVED_MONITORS
+        );
+        assert!(!settings.accounts[0].bounds_by_monitor.contains_key("bad"));
+    }
+
+    #[test]
+    fn export_keeps_window_modes_but_scrubs_monitor_bounds() {
+        let mut account = Account::with_id("acc-1", "Work");
+        account.always_on_top = true;
+        account.mini_mode = true;
+        account.normal_bounds = Some(bounds(10.0, 20.0, 1180.0, 780.0));
+        account.mini_bounds = Some(bounds(40.0, 50.0, 420.0, 620.0));
+        account
+            .bounds_by_monitor
+            .insert("left".to_string(), bounds(10.0, 20.0, 1180.0, 780.0));
+        account.bounds = Some(bounds(10.0, 20.0, 1180.0, 780.0));
+        let settings = Settings {
+            accounts: vec![account],
+            active_account: Some("acc-1".to_string()),
+            ..Settings::default()
+        };
+
+        let export = SettingsExport::new(&settings, UNIX_EPOCH);
+        let json = export.to_json().unwrap();
+        let restored = SettingsExport::from_bytes(json.as_bytes()).unwrap();
+
+        assert!(json.contains("always_on_top"));
+        assert!(json.contains("mini_mode"));
+        assert!(!json.contains("normal_bounds"));
+        assert!(!json.contains("bounds_by_monitor"));
+        assert!(restored.accounts[0].always_on_top);
+        assert!(restored.accounts[0].mini_mode);
+        assert!(restored.accounts[0].normal_bounds.is_none());
+        assert!(restored.accounts[0].mini_bounds.is_none());
+        assert!(restored.accounts[0].bounds_by_monitor.is_empty());
+    }
+
+    #[test]
+    fn mini_bounds_allow_smaller_windows_than_normal_bounds() {
+        let mini = bounds(0.0, 0.0, 420.0, 620.0);
+        assert!(mini.is_usable());
+        assert!(!mini.is_valid());
+        assert!(!bounds(0.0, 0.0, 200.0, 200.0).is_usable());
     }
 
     #[cfg(unix)]

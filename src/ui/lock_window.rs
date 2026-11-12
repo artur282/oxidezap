@@ -21,7 +21,7 @@ impl LockWindow {
     pub fn new(model: Entity<AppModel>, cx: &mut Context<Self>) -> Self {
         let weak = cx.weak_entity();
         let password_field = cx.new(|cx| {
-            TextField::new("Password", cx)
+            TextField::new(t!("Password"), cx)
                 .masked(true)
                 .on_enter(move |window, cx| {
                     let _ = weak.update(cx, |view, cx| view.submit(window, cx));
@@ -44,7 +44,7 @@ impl LockWindow {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let password = self.password_field.read(cx).content().to_string();
         if password.is_empty() {
-            self.error = Some("Enter your password.".to_string());
+            self.error = Some(t!("Enter your password.").to_string());
             cx.notify();
             return;
         }
@@ -54,7 +54,7 @@ impl LockWindow {
         if unlocked {
             self.error = None;
         } else {
-            self.error = Some("Incorrect password.".to_string());
+            self.error = Some(t!("Incorrect password.").to_string());
             self.password_field.update(cx, |field, cx| field.clear(cx));
             let focus = self.password_field.read(cx).focus_handle(cx);
             window.focus(&focus);
@@ -78,6 +78,7 @@ impl Render for LockWindow {
         if window.focused(cx).is_none() {
             window.focus(&self.focus_handle);
         }
+        window.set_window_title(t!("Welcome to OxideZap"));
 
         // The theme is resolved from the window appearance on every render, so a
         // repaint is enough when the system appearance changes. Register once per
@@ -129,14 +130,16 @@ impl Render for LockWindow {
                                             .text_size(px(18.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
-                                            .child("OxideZap is locked"),
+                                            .child(t!("OxideZap is locked")),
                                     ),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
                                     .text_color(theme.text_muted)
-                                    .child("Enter your password to return to WhatsApp. Account windows stay hidden until you unlock."),
+                                    .child(t!(
+                                        "Enter your password to return to WhatsApp. Account windows stay hidden until you unlock."
+                                    )),
                             ),
                     )
                     .child(
@@ -160,7 +163,7 @@ impl Render for LockWindow {
                             .gap(px(8.))
                             .child(div().flex_1().child(button(
                                 "unlock",
-                                "Unlock",
+                                t!("Unlock"),
                                 theme,
                                 true,
                                 cx.listener(|this, _event, window, cx| {
@@ -169,7 +172,7 @@ impl Render for LockWindow {
                             )))
                             .child(button(
                                 "quit-locked",
-                                "Quit",
+                                t!("Quit"),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -178,7 +181,7 @@ impl Render for LockWindow {
                             )),
                     )
                     .child(div().text_size(px(10.)).text_color(theme.text_faint).child(
-                        "The password is stored as an Argon2id hash in your config directory.",
+                        t!("The password is stored as an Argon2id hash in your config directory."),
                     )),
             )
     }
