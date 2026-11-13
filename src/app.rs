@@ -34,10 +34,10 @@ use crate::settings::performance::{
 };
 use crate::settings::storage::{self, StorageOperation, StorageSnapshot};
 use crate::settings::{
-    Account, AppearanceSettings, DoNotDisturbSettings, LockSettings, MemorySettings, MonitorArea,
-    ONBOARDING_VERSION, ProxySettings, SETTINGS_SAVE_DEBOUNCE, SaveDebounce, SavedBounds, Settings,
-    SettingsWriter, WritingSettings, monitor_for_bounds, restore_account_bounds,
-    should_show_onboarding, validate_custom_css,
+    Account, AccountIdentity, AccountTheme, AppearanceSettings, DoNotDisturbSettings, LockSettings,
+    MemorySettings, MonitorArea, ONBOARDING_VERSION, ProxySettings, SETTINGS_SAVE_DEBOUNCE,
+    SaveDebounce, SavedBounds, Settings, SettingsWriter, WritingSettings, monitor_for_bounds,
+    restore_account_bounds, should_show_onboarding, validate_custom_css,
 };
 use crate::shortcut::Shortcut;
 use crate::single_instance::{
@@ -1214,6 +1214,7 @@ impl AppModel {
         let power = detect_power_state();
         let performance = settings.performance.resolve(power);
         gtk.set_performance(performance.battery_saver, performance.cadence());
+        gtk.set_accessibility(settings.accessibility.reduce_motion);
         Self {
             paths,
             settings,
@@ -1429,7 +1430,80 @@ impl AppModel {
     }
 
     pub fn theme(&self, window: &Window) -> Theme {
-        Theme::resolve(self.settings.theme, window.appearance())
+        Theme::resolve(
+            self.settings.theme,
+            window.appearance(),
+            &self.settings.accessibility,
+        )
+    }
+
+    /// Theme for one account window. The account override wins; otherwise the
+    /// global theme applies. Other windows keep using [`Self::theme`].
+    pub fn account_theme(&self, account_id: &str, window: &Window) -> Theme {
+        Theme::resolve(
+            self.settings.effective_theme(account_id),
+            window.appearance(),
+            &self.settings.accessibility,
+        )
+    }
+
+    pub fn account_theme_mode(&self, account_id: &str) -> crate::settings::ThemeMode {
+        self.settings.effective_theme(account_id)
+    }
+
+    pub fn account_zoom(&self, account_id: &str) -> f64 {
+        self.settings.effective_zoom(account_id)
+    }
+
+    /// Changes one account's theme override. Only that account window is
+    /// repainted; the other accounts keep their own resolved appearance.
+    pub fn set_account_theme(
+        &mut self,
+        account_id: &str,
+        theme: AccountTheme,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.settings.set_account_theme(account_id, theme) {
+            return;
+        }
+        self.save_settings(cx);
+        self.refresh_account_window(account_id, cx);
+    }
+
+    /// Changes one account's WhatsApp zoom override and pushes the resolved
+    /// zoom to that account's WebKit view only.
+    pub fn set_account_zoom(
+        &mut self,
+        account_id: &str,
+        zoom: Option<f64>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.settings.set_account_zoom(account_id, zoom) {
+            return;
+        }
+        self.gtk
+            .set_zoom(account_id, self.settings.effective_zoom(account_id));
+        self.save_settings(cx);
+        self.refresh_account_window(account_id, cx);
+    }
+
+    /// Explicit bulk action: copies one account's appearance overrides to every
+    /// other account. Sessions, unread counts, and window bounds are untouched.
+    pub fn apply_account_appearance_to_all(&mut self, account_id: &str, cx: &mut Context<Self>) {
+        if !self.settings.apply_account_appearance_to_all(account_id) {
+            return;
+        }
+        let account_ids: Vec<String> = self
+            .settings
+            .accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect();
+        for id in account_ids {
+            self.gtk.set_zoom(&id, self.settings.effective_zoom(&id));
+        }
+        self.save_settings(cx);
+        cx.refresh_windows();
     }
 
     /// Snapshot of the runtime state that appears in the diagnostics report.
@@ -1490,6 +1564,15 @@ impl AppModel {
             .account(id)
             .map(|account| account.unread)
             .unwrap_or(0)
+    }
+
+    /// The avatar label and accent shared by the titlebar, Settings, the tray,
+    /// and notifications.
+    pub fn account_identity(&self, id: &str) -> AccountIdentity {
+        self.settings
+            .account(id)
+            .map(Account::identity)
+            .unwrap_or_default()
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) {
@@ -1937,13 +2020,14 @@ impl AppModel {
                 "manual WhatsApp Web reload skipped while a download is active"
             );
             if notify::notifications_allowed(&self.settings, SystemTime::now()) {
-                notify::notify(
+                let content = self.notification_policy().system(
+                    self.locked,
                     t!("Download in progress"),
                     t!(
                         "OxideZap did not reload WhatsApp Web while a download is active. Retry when the download finishes."
                     ),
-                    Some(&self.paths.runtime_icon()),
                 );
+                notify::notify_content(content, Some(&self.paths.runtime_icon()));
             }
             self.refresh_account_window(account_id, cx);
             return;
@@ -2138,6 +2222,13 @@ impl AppModel {
         }
     }
 
+    fn notification_policy(&self) -> notify::NotificationPrivacyPolicy {
+        notify::NotificationPrivacyPolicy::new(
+            self.settings.notification_privacy,
+            self.settings.hide_notification_previews_when_locked,
+        )
+    }
+
     fn handle_gtk_event(&mut self, event: GtkEvent, cx: &mut Context<Self>) {
         match event {
             GtkEvent::Ready { account_id, xid } => {
@@ -2165,7 +2256,8 @@ impl AppModel {
                         .crash_recovery
                         .remove(&account_id)
                         .is_some_and(|recovery| recovery.failed);
-                    self.gtk.set_zoom(&account_id, self.settings.zoom);
+                    self.gtk
+                        .set_zoom(&account_id, self.settings.effective_zoom(&account_id));
                     if recovered {
                         self.gtk.show(&account_id);
                     }
@@ -2238,11 +2330,12 @@ impl AppModel {
                     tracker.on_reload_blocked();
                 }
                 if notify::notifications_allowed(&self.settings, SystemTime::now()) {
-                    notify::notify(
+                    let content = self.notification_policy().system(
+                        self.locked,
                         t!("Download in progress"),
                         t!("OxideZap did not reload WhatsApp Web while a download is active."),
-                        Some(&self.paths.runtime_icon()),
                     );
+                    notify::notify_content(content, Some(&self.paths.runtime_icon()));
                 }
                 self.refresh_account_window(&account_id, cx);
             }
@@ -2265,13 +2358,16 @@ impl AppModel {
             } => {
                 debug!(%account_id, %title, "webview notification");
                 if self.settings.message_notifications_enabled(&account_id)
-                    && !self.locked
                     && self.should_notify(&title, &body)
                 {
                     let sound = self.settings.notification_sound_enabled(&account_id);
-                    notify::notify_with_sound(
-                        &title,
-                        &body,
+                    let avatar = self.account_identity(&account_id).label;
+                    let mut content =
+                        self.notification_policy()
+                            .message(self.locked, &title, &body);
+                    content.summary = notify::account_summary(&avatar, &content.summary);
+                    notify::notify_content_with_sound(
+                        content,
                         Some(&self.paths.runtime_icon()),
                         sound,
                     );
@@ -2309,15 +2405,16 @@ impl AppModel {
                         .parent()
                         .map(|parent| parent.display().to_string())
                         .unwrap_or_else(|| self.downloads_base_dir().display().to_string());
-                    notify::notify(
+                    let content = self.notification_policy().system(
+                        self.locked,
                         t!("Downloading"),
                         &tr!(
                             "{filename}\nSaving to {folder}",
                             filename = filename,
                             folder = folder
                         ),
-                        Some(&self.paths.runtime_icon()),
                     );
+                    notify::notify_content(content, Some(&self.paths.runtime_icon()));
                 }
                 self.refresh_downloads_window(cx);
             }
@@ -2378,11 +2475,12 @@ impl AppModel {
                     format!("A download could not start: {reason}"),
                 );
                 if notify::notifications_allowed(&self.settings, SystemTime::now()) {
-                    notify::notify(
+                    let content = self.notification_policy().system(
+                        self.locked,
                         t!("Download could not start"),
                         &tr!("{filename}\n{reason}", filename = filename, reason = reason),
-                        Some(&self.paths.runtime_icon()),
                     );
+                    notify::notify_content(content, Some(&self.paths.runtime_icon()));
                 }
             }
             GtkEvent::DownloadRetryFailed { id, message } => {
@@ -2392,11 +2490,12 @@ impl AppModel {
                     format!("A download retry failed: {message}"),
                 );
                 if notify::notifications_allowed(&self.settings, SystemTime::now()) {
-                    notify::notify(
+                    let content = self.notification_policy().system(
+                        self.locked,
                         t!("Download could not be retried"),
                         &message,
-                        Some(&self.paths.runtime_icon()),
                     );
+                    notify::notify_content(content, Some(&self.paths.runtime_icon()));
                 }
             }
             GtkEvent::MediaFailed {
@@ -2409,33 +2508,36 @@ impl AppModel {
                     format!("A media action failed: {message}"),
                 );
                 if self.settings.notifications {
-                    notify::notify(
+                    let content = self.notification_policy().system(
+                        self.locked,
                         t!("Media action failed"),
                         &message,
-                        Some(&self.paths.runtime_icon()),
                     );
+                    notify::notify_content(content, Some(&self.paths.runtime_icon()));
                 }
             }
             GtkEvent::MediaCopied { account_id } => {
                 debug!(%account_id, "copied a WhatsApp image to the clipboard");
                 if self.settings.notifications {
-                    notify::notify(
+                    let content = self.notification_policy().system(
+                        self.locked,
                         t!("Image copied"),
                         t!("The image is on the clipboard."),
-                        Some(&self.paths.runtime_icon()),
                     );
+                    notify::notify_content(content, Some(&self.paths.runtime_icon()));
                 }
             }
             GtkEvent::ShareAttached { account_id, count } => {
                 let name = self.account_name(&account_id);
                 let noun = if count == 1 { "file" } else { "files" };
-                notify::notify(
+                let content = self.notification_policy().system(
+                    self.locked,
                     "Attached for review",
                     &format!(
                         "{count} {noun} attached to {name}. Check the WhatsApp preview before sending."
                     ),
-                    Some(&self.paths.runtime_icon()),
                 );
+                notify::notify_content(content, Some(&self.paths.runtime_icon()));
                 debug!(%account_id, count, "queued shared files for the attachment preview");
             }
             GtkEvent::ShareRejected {
@@ -2443,11 +2545,12 @@ impl AppModel {
                 message,
             } => {
                 warn!(%account_id, "a shared file was rejected");
-                notify::notify(
+                let content = self.notification_policy().system(
+                    self.locked,
                     "Could not attach the file",
                     &message,
-                    Some(&self.paths.runtime_icon()),
                 );
+                notify::notify_content(content, Some(&self.paths.runtime_icon()));
             }
             GtkEvent::OpenExternal { url } => {
                 Self::open_external(cx, &url);
@@ -2540,11 +2643,12 @@ impl AppModel {
                 self.errors
                     .record(DiagnosticLevel::Error, format!("WebKit error: {message}"));
                 if !notify::do_not_disturb_suppressed(&self.settings, SystemTime::now()) {
-                    notify::notify(
+                    let content = self.notification_policy().system(
+                        self.locked,
                         t!("WhatsApp Web could not start"),
                         &message,
-                        Some(&self.paths.runtime_icon()),
                     );
+                    notify::notify_content(content, Some(&self.paths.runtime_icon()));
                 }
                 self.refresh_account_window(&account_id, cx);
                 self.update_tray();
@@ -2685,11 +2789,12 @@ impl AppModel {
                 }
             }
             Err(message) => {
-                notify::notify(
+                let content = self.notification_policy().system(
+                    self.locked,
                     "Could not attach the file",
                     &message,
-                    Some(&self.paths.runtime_icon()),
                 );
+                notify::notify_content(content, Some(&self.paths.runtime_icon()));
             }
         }
     }
@@ -2799,13 +2904,14 @@ impl AppModel {
         };
         let Some(url) = record.retry_url().map(str::to_string) else {
             if !notify::do_not_disturb_suppressed(&self.settings, SystemTime::now()) {
-                notify::notify(
+                let content = self.notification_policy().system(
+                    self.locked,
                     t!("Retry unavailable"),
                     t!(
                         "This download has no reusable source URL. Start it again from WhatsApp Web."
                     ),
-                    Some(&self.paths.runtime_icon()),
                 );
+                notify::notify_content(content, Some(&self.paths.runtime_icon()));
             }
             return;
         };
@@ -2857,30 +2963,47 @@ impl AppModel {
 
     fn notify_download_outcome(&self, record: &DownloadRecord, success: bool, cancelled: bool) {
         let icon = self.paths.runtime_icon();
-        if success {
+        let content = if success {
             if let Some(path) = record.path.as_deref() {
-                notify::notify_download(&record.filename, path, Some(&icon));
+                self.notification_policy().system(
+                    self.locked,
+                    t!("Download complete"),
+                    &tr!(
+                        "{filename}\nSaved to {destination}",
+                        filename = record.filename,
+                        destination = path.display()
+                    ),
+                )
             } else {
-                notify::notify(t!("Download complete"), &record.filename, Some(&icon));
+                self.notification_policy().system(
+                    self.locked,
+                    t!("Download complete"),
+                    &record.filename,
+                )
             }
         } else if cancelled {
-            notify::notify(t!("Download cancelled"), &record.filename, Some(&icon));
+            self.notification_policy().system(
+                self.locked,
+                t!("Download cancelled"),
+                &record.filename,
+            )
         } else {
             let hint = if record.retry_url().is_some() {
                 t!("Open the Download Center to retry.")
             } else {
                 t!("Reopen the media and use the save action to retry.")
             };
-            notify::notify(
+            self.notification_policy().system(
+                self.locked,
                 t!("Download failed"),
                 &tr!(
                     "{filename}\n{hint}",
                     filename = record.filename,
                     hint = hint
                 ),
-                Some(&icon),
-            );
-        }
+            )
+        };
+        notify::notify_content(content, Some(&icon));
     }
 
     fn download_layout(&self) -> DownloadLayout {
@@ -3131,11 +3254,12 @@ impl AppModel {
             html,
             show,
             scale,
-            zoom: self.settings.zoom,
+            zoom: self.settings.effective_zoom(account_id),
             writing: self.settings.writing.clone(),
             proxy: self.settings.network.proxy.clone(),
             appearance: self.settings.appearance.clone(),
             media_actions: self.settings.media_actions,
+            reduce_motion: self.settings.accessibility.reduce_motion,
         });
         // A recreated WebKit window loses GTK-only state such as keep-above.
         // Reapply it when the GPUI window is already tagged.
@@ -4252,11 +4376,14 @@ impl AppModel {
             .iter()
             .map(|account| account.id.clone())
         {
-            self.gtk.set_zoom(&account_id, self.settings.zoom);
+            self.gtk
+                .set_zoom(&account_id, self.settings.effective_zoom(&account_id));
         }
         self.apply_hotkeys();
         self.gtk.set_proxy(self.settings.network.proxy.clone());
         self.gtk.set_appearance(self.settings.appearance.clone());
+        self.gtk
+            .set_accessibility(self.settings.accessibility.reduce_motion);
         self.gtk.set_media_actions(self.settings.media_actions);
         self.apply_performance(cx);
         // Turning low-memory mode off must not strand accounts in the
@@ -4818,11 +4945,12 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
                 !notify::do_not_disturb_suppressed(&model.settings, SystemTime::now())
             };
             if notify_allowed {
-                notify::notify(
+                let content = model.read(cx).notification_policy().system(
+                    model.read(cx).locked,
                     t!("Could not open the account window"),
                     &error.to_string(),
-                    Some(&icon),
                 );
+                notify::notify_content(content, Some(&icon));
             }
             model.update(cx, |model, _| {
                 model.pending_accounts.remove(&account_id);

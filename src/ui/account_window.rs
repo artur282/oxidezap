@@ -8,6 +8,7 @@ use gpui::{
 
 use crate::app::{AccountViewState, AppModel, ConnectionState};
 use crate::assets::{ICON_GEAR, ICON_LOCK, ICON_MINUS, ICON_PALETTE, ICON_SQUARE, ICON_X};
+use crate::settings::{AccountIdentity, appearance_summary};
 use crate::theme::Theme;
 use crate::ui::command_palette::digit_account_index;
 use crate::ui::components::{
@@ -155,24 +156,42 @@ impl Render for AccountWindow {
                 Some(cx.observe_window_appearance(window, |_this, _window, cx| cx.notify()));
         }
 
-        let (theme, name, unread, crash_failed, connection, view_state, always_on_top, mini_mode) = {
+        let (
+            theme,
+            name,
+            identity,
+            unread,
+            crash_failed,
+            connection,
+            view_state,
+            always_on_top,
+            mini_mode,
+            theme_mode,
+            zoom,
+        ) = {
             let model = self.model.read(cx);
             (
-                model.theme(window),
+                model.account_theme(&self.account_id, window),
                 model.account_name(&self.account_id),
+                model.account_identity(&self.account_id),
                 model.account_unread(&self.account_id),
                 model.account_crash_failed(&self.account_id),
                 model.account_connection(&self.account_id),
                 model.account_view_state(&self.account_id),
                 model.account_always_on_top(&self.account_id),
                 model.account_mini_mode(&self.account_id),
+                model.account_theme_mode(&self.account_id),
+                model.account_zoom(&self.account_id),
             )
         };
+        window.set_rem_size(theme.rem_size());
+        let appearance = appearance_summary(theme_mode, zoom);
 
         let drop_hover = self.drop_hover || cx.has_active_drag();
+        let show_unread = self.model.read(cx).settings.show_unread_in_title;
 
-        let title = if unread > 0 {
-            format!("OxideZap — {name} ({unread})")
+        let title = if unread > 0 && show_unread {
+            format!("({unread}) OxideZap — {name}")
         } else {
             format!("OxideZap — {name}")
         };
@@ -211,13 +230,19 @@ impl Render for AccountWindow {
                     window.titlebar_double_click();
                 }
             })
-            .child(app_icon(20.0))
+            .child(account_avatar(&identity, 22.0, theme))
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(theme.font_px(13.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .child(SharedString::from(name)),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(appearance.clone())),
             )
             .when(unread > 0, |style| style.child(unread_badge(unread, theme)));
 
@@ -273,7 +298,7 @@ impl Render for AccountWindow {
                     .w_full()
                     .bg(theme.surface)
                     .border_b_1()
-                    .border_color(theme.border)
+                    .border_color(identity.accent.map(|accent| rgb(accent.rgb())).unwrap_or(theme.border))
                     .child(drag_area)
                     .child(
                         div()
@@ -330,7 +355,8 @@ impl Render for AccountWindow {
                             ))
                             .child(titlebar_button(
                                 "account-settings",
-                                ICON_GEAR,t!("Settings"),
+                                ICON_GEAR,
+                                tr!("Settings — {appearance}", appearance = appearance),
                                 theme,
                                 false,
                                 cx.listener(|this, _event, _window, cx| {
@@ -394,7 +420,7 @@ impl Render for AccountWindow {
                                 element
                                     .child(
                                         div()
-                                            .text_size(px(16.))
+                                            .text_size(theme.font_px(16.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
                                             .child(t!("Account suspended")),
@@ -403,7 +429,7 @@ impl Render for AccountWindow {
                                         div()
                                             .w(px(440.))
                                             .text_center()
-                                            .text_size(px(13.))
+                                            .text_size(theme.font_px(13.))
                                             .text_color(theme.text_muted)
                                             .child(t!("WhatsApp Web is not running, so its memory was released. Your login, chats, and settings stay on disk.")),
                                     )
@@ -411,7 +437,7 @@ impl Render for AccountWindow {
                                         div()
                                             .w(px(440.))
                                             .text_center()
-                                            .text_size(px(12.))
+                                            .text_size(theme.font_px(12.))
                                             .text_color(theme.text_faint)
                                             .child(t!("Reactivating reloads WhatsApp Web and can take a few seconds. The current scroll position or an unsent draft may be lost.")),
                                     )
@@ -431,7 +457,7 @@ impl Render for AccountWindow {
                                 element
                                     .child(
                                         div()
-                                            .text_size(px(16.))
+                                            .text_size(theme.font_px(16.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
                                             .child(t!("Restoring WhatsApp Web…")),
@@ -440,7 +466,7 @@ impl Render for AccountWindow {
                                         div()
                                             .w(px(440.))
                                             .text_center()
-                                            .text_size(px(13.))
+                                            .text_size(theme.font_px(13.))
                                             .text_color(theme.text_muted)
                                             .child(t!("Creating a fresh WebKit view. Your session is kept and the page will reconnect automatically.")),
                                     )
@@ -449,7 +475,7 @@ impl Render for AccountWindow {
                                 element
                                     .child(
                                         div()
-                                            .text_size(px(13.))
+                                            .text_size(theme.font_px(13.))
                                             .text_color(theme.text_muted)
                                             .child(connection_message),
                                     )
@@ -458,7 +484,7 @@ impl Render for AccountWindow {
                                             div()
                                                 .w(px(420.))
                                                 .text_center()
-                                                .text_size(px(12.))
+                                                .text_size(theme.font_px(12.))
                                                 .text_color(theme.text_faint)
                                                 .child(hint),
                                         )
@@ -479,7 +505,7 @@ impl Render for AccountWindow {
                                 element
                                     .child(
                                         div()
-                                            .text_size(px(16.))
+                                            .text_size(theme.font_px(16.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
                                             .child(t!("Could not recover WhatsApp Web")),
@@ -488,7 +514,7 @@ impl Render for AccountWindow {
                                         div()
                                             .w(px(420.))
                                             .text_center()
-                                            .text_size(px(13.))
+                                            .text_size(theme.font_px(13.))
                                             .text_color(theme.text_muted)
                                             .child(t!("The page kept crashing. Your session and messages are safe. Retry when you are ready.")),
                                     )
@@ -575,6 +601,24 @@ impl Render for AccountWindow {
     }
 }
 
+fn account_avatar(identity: &AccountIdentity, size: f32, theme: Theme) -> impl IntoElement {
+    let (background, text) = match identity.accent {
+        Some(accent) => (rgb(accent.rgb()), rgb(accent.readable_text().rgb())),
+        None => (theme.accent, theme.accent_text),
+    };
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(size))
+        .rounded_full()
+        .bg(background)
+        .text_color(text)
+        .text_size(px((size * 0.45).max(10.0)))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .child(SharedString::from(identity.label.clone()))
+}
+
 fn drop_overlay(theme: Theme) -> impl IntoElement {
     div()
         .absolute()
@@ -599,14 +643,14 @@ fn drop_overlay(theme: Theme) -> impl IntoElement {
                 .rounded_md()
                 .child(
                     div()
-                        .text_size(px(22.))
+                        .text_size(theme.font_px(22.))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
                         .child("Drop to attach"),
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(theme.font_px(12.))
                         .text_color(theme.text_muted)
                         .child("Images, videos, PDFs, and files up to 64 MB stay in the preview until you send."),
                 ),
@@ -629,7 +673,7 @@ fn connection_badge(state: ConnectionState, theme: Theme) -> impl IntoElement {
         .child(div().size(px(7.)).rounded_full().bg(color))
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(theme.font_px(11.))
                 .text_color(theme.text_muted)
                 .child(state.label()),
         )

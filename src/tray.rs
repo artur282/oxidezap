@@ -1,17 +1,22 @@
 use std::collections::HashSet;
+use std::io::Cursor;
 
 use crossbeam_channel::Sender;
-use image::{Rgba, RgbaImage};
+use image::{ImageFormat, Rgba, RgbaImage};
 use ksni::menu::{MenuItem, StandardItem, SubMenu};
 use ksni::{Icon, ToolTip};
 use tracing::{info, warn};
 
-use crate::settings::Account;
+use crate::settings::{Account, AccountColor};
 
 const BADGE_CENTER: i32 = 46;
 const BADGE_OUTER_RADIUS: i32 = 17;
 const BADGE_RING_RADIUS: i32 = 15;
 const BADGE_INNER_RADIUS: i32 = 13;
+
+/// Size of the generated per-account menu icon. StatusNotifierItem consumers
+/// scale it to their own menu row height.
+const ACCOUNT_ICON_SIZE: u32 = 22;
 
 const BADGE_OUTLINE: [u8; 4] = [24, 34, 42, 255];
 const BADGE_RING: [u8; 4] = [255, 255, 255, 255];
@@ -121,6 +126,7 @@ struct TrayAccount {
     name: String,
     unread: u32,
     suspended: bool,
+    accent: Option<AccountColor>,
 }
 
 pub struct OxideTray {
@@ -221,26 +227,27 @@ impl ksni::Tray for OxideTray {
         );
         items.push(MenuItem::Separator);
 
+        let active_account = self
+            .window
+            .as_ref()
+            .map(|window| window.account_id.as_str());
         let account_items = self
             .accounts
             .iter()
             .map(|account| {
                 let id = account.id.clone();
-                let mut label = if account.unread > 0 {
-                    format!("{} ({})", account.name, account.unread)
-                } else {
-                    account.name.clone()
-                };
-                if account.suspended {
-                    label.push_str(&format!(" ({})", t!("suspended")));
-                }
+                let label =
+                    account_menu_label(account, active_account == Some(account.id.as_str()));
                 StandardItem {
                     label,
-                    icon_name: if account.suspended {
+                    icon_name: if account.accent.is_some() {
+                        String::new()
+                    } else if account.suspended {
                         "user-away".to_string()
                     } else {
                         "user-available".to_string()
                     },
+                    icon_data: account.accent.map(account_icon_data).unwrap_or_default(),
                     activate: Box::new(move |tray: &mut Self| {
                         let _ = tray.tx.try_send(TrayAction::OpenAccount(id.clone()));
                     }),
@@ -497,6 +504,7 @@ impl TrayHandle {
                 name: account.name.clone(),
                 unread: account.unread,
                 suspended: suspended.contains(&account.id),
+                accent: account.accent_color(),
             })
             .collect();
         let active = dnd.active;
@@ -514,6 +522,51 @@ impl TrayHandle {
     pub fn shutdown(&self) {
         self.handle.shutdown();
     }
+}
+
+/// Label for an account entry in the tray submenu. The active account gets a
+/// leading checkmark, and the unread count and suspended marker keep the same
+/// shape as before so the sheet stays easy to scan.
+fn account_menu_label(account: &TrayAccount, active: bool) -> String {
+    let mut label = if active {
+        format!("✓ {}", account.name)
+    } else {
+        account.name.clone()
+    };
+    if account.unread > 0 {
+        label.push_str(&format!(" ({})", account.unread));
+    }
+    if account.suspended {
+        label.push_str(&format!(" ({})", t!("suspended")));
+    }
+    label
+}
+
+/// Renders a small PNG disc in the account accent for the tray submenu. The
+/// DBus menu protocol carries menu icons as PNG bytes, so no file is written
+/// and an invalid or missing accent simply keeps the themed user icon.
+fn account_icon_data(accent: AccountColor) -> Vec<u8> {
+    let mut image = RgbaImage::new(ACCOUNT_ICON_SIZE, ACCOUNT_ICON_SIZE);
+    let center = (ACCOUNT_ICON_SIZE as i32 - 1) as f32 / 2.0;
+    let radius = ACCOUNT_ICON_SIZE as f32 / 2.0 - 1.0;
+    let radius_squared = radius * radius;
+    let [red, green, blue] = accent.channels();
+    for y in 0..ACCOUNT_ICON_SIZE as i32 {
+        for x in 0..ACCOUNT_ICON_SIZE as i32 {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            if dx * dx + dy * dy <= radius_squared {
+                image.put_pixel(x as u32, y as u32, Rgba([red, green, blue, 255]));
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    let mut cursor = Cursor::new(&mut bytes);
+    if let Err(error) = image.write_to(&mut cursor, ImageFormat::Png) {
+        warn!(%error, "could not encode a tray account icon");
+        return Vec::new();
+    }
+    bytes
 }
 
 fn tooltip_description(accounts: &[TrayAccount], unread: u32, dnd_status: Option<&str>) -> String {
@@ -742,18 +795,21 @@ mod tests {
                 name: "Work".to_string(),
                 unread: 3,
                 suspended: false,
+                accent: Some(AccountColor::new(0x1d, 0x4e, 0xd8)),
             },
             TrayAccount {
                 id: "b".to_string(),
                 name: "Personal".to_string(),
                 unread: 2,
                 suspended: false,
+                accent: None,
             },
             TrayAccount {
                 id: "c".to_string(),
                 name: "Empty".to_string(),
                 unread: 0,
                 suspended: false,
+                accent: Some(AccountColor::new(0xbe, 0x18, 0x5d)),
             },
         ]
     }
@@ -877,6 +933,34 @@ mod tests {
         assert_eq!(
             tooltip_description(&accounts, 0, None),
             "WhatsApp Web for Linux\n2 suspended accounts"
+        );
+    }
+
+    #[test]
+    fn account_menu_labels_mark_the_active_account() {
+        let accounts = accounts();
+
+        assert_eq!(account_menu_label(&accounts[0], false), "Work (3)");
+        assert_eq!(account_menu_label(&accounts[0], true), "✓ Work (3)");
+        assert_eq!(account_menu_label(&accounts[2], false), "Empty");
+    }
+
+    #[test]
+    fn account_icons_are_png_images_that_differ_by_accent() {
+        let blue = AccountColor::new(0x1d, 0x4e, 0xd8);
+        let red = AccountColor::new(0xb9, 0x1c, 0x1c);
+        let blue_icon = account_icon_data(blue);
+        let red_icon = account_icon_data(red);
+
+        assert!(blue_icon.starts_with(&[0x89, b'P', b'N', b'G']));
+        assert_ne!(blue_icon, red_icon);
+        let decoded = image::load_from_memory(&blue_icon)
+            .expect("the tray icon is a valid PNG")
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (ACCOUNT_ICON_SIZE, ACCOUNT_ICON_SIZE));
+        assert_eq!(
+            decoded.get_pixel(ACCOUNT_ICON_SIZE / 2, ACCOUNT_ICON_SIZE / 2)[3],
+            255
         );
     }
 }

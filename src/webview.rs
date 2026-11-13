@@ -223,6 +223,9 @@ pub enum GtkCommand {
         appearance: AppearanceSettings,
         /// Whether the injected media action menu is enabled for this account.
         media_actions: bool,
+        /// Whether the independent reduced-motion preference is active. The
+        /// GTK thread also knows the battery-saver state.
+        reduce_motion: bool,
     },
     Show {
         account_id: String,
@@ -252,6 +255,12 @@ pub enum GtkCommand {
     SetPerformance {
         battery_saver: bool,
         cadence: PerformanceCadence,
+    },
+    /// Applies the native accessibility preference that affects web content.
+    /// Reduce motion is independent of battery saver: either source activates
+    /// the same stylesheet, but turning one off never changes the other.
+    SetAccessibility {
+        reduce_motion: bool,
     },
     SetDownloadLayout(DownloadLayout),
     CancelDownload {
@@ -353,6 +362,10 @@ impl GtkHandle {
             battery_saver,
             cadence,
         });
+    }
+
+    pub fn set_accessibility(&self, reduce_motion: bool) {
+        self.send(GtkCommand::SetAccessibility { reduce_motion });
     }
 
     pub fn set_download_layout(&self, layout: DownloadLayout) {
@@ -468,6 +481,7 @@ pub fn spawn(
                 media_actions: true,
                 cadence: PerformanceCadence::NORMAL,
                 battery_saver: false,
+                reduce_motion: false,
                 last_overlay_sync: Instant::now(),
                 connection_poll: Rc::new(Cell::new(PerformanceCadence::NORMAL.connection_report)),
                 media_transfers: Rc::new(RefCell::new(HashMap::new())),
@@ -535,8 +549,11 @@ struct GtkState {
     /// Resolved performance policy. `overlay_sync` gates the native
     /// synchronization timer; `connection_report` is injected into open pages.
     cadence: PerformanceCadence,
-    /// Whether the reduced-motion stylesheet is currently applied.
+    /// Whether the reduced-motion stylesheet is currently applied by battery
+    /// saver. Accessibility's independent reduce-motion flag is separate.
     battery_saver: bool,
+    /// Whether the user asked for reduced motion in Settings > Accessibility.
+    reduce_motion: bool,
     /// Last time the overlay geometry was synchronized, so the fastest timer
     /// can serve both cadences without rebuilding the GLib source.
     last_overlay_sync: Instant,
@@ -656,6 +673,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
             proxy,
             appearance,
             media_actions,
+            reduce_motion,
         } => {
             match create_entry(
                 &account_id,
@@ -677,6 +695,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 state.paste.clone(),
                 media_actions,
                 state.battery_saver,
+                reduce_motion,
                 state.connection_poll.clone(),
                 state.media_transfers.clone(),
             ) {
@@ -692,6 +711,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                     state.proxy = proxy;
                     state.appearance = appearance;
                     state.media_actions = media_actions;
+                    state.reduce_motion = reduce_motion;
                     let _ = state.events.send(GtkEvent::Ready { account_id, xid });
                 }
                 Err(error) => {
@@ -745,7 +765,14 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
             }
             for entry in state.entries.values() {
                 if let Some(manager) = entry.webview.user_content_manager() {
-                    apply_user_stylesheets(&manager, &appearance, state.battery_saver);
+                    apply_user_stylesheets(
+                        &manager,
+                        &appearance,
+                        crate::settings::reduce_motion_active(
+                            state.battery_saver,
+                            state.reduce_motion,
+                        ),
+                    );
                 }
             }
             state.appearance = appearance;
@@ -764,7 +791,14 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 for entry in state.entries.values() {
                     if saver_changed {
                         if let Some(manager) = entry.webview.user_content_manager() {
-                            apply_user_stylesheets(&manager, &state.appearance, battery_saver);
+                            apply_user_stylesheets(
+                                &manager,
+                                &state.appearance,
+                                crate::settings::reduce_motion_active(
+                                    battery_saver,
+                                    state.reduce_motion,
+                                ),
+                            );
                         }
                     }
                     entry.webview.evaluate_javascript(
@@ -774,6 +808,19 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                         None::<&gtk::gio::Cancellable>,
                         |_result| {},
                     );
+                }
+            }
+        }
+        GtkCommand::SetAccessibility { reduce_motion } => {
+            if state.reduce_motion == reduce_motion {
+                return;
+            }
+            state.reduce_motion = reduce_motion;
+            let reduce_motion =
+                crate::settings::reduce_motion_active(state.battery_saver, state.reduce_motion);
+            for entry in state.entries.values() {
+                if let Some(manager) = entry.webview.user_content_manager() {
+                    apply_user_stylesheets(&manager, &state.appearance, reduce_motion);
                 }
             }
         }
@@ -990,6 +1037,7 @@ fn create_entry(
     paste: Rc<RefCell<PasteQueue>>,
     media_actions: bool,
     battery_saver: bool,
+    reduce_motion: bool,
     connection_poll: Rc<Cell<Duration>>,
     media_transfers: Rc<RefCell<HashMap<String, MediaTransfer>>>,
 ) -> Result<WebEntry> {
@@ -1022,7 +1070,11 @@ fn create_entry(
         events.clone(),
         connection_poll.get(),
     );
-    apply_user_stylesheets(&user_content, appearance, battery_saver);
+    apply_user_stylesheets(
+        &user_content,
+        appearance,
+        crate::settings::reduce_motion_active(battery_saver, reduce_motion),
+    );
     let downloads = Rc::new(Cell::new(0));
     let media_enabled = Rc::new(Cell::new(media_actions));
     connect_media_script(
@@ -1112,10 +1164,11 @@ fn create_entry(
     })
 }
 
-/// Pauses decorative motion while battery saver is active. Media playback and
-/// layout are untouched; only CSS animation and transition timing is collapsed
-/// so WhatsApp's interface stops repainting for effects it no longer shows.
-const BATTERY_SAVER_STYLESHEET: &str = r#"
+/// Pauses decorative motion when battery saver or the Reduce motion preference
+/// is active. Media playback and layout are untouched; only CSS animation and
+/// transition timing is collapsed so WhatsApp's interface stops repainting for
+/// effects it no longer shows.
+const REDUCED_MOTION_STYLESHEET: &str = r#"
 *, *::before, *::after {
   animation-duration: 0.001ms !important;
   animation-delay: 0ms !important;
@@ -1126,7 +1179,7 @@ const BATTERY_SAVER_STYLESHEET: &str = r#"
 "#;
 
 /// Replaces the user stylesheets on a content manager. Experimental CSS and
-/// the battery-saver stylesheet share the manager, so both are rebuilt
+/// the reduced-motion stylesheet share the manager, so both are rebuilt
 /// together; removing only one would also detach the other.
 ///
 /// WebKit injects user stylesheets at document start and keeps them attached
@@ -1137,7 +1190,7 @@ const BATTERY_SAVER_STYLESHEET: &str = r#"
 fn apply_user_stylesheets(
     manager: &UserContentManager,
     appearance: &AppearanceSettings,
-    battery_saver: bool,
+    reduce_motion: bool,
 ) {
     manager.remove_all_style_sheets();
     if let Some(css) = appearance.active_css() {
@@ -1154,9 +1207,9 @@ fn apply_user_stylesheets(
             info!(bytes = css.len(), "applied experimental custom CSS");
         }
     }
-    if battery_saver {
+    if reduce_motion {
         manager.add_style_sheet(&UserStyleSheet::new(
-            BATTERY_SAVER_STYLESHEET,
+            REDUCED_MOTION_STYLESHEET,
             UserContentInjectedFrames::TopFrame,
             UserStyleLevel::User,
             CUSTOM_CSS_ALLOW_PATTERNS,
@@ -3819,6 +3872,23 @@ fn mime_for_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reduced_motion_stylesheet_only_collapses_animation_and_transitions() {
+        assert!(REDUCED_MOTION_STYLESHEET.contains("animation-duration: 0.001ms"));
+        assert!(REDUCED_MOTION_STYLESHEET.contains("animation-delay: 0ms"));
+        assert!(REDUCED_MOTION_STYLESHEET.contains("transition-duration: 0.001ms"));
+        assert!(REDUCED_MOTION_STYLESHEET.contains("transition-delay: 0ms"));
+        assert!(REDUCED_MOTION_STYLESHEET.contains("animation-iteration-count: 1"));
+        assert!(
+            !REDUCED_MOTION_STYLESHEET.contains("display"),
+            "the stylesheet must not hide content or media"
+        );
+        assert!(
+            !REDUCED_MOTION_STYLESHEET.contains("visibility"),
+            "the stylesheet must not hide content or media"
+        );
+    }
 
     #[test]
     fn connection_script_bakes_the_poll_and_has_no_placeholder() {

@@ -13,14 +13,16 @@ use crate::app::{AppModel, AppModelEntityExt};
 use crate::assets::{ICON_BELL, ICON_GEAR, ICON_INFO, ICON_PALETTE, ICON_SHIELD, ICON_USER};
 use crate::diagnostics;
 use crate::lock::MIN_PASSWORD_LENGTH;
+use crate::notify;
 use crate::settings::performance::PerformanceMode;
 use crate::settings::storage::{self, ConfirmationLevel, StorageOperation};
 use crate::settings::{
-    DoNotDisturbMode, EVERY_DAY, ImportPreview, MAX_CUSTOM_CSS_BYTES, MAX_ZOOM, MIN_ZOOM,
-    ManualProxy, ProxyMode, ProxyProtocol, ProxySettings, SUSPEND_DELAY_OPTIONS, Settings,
-    SettingsExport, SpellCheckLanguage, ThemeMode, WEEKDAYS, WEEKENDS, ZOOM_LEVELS,
-    export_file_name, format_time_of_day, json_path, parse_time_of_day, test_proxy_connection,
-    validate_custom_css, write_settings_backup,
+    Account, AccountColor, AccountTheme, DoNotDisturbMode, EVERY_DAY, FontScale, ImportPreview,
+    MAX_CUSTOM_CSS_BYTES, MAX_ZOOM, MIN_ZOOM, ManualProxy, NotificationPrivacy, ProxyMode,
+    ProxyProtocol, ProxySettings, SUSPEND_DELAY_OPTIONS, Settings, SettingsExport,
+    SpellCheckLanguage, ThemeMode, WEEKDAYS, WEEKENDS, ZOOM_LEVELS, appearance_summary,
+    export_file_name, format_time_of_day, json_path, normalize_avatar_label, parse_time_of_day,
+    test_proxy_connection, validate_custom_css, write_settings_backup,
 };
 use crate::shortcut::Shortcut;
 use crate::theme::Theme;
@@ -72,6 +74,15 @@ impl StorageConfirm {
     }
 }
 
+/// Inline editor for the optional avatar and custom accent of one account.
+#[derive(Clone)]
+struct IdentityEdit {
+    account_id: String,
+    hex: Entity<TextField>,
+    avatar: Entity<TextField>,
+    error: Option<String>,
+}
+
 const ICON_STORAGE: &str = "icons/download.svg";
 
 #[derive(Clone, Debug)]
@@ -101,6 +112,7 @@ pub enum SettingsSection {
     Accounts,
     Storage,
     Appearance,
+    Accessibility,
     Notifications,
     Network,
     General,
@@ -115,6 +127,7 @@ impl SettingsSection {
             SettingsSection::Accounts => t!("Accounts"),
             SettingsSection::Storage => t!("Storage"),
             SettingsSection::Appearance => t!("Appearance"),
+            SettingsSection::Accessibility => t!("Accessibility"),
             SettingsSection::Notifications => t!("Notifications"),
             SettingsSection::Network => t!("Network"),
             SettingsSection::General => t!("General"),
@@ -129,6 +142,7 @@ impl SettingsSection {
             SettingsSection::Accounts => ICON_USER,
             SettingsSection::Storage => ICON_STORAGE,
             SettingsSection::Appearance => ICON_PALETTE,
+            SettingsSection::Accessibility => ICON_INFO,
             SettingsSection::Notifications => ICON_BELL,
             SettingsSection::Network => ICON_INFO,
             SettingsSection::General => ICON_GEAR,
@@ -144,7 +158,10 @@ pub struct SettingsWindow {
     section: SettingsSection,
     focus_handle: FocusHandle,
     renaming: Option<(String, Entity<TextField>)>,
+    identity_edit: Option<IdentityEdit>,
     remove_confirm: Option<String>,
+    apply_appearance_confirm: Option<String>,
+    account_appearance_feedback: Option<Notice>,
     password_field: Entity<TextField>,
     confirm_field: Entity<TextField>,
     shortcut_field: Entity<TextField>,
@@ -247,7 +264,10 @@ impl SettingsWindow {
             section: SettingsSection::Accounts,
             focus_handle: cx.focus_handle(),
             renaming: None,
+            identity_edit: None,
             remove_confirm: None,
+            apply_appearance_confirm: None,
+            account_appearance_feedback: None,
             password_field,
             confirm_field,
             shortcut_field,
@@ -292,6 +312,9 @@ impl SettingsWindow {
             self.storage_confirm = None;
             self.storage_confirm_error = None;
         }
+        if section != SettingsSection::Accounts {
+            self.apply_appearance_confirm = None;
+        }
         self.section = section;
         if section == SettingsSection::Storage {
             self.model.update(cx, |model, cx| model.refresh_storage(cx));
@@ -316,6 +339,7 @@ impl SettingsWindow {
     fn cancel_pending_dialog(&mut self, cx: &mut Context<Self>) -> bool {
         let pending = self.renaming.is_some()
             || self.remove_confirm.is_some()
+            || self.apply_appearance_confirm.is_some()
             || self.remove_password_confirm
             || self.pending_import.is_some()
             || self.reset_confirm
@@ -325,6 +349,7 @@ impl SettingsWindow {
         }
         self.renaming = None;
         self.remove_confirm = None;
+        self.apply_appearance_confirm = None;
         self.remove_password_confirm = false;
         self.pending_import = None;
         self.reset_confirm = false;
@@ -344,8 +369,11 @@ impl SettingsWindow {
         for account in &settings.accounts {
             let id = account.id.clone();
             let name = account.name.clone();
+            let identity = account.identity();
             let initial = account.initial();
             let unread = account.unread;
+            let appearance =
+                appearance_summary(settings.effective_theme(&id), settings.effective_zoom(&id));
 
             if let Some((renaming_id, field)) = &self.renaming {
                 if renaming_id == &id {
@@ -358,7 +386,7 @@ impl SettingsWindow {
                                 .flex()
                                 .items_center()
                                 .gap(px(12.))
-                                .child(avatar(&initial, theme))
+                                .child(avatar(&identity.label, theme))
                                 .child(field)
                                 .child(button(
                                     SharedString::from(format!("rename-save-{save_id}")),
@@ -392,6 +420,103 @@ impl SettingsWindow {
                 }
             }
 
+            if let Some(edit) = &self.identity_edit {
+                if edit.account_id == id {
+                    let edit = edit.clone();
+                    let save_id = id.clone();
+                    let reset_id = id.clone();
+                    let cancel_id = id.clone();
+                    let error = edit.error.clone();
+                    list = list.child(
+                        card(theme)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .child(avatar(&identity.label, theme))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.))
+                                            .child(
+                                                div()
+                                                    .text_size(px(14.))
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(theme.text)
+                                                    .child(SharedString::from(name)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(theme.text_muted)
+                                                    .child(t!("Identity")),
+                                            ),
+                                    ),
+                            )
+                            .child(labeled_field(
+                                t!("Custom color"),
+                                Some(SharedString::from(
+                                    t!("Use a hex color such as #1d4ed8."),
+                                )),
+                                theme,
+                                edit.hex.clone(),
+                            ))
+                            .child(labeled_field(
+                                t!("Avatar"),
+                                Some(SharedString::from(
+                                    t!("Use up to two characters or one emoji. Empty shows the account initial."),
+                                )),
+                                theme,
+                                edit.avatar.clone(),
+                            ))
+                            .when_some(error, |style, error| {
+                                style.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme.danger)
+                                        .child(error),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(8.))
+                                    .child(button(
+                                        SharedString::from(format!("identity-save-{save_id}")),
+                                        t!("Save"),
+                                        theme,
+                                        true,
+                                        cx.listener(|this, _event, _window, cx| {
+                                            this.save_identity(cx);
+                                        }),
+                                    ))
+                                    .child(button(
+                                        SharedString::from(format!("identity-reset-{reset_id}")),
+                                        t!("Reset identity"),
+                                        theme,
+                                        false,
+                                        cx.listener(move |this, _event, _window, cx| {
+                                            this.reset_account_identity(&reset_id, cx);
+                                        }),
+                                    ))
+                                    .child(button(
+                                        SharedString::from(format!("identity-cancel-{cancel_id}")),
+                                        t!("Cancel"),
+                                        theme,
+                                        false,
+                                        cx.listener(|this, _event, _window, cx| {
+                                            this.identity_edit = None;
+                                            cx.notify();
+                                        }),
+                                    )),
+                            ),
+                    );
+                    continue;
+                }
+            }
+
             if self.remove_confirm.as_deref() == Some(id.as_str()) {
                 let remove_id = id.clone();
                 let cancel_id = id.clone();
@@ -400,13 +525,13 @@ impl SettingsWindow {
                         .border_color(theme.danger)
                         .child(
                             div()
-                                .text_size(px(13.))
+                                .text_size(theme.font_px(13.))
                                 .text_color(theme.text)
                                 .child(t!("Remove this account?")),
                         )
                         .child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(theme.font_px(12.))
                                 .text_color(theme.text_muted)
                                 .child(t!("The local WhatsApp session, cookies, and cached files for this account will be deleted. This cannot be undone.")),
                         )
@@ -446,92 +571,101 @@ impl SettingsWindow {
             let rename_name = name.clone();
             let remove_id = id.clone();
             list = list.child(
-                card(theme).child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(14.))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(12.))
-                                .child(avatar(&initial, theme))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(2.))
-                                        .child(
-                                            div()
-                                                .text_size(px(14.))
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                .text_color(theme.text)
-                                                .child(SharedString::from(name)),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(11.))
-                                                .text_color(theme.text_muted)
-                                                .child(if unread > 0 {
-                                                    tn!(
-                                                        unread,
-                                                        "{count} unread message",
-                                                        "{count} unread messages"
-                                                    )
-                                                } else {
-                                                    t!("No unread messages").to_string()
-                                                }),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
-                                .child(button(
-                                    SharedString::from(format!("open-{open_id}")),
-                                    t!("Open"),
-                                    theme,
-                                    true,
-                                    cx.listener(move |this, _event, _window, cx| {
-                                        let account_id = open_id.clone();
-                                        this.model.update(cx, |model, cx| {
-                                            model.open_account_window(&account_id, cx);
-                                        });
-                                    }),
-                                ))
-                                .child(button(
-                                    SharedString::from(format!("rename-{rename_id}")),
-                                    t!("Rename"),
-                                    theme,
-                                    false,
-                                    cx.listener(move |this, _event, _window, cx| {
-                                        let field = cx.new(|cx| {
-                                            TextField::new(t!("Account name"), cx)
-                                                .with_content(rename_name.clone())
-                                        });
-                                        register_field_tab_stop(&field, cx);
-                                        this.renaming = Some((rename_id.clone(), field));
-                                        cx.notify();
-                                    }),
-                                ))
-                                .when(settings.accounts.len() > 1, |style| {
-                                    style.child(button(
-                                        SharedString::from(format!("remove-{remove_id}")),
-                                        t!("Remove"),
+                card(theme)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(14.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .child(avatar(&initial, theme))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.))
+                                            .child(
+                                                div()
+                                                    .text_size(px(14.))
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(theme.text)
+                                                    .child(SharedString::from(name)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(theme.text_muted)
+                                                    .child(if unread > 0 {
+                                                        tn!(
+                                                            unread,
+                                                            "{count} unread message",
+                                                            "{count} unread messages"
+                                                        )
+                                                    } else {
+                                                        t!("No unread messages").to_string()
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(theme.text_faint)
+                                                    .child(SharedString::from(appearance.clone())),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(button(
+                                        SharedString::from(format!("open-{open_id}")),
+                                        t!("Open"),
+                                        theme,
+                                        true,
+                                        cx.listener(move |this, _event, _window, cx| {
+                                            let account_id = open_id.clone();
+                                            this.model.update(cx, |model, cx| {
+                                                model.open_account_window(&account_id, cx);
+                                            });
+                                        }),
+                                    ))
+                                    .child(button(
+                                        SharedString::from(format!("rename-{rename_id}")),
+                                        t!("Rename"),
                                         theme,
                                         false,
                                         cx.listener(move |this, _event, _window, cx| {
-                                            this.remove_confirm = Some(remove_id.clone());
+                                            let field = cx.new(|cx| {
+                                                TextField::new(t!("Account name"), cx)
+                                                    .with_content(rename_name.clone())
+                                            });
+                                            register_field_tab_stop(&field, cx);
+                                            this.renaming = Some((rename_id.clone(), field));
                                             cx.notify();
                                         }),
                                     ))
-                                }),
-                        ),
-                ),
+                                    .when(settings.accounts.len() > 1, |style| {
+                                        style.child(button(
+                                            SharedString::from(format!("remove-{remove_id}")),
+                                            t!("Remove"),
+                                            theme,
+                                            false,
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                this.remove_confirm = Some(remove_id.clone());
+                                                cx.notify();
+                                            }),
+                                        ))
+                                    }),
+                            ),
+                    )
+                    .child(divider(theme))
+                    .child(self.render_account_appearance(account, settings, theme, cx)),
             );
         }
 
@@ -545,7 +679,7 @@ impl SettingsWindow {
             }),
         );
 
-        div()
+        let mut page = div()
             .flex()
             .flex_col()
             .gap(px(18.))
@@ -554,8 +688,22 @@ impl SettingsWindow {
                 t!("Every account has its own isolated WhatsApp Web session and window."),
                 theme,
             ))
-            .child(list)
-            .child(div().flex().gap(px(8.)).child(add_button))
+            .child(list);
+        if let Some(notice) = &self.account_appearance_feedback {
+            page = page.child(
+                card(theme).child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(if notice.error {
+                            theme.danger
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(notice.text.clone()),
+                ),
+            );
+        }
+        page.child(div().flex().gap(px(8.)).child(add_button))
             .child(
                 div()
                     .text_size(px(11.))
@@ -565,6 +713,257 @@ impl SettingsWindow {
                     )),
             )
             .into_any_element()
+    }
+
+    /// Theme and zoom controls for one account, shown inside its card. The
+    /// effective values and the global fallback are visible without opening
+    /// the Appearance section.
+    fn render_account_appearance(
+        &self,
+        account: &Account,
+        settings: &Settings,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let account_id = account.id.clone();
+        let global_appearance = appearance_summary(settings.theme, settings.zoom);
+        let effective_appearance = appearance_summary(
+            settings.effective_theme(&account_id),
+            settings.effective_zoom(&account_id),
+        );
+
+        let mut theme_row = div().flex().flex_wrap().gap(px(6.));
+        for option in [
+            AccountTheme::Inherit,
+            AccountTheme::System,
+            AccountTheme::Light,
+            AccountTheme::Dark,
+        ] {
+            let selected = account.appearance.theme == option;
+            let label = if option.is_inherit() {
+                tr!("Use global ({value})", value = settings.theme.label())
+            } else {
+                option.label().to_string()
+            };
+            let id =
+                SharedString::from(format!("account-theme-{account_id}-{option:?}").to_lowercase());
+            let account_id = account_id.clone();
+            theme_row = theme_row.child(button(
+                id,
+                label,
+                theme,
+                selected,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.set_account_theme(&account_id, option, cx);
+                    });
+                    this.account_appearance_feedback = None;
+                    cx.notify();
+                }),
+            ));
+        }
+
+        let mut zoom_row = div().flex().flex_wrap().gap(px(6.));
+        let inherit_id = account_id.clone();
+        let global_zoom = format!("{}%", (settings.zoom * 100.0).round() as u32);
+        zoom_row = zoom_row.child(button(
+            SharedString::from(format!("account-zoom-{account_id}-global")),
+            tr!("Use global ({value})", value = global_zoom),
+            theme,
+            account.appearance.zoom.is_none(),
+            cx.listener(move |this, _event, _window, cx| {
+                this.model.update(cx, |model, cx| {
+                    model.set_account_zoom(&inherit_id, None, cx)
+                });
+                this.account_appearance_feedback = None;
+                cx.notify();
+            }),
+        ));
+        for zoom in ZOOM_LEVELS {
+            let selected = account
+                .appearance
+                .zoom
+                .is_some_and(|current| (current - zoom).abs() < 0.001);
+            let label = format!("{}%", (zoom * 100.0).round() as u32);
+            let id = SharedString::from(format!("account-zoom-{account_id}-{label}"));
+            let account_id = account_id.clone();
+            zoom_row = zoom_row.child(button(
+                id,
+                label,
+                theme,
+                selected,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.set_account_zoom(&account_id, Some(zoom), cx);
+                    });
+                    this.account_appearance_feedback = None;
+                    cx.notify();
+                }),
+            ));
+        }
+
+        let mut apply_row = div().flex().flex_wrap().items_center().gap(px(8.));
+        if self.apply_appearance_confirm.as_deref() == Some(account_id.as_str()) {
+            let confirm_id = account_id.clone();
+            let cancel_id = account_id.clone();
+            apply_row = apply_row
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.text)
+                        .child(t!("Apply this account's appearance to all accounts?")),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(px(11.))
+                        .text_color(theme.text_muted)
+                        .child(t!(
+                            "Other accounts will use the same theme and zoom overrides. Their sessions and window bounds are kept."
+                        )),
+                )
+                .child(button(
+                    SharedString::from(format!("apply-appearance-confirm-{confirm_id}")),
+                    t!("Apply to all accounts"),
+                    theme,
+                    true,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.apply_appearance_confirm = None;
+                        this.model.update(cx, |model, cx| {
+                            model.apply_account_appearance_to_all(&confirm_id, cx);
+                        });
+                        this.account_appearance_feedback =
+                            Some(Notice::success(t!("Appearance applied to all accounts.")));
+                        cx.notify();
+                    }),
+                ))
+                .child(button(
+                    SharedString::from(format!("apply-appearance-cancel-{cancel_id}")),
+                    t!("Cancel"),
+                    theme,
+                    false,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.apply_appearance_confirm = None;
+                        cx.notify();
+                    }),
+                ));
+        } else {
+            let apply_id = account_id.clone();
+            apply_row = apply_row.child(button(
+                SharedString::from(format!("apply-appearance-{apply_id}")),
+                t!("Apply to all accounts"),
+                theme,
+                false,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.apply_appearance_confirm = Some(apply_id.clone());
+                    cx.notify();
+                }),
+            ));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(t!("Account appearance")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.text_muted)
+                    .child(t!("Theme")),
+            )
+            .child(theme_row)
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.text_muted)
+                    .child(t!("Display size")),
+            )
+            .child(zoom_row)
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(tr!(
+                        "Global appearance: {appearance}",
+                        appearance = global_appearance
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(tr!(
+                        "This account: {appearance}",
+                        appearance = effective_appearance
+                    )),
+            )
+            .child(apply_row)
+            .into_any_element()
+    }
+
+    /// Validates the inline identity editor and applies both values in one
+    /// settings update, so a rejected color never leaves a half-applied avatar.
+    fn save_identity(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.identity_edit.clone() else {
+            return;
+        };
+        let hex = edit.hex.read(cx).content().trim().to_string();
+        let avatar = edit.avatar.read(cx).content().trim().to_string();
+        let accent = if hex.is_empty() {
+            None
+        } else {
+            match AccountColor::parse(&hex) {
+                Some(color) => Some(color.to_hex()),
+                None => {
+                    self.set_identity_error(t!("Use a hex color such as #1d4ed8."), cx);
+                    return;
+                }
+            }
+        };
+        let avatar = if avatar.is_empty() {
+            None
+        } else {
+            match normalize_avatar_label(&avatar) {
+                Some(label) => Some(label),
+                None => {
+                    self.set_identity_error(t!("Use up to two characters or one emoji."), cx);
+                    return;
+                }
+            }
+        };
+        let account_id = edit.account_id;
+        self.model.update(cx, |model, cx| {
+            model.update_settings(cx, |settings| {
+                settings.set_account_accent(&account_id, accent.as_deref());
+                settings.set_account_avatar(&account_id, avatar.as_deref());
+            });
+        });
+        self.identity_edit = None;
+        cx.notify();
+    }
+
+    fn set_identity_error(&mut self, message: &str, cx: &mut Context<Self>) {
+        if let Some(edit) = self.identity_edit.as_mut() {
+            edit.error = Some(message.to_string());
+        }
+        cx.notify();
+    }
+
+    fn reset_account_identity(&mut self, account_id: &str, cx: &mut Context<Self>) {
+        self.model.update(cx, |model, cx| {
+            model.update_settings(cx, |settings| {
+                settings.reset_account_identity(account_id);
+            });
+        });
+        self.identity_edit = None;
+        cx.notify();
     }
 
     fn request_storage_action(
@@ -678,14 +1077,14 @@ impl SettingsWindow {
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(tr!("Data folder: {path}", path = data_dir.display())),
             );
         if let Some(notice) = notice {
             summary = summary.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(if notice.error {
                         theme.danger
                     } else {
@@ -753,14 +1152,14 @@ impl SettingsWindow {
                             .gap(px(2.))
                             .child(
                                 div()
-                                    .text_size(px(14.))
+                                    .text_size(theme.font_px(14.))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(theme.text)
                                     .child(name),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(theme.font_px(11.))
                                     .text_color(theme.text_muted)
                                     .child(info_line),
                             ),
@@ -768,7 +1167,7 @@ impl SettingsWindow {
                     .when(open, |style| {
                         style.child(
                             div()
-                                .text_size(px(10.))
+                                .text_size(theme.font_px(10.))
                                 .text_color(theme.text_faint)
                                 .child(t!("Window open")),
                         )
@@ -778,7 +1177,7 @@ impl SettingsWindow {
             if working {
                 entry = entry.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(theme.font_px(11.))
                         .text_color(theme.text_muted)
                         .child(t!("Running storage operation…")),
                 );
@@ -852,7 +1251,7 @@ impl SettingsWindow {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(t!(
                         "Clearing data closes and recreates the account's webview. Clearing the cache keeps the WhatsApp session; signing out requires the QR code again. Sizes are approximate while WhatsApp Web is running and stop at a bounded scan limit.",
@@ -883,13 +1282,13 @@ impl SettingsWindow {
                     .border_color(theme.danger)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .text_color(theme.text)
                             .child(tr!("Sign out of “{name}”?", name = name)),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_muted)
                             .child(t!(
                                 "The account and its settings are kept, but its WebKit data is deleted. WhatsApp Web will ask for the QR code again.",
@@ -942,13 +1341,13 @@ impl SettingsWindow {
                     .border_color(theme.danger)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .text_color(theme.text)
                             .child(tr!("Delete all data for “{name}”?", name = name)),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_muted)
                             .child(t!(
                                 "This closes the account, deletes its WebKit profile, and removes it from OxideZap. This cannot be undone.",
@@ -962,7 +1361,7 @@ impl SettingsWindow {
                     .when_some(error, |style, error| {
                         style.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(theme.font_px(11.))
                                 .text_color(theme.danger)
                                 .child(error),
                         )
@@ -1060,14 +1459,14 @@ impl SettingsWindow {
                     }))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(theme.font_px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.text)
                             .child(mode.label()),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_muted)
                             .child(description),
                     ),
@@ -1106,7 +1505,7 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Theme")),
@@ -1114,7 +1513,7 @@ impl SettingsWindow {
                     .child(theme_cards)
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(t!(
                                 "System follows the desktop color scheme live. On Linux this depends on the XDG desktop portal and the desktop settings service, so some window managers may not report changes.",
@@ -1125,7 +1524,7 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Display size")),
@@ -1133,16 +1532,146 @@ impl SettingsWindow {
                     .child(zoom_row)
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(tr!(
-                                "WhatsApp Web zoom is limited to {min}%–{max}%. The native UI keeps its own size.",
+                                "WhatsApp Web zoom is limited to {min}%–{max}%. It does not resize the native UI; use Accessibility for native text size.",
                                 min = (MIN_ZOOM * 100.0) as u32,
                                 max = (MAX_ZOOM * 100.0) as u32
                             )),
                     ),
             )
             .child(self.render_experimental_css(settings, theme, cx))
+            .into_any_element()
+    }
+
+    fn render_accessibility(
+        &mut self,
+        settings: &Settings,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let accessibility = &settings.accessibility;
+        let high_contrast = accessibility.high_contrast;
+        let reduce_motion = accessibility.reduce_motion;
+
+        let mut scale_row = div().flex().flex_wrap().gap(px(8.));
+        for scale in FontScale::ALL {
+            let selected = accessibility.font_scale == scale;
+            let label = format!("{}%", scale.percent());
+            let text = if selected {
+                format!("✓ {label}")
+            } else {
+                label
+            };
+            scale_row = scale_row.child(button(
+                SharedString::from(format!("font-scale-{}", scale.percent())),
+                text,
+                theme,
+                selected,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.model.update_settings(cx, |settings| {
+                        settings.set_font_scale(scale);
+                    });
+                }),
+            ));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .child(section_header(
+                t!("Accessibility"),
+                t!("Contrast, text size, and motion preferences for the native shell. They are saved with your settings and included in exports."),
+                theme,
+            ))
+            .child(
+                card(theme)
+                    .child(toggle_row(
+                        "high-contrast",
+                        t!("High contrast"),
+                        t!("Use a stronger palette for text, backgrounds, and borders in the native shell. The System, Light, and Dark choice still picks the base palette; WhatsApp Web content is unchanged."),
+                        high_contrast,
+                        theme,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.set_high_contrast(!high_contrast);
+                            });
+                        }),
+                    ))
+                    .child(divider(theme))
+                    .child(
+                        div()
+                            .text_size(theme.font_px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child(t!("Text size")),
+                    )
+                    .child(scale_row)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .p(px(10.))
+                            .rounded_md()
+                            .bg(theme.surface_alt)
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .text_size(theme.font_px(14.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .child(t!("Preview text")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme.font_px(12.))
+                                    .text_color(theme.text_muted)
+                                    .child(tr!(
+                                        "This text is shown at {percent}% of its base size.",
+                                        percent = accessibility.font_scale.percent()
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.font_px(11.))
+                            .text_color(theme.text_faint)
+                            .child(t!("Text size scales the Settings window, the lock screen, and the native text in account windows. Icons, spacing, window chrome, text-field contents, the command palette, and the other native windows keep their fixed sizes; WhatsApp Web zoom is separate.")),
+                    ),
+            )
+            .child(
+                card(theme)
+                    .child(toggle_row(
+                        "reduce-motion",
+                        t!("Reduce motion"),
+                        t!("Pause CSS animations and transitions in WhatsApp Web. The native shell has no animated transitions today; any future native transition must honor this setting too. It works independently of battery saver."),
+                        reduce_motion,
+                        theme,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.set_reduce_motion(!reduce_motion);
+                            });
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .text_size(theme.font_px(11.))
+                            .text_color(theme.text_faint)
+                            .child(t!("Reduce motion is independent of battery saver and stays active when the saver is off or the device is on AC power.")),
+                    ),
+            )
+            .child(
+                card(theme).child(
+                    div()
+                        .text_size(theme.font_px(11.))
+                        .text_color(theme.text_faint)
+                        .child(t!("GPUI 0.2.2 has no AccessKit/AT-SPI bridge, so screen readers cannot inspect these native controls. Keyboard focus and the visible focus ring still work, and WhatsApp Web keeps WebKit's own accessibility tree.")),
+                ),
+            )
             .into_any_element()
     }
 
@@ -1175,7 +1704,7 @@ impl SettingsWindow {
         let mut card = card(theme)
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(theme.font_px(12.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted)
                     .child(t!("Experimental CSS")),
@@ -1187,14 +1716,14 @@ impl SettingsWindow {
                     .gap(px(3.))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(theme.font_px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.danger)
                             .child(t!("Unsupported and experimental")),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_muted)
                             .child(t!(
                                 "WhatsApp Web changes its DOM without notice. A stylesheet can break the QR login, calls, dialogs, or the chat view, and may stop working after any WhatsApp update. Do not hide security, privacy, or abuse-reporting controls. OxideZap injects CSS only: it never runs JavaScript from this file and never downloads remote themes.",
@@ -1243,7 +1772,7 @@ impl SettingsWindow {
                     .when(busy, |row| {
                         row.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(theme.font_px(11.))
                                 .text_color(theme.text_muted)
                                 .child(t!("Waiting for the file dialog\u{2026}")),
                         )
@@ -1261,20 +1790,20 @@ impl SettingsWindow {
                     .border_color(theme.border)
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(status),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_muted)
                             .child(preview),
                     ),
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(t!(
                         "Restricted to https://web.whatsapp.com · 64 KiB limit · CSS only · excluded from settings exports.",
@@ -1284,7 +1813,7 @@ impl SettingsWindow {
         if let Some(notice) = feedback {
             card = card.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(if notice.error {
                         theme.danger
                     } else {
@@ -1331,14 +1860,14 @@ impl SettingsWindow {
                         .py(px(8.))
                         .child(
                             div()
-                                .text_size(px(13.))
+                                .text_size(theme.font_px(13.))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(name),
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(theme.font_px(11.))
                                 .text_color(theme.text_faint)
                                 .child(state),
                         ),
@@ -1517,7 +2046,7 @@ impl SettingsWindow {
             ))
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(theme.font_px(13.))
                     .text_color(theme.text_muted)
                     .child(tr!(
                         "Mode: {mode} · Status: {status}",
@@ -1529,14 +2058,14 @@ impl SettingsWindow {
             .child(divider(theme))
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(theme.font_px(12.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted)
                     .child(t!("Quiet hours")),
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(tr!(
                         "Recurring window: {window}.",
@@ -1562,7 +2091,7 @@ impl SettingsWindow {
             .when_some(self.dnd_error.clone(), |card, error| {
                 card.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(theme.font_px(11.))
                         .text_color(theme.danger)
                         .child(error),
                 )
@@ -1570,15 +2099,165 @@ impl SettingsWindow {
             .child(quiet_actions)
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(t!("Quiet hours use the desktop's local time. Overnight ranges such as 22:00-07:00 are supported; each period belongs to the day it starts. Times are re-evaluated when the clock changes or the machine resumes, and daylight-saving transitions follow the desktop timezone.")),
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(t!("'Until tomorrow' uses the quiet-hours end time as its wake hour. Changing the times requires Apply; toggles and presets apply immediately.")),
+            );
+
+        let hide_when_locked = settings.hide_notification_previews_when_locked;
+        let mut privacy_levels = div().flex().flex_wrap().gap(px(8.));
+        for level in NotificationPrivacy::ALL {
+            let selected = settings.notification_privacy == level;
+            let text = if selected {
+                format!("✓ {}", level.label())
+            } else {
+                level.label().to_string()
+            };
+            privacy_levels = privacy_levels.child(button(
+                SharedString::from(format!("notification-privacy-{}", level.slug())),
+                text,
+                theme,
+                selected,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.update_settings(cx, |settings| {
+                            settings.set_notification_privacy(level);
+                        });
+                    });
+                }),
+            ));
+        }
+
+        let mut examples = div().flex().flex_col().gap(px(4.));
+        for level in NotificationPrivacy::ALL {
+            examples = examples.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.text_muted)
+                    .child(format!("{}: {}", level.label(), level.description())),
+            );
+        }
+
+        let preview =
+            notify::NotificationPrivacyPolicy::new(settings.notification_privacy, hide_when_locked)
+                .message(false, "Alice", t!("See you at 18:00."));
+        let preview_summary = preview.summary;
+        let preview_body = preview.body;
+        let mut preview_box = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .p(px(12.))
+            .rounded_md()
+            .bg(theme.surface_alt)
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(preview_summary),
+            );
+        if !preview_body.is_empty() {
+            preview_box = preview_box.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.text_muted)
+                    .child(preview_body),
+            );
+        }
+
+        let privacy_card = card(theme)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(t!("Notification privacy")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(t!(
+                                "Notification privacy controls what the native notification shows. Unread counts, window titles, the tray badge, and the click target never change."
+                            )),
+                    ),
+            )
+            .child(privacy_levels)
+            .child(examples)
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(t!(
+                        "Sender only falls back to Hidden when WhatsApp does not provide a sender."
+                    )),
+            )
+            .child(divider(theme))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child(t!("Preview")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_faint)
+                            .child(t!(
+                                "This is what a message notification looks like with the current selection."
+                            )),
+                    )
+                    .child(preview_box),
+            )
+            .child(toggle_row(
+                "hide-previews-when-locked",
+                t!("Hide previews while OxideZap is locked"),
+                t!(
+                    "While the app is locked, notifications use the Hidden level regardless of the selection above."
+                ),
+                hide_when_locked,
+                theme,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.update_settings(cx, |settings| {
+                            settings.set_hide_notification_previews_when_locked(!hide_when_locked);
+                        });
+                    });
+                }),
+            ))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(t!(
+                        "The notification daemon and the operating system may still store or show content on their own lock screen; OxideZap cannot control that."
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_faint)
+                    .child(t!(
+                        "The selected level applies to message and system notifications such as downloads and errors. Connection and crash notifications keep their full text."
+                    )),
             );
 
         div()
@@ -1611,15 +2290,29 @@ impl SettingsWindow {
                                     !settings.connection_notifications;
                             });
                         }),
+                    ))
+                    .child(divider(theme))
+                    .child(toggle_row(
+                        "unread-title",
+                        t!("Unread count in window title"),
+                        t!("Prefix the title with the account's unread count, for example (3) OxideZap — Work."),
+                        settings.show_unread_in_title,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.model.update_settings(cx, |settings| {
+                                settings.show_unread_in_title = !settings.show_unread_in_title;
+                            });
+                        }),
                     )),
             )
+            .child(privacy_card)
             .child(dnd_card)
             .child(writing_card(settings, theme, cx))
             .child(
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Per-account")),
@@ -1631,11 +2324,10 @@ impl SettingsWindow {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(t!("Muted accounts and Do not disturb have priority over per-account sounds."))
                     .child(t!("Connection notifications also follow Do not disturb and per-account mute."))
-                    .child(t!("Notifications are also suppressed while the app is locked."))
                     .child(t!("Sound playback depends on the notification service and its sound theme; some servers ignore the requested sound or always use their own.")),
             )
             .into_any_element()
@@ -2086,7 +2778,7 @@ impl SettingsWindow {
             .when(busy, |style| {
                 style.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(theme.font_px(12.))
                         .text_color(theme.text_muted)
                         .child(t!(
                             "Waiting for the file dialog or the current operation\u{2026}"
@@ -2097,14 +2789,14 @@ impl SettingsWindow {
         let mut card = card(theme)
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(theme.font_px(12.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted)
                     .child(t!("Backup and restore")),
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(theme.font_px(12.))
                     .text_color(theme.text_muted)
                     .child(t!(
                         "Export the configuration to a readable JSON file, import it on another installation, or restore the defaults.",
@@ -2112,7 +2804,7 @@ impl SettingsWindow {
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(t!(
                         "Exports never include account sessions, cookies, chats, or the app-lock password. Every import and reset writes a dated backup first.",
@@ -2123,7 +2815,7 @@ impl SettingsWindow {
         if let Some(notice) = feedback {
             card = card.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(if notice.error {
                         theme.danger
                     } else {
@@ -2138,7 +2830,7 @@ impl SettingsWindow {
             for change in &preview.changes {
                 summary = summary.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(theme.font_px(12.))
                         .text_color(theme.text)
                         .child(change.clone()),
                 );
@@ -2147,7 +2839,7 @@ impl SettingsWindow {
                 .child(divider(theme))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(theme.font_px(12.))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.text_muted)
                         .child(t!("Import summary")),
@@ -2155,7 +2847,7 @@ impl SettingsWindow {
                 .child(summary)
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(theme.font_px(11.))
                         .text_color(theme.text_faint)
                         .child(t!(
                             "Accounts from the file replace the current account list; local session data is not deleted. The app-lock password is not imported, so set it again afterwards.",
@@ -2190,13 +2882,13 @@ impl SettingsWindow {
                 .child(divider(theme))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(theme.font_px(12.))
                         .text_color(theme.text)
                         .child(t!("Reset preferences to their defaults?")),
                 )
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(theme.font_px(11.))
                         .text_color(theme.text_faint)
                         .child(t!(
                             "Theme, zoom, notifications, startup, the global shortcut, the app-lock password, and the first-run guide status are reset. Accounts and their WhatsApp sessions are kept, and the first-run guide opens again. A dated backup is written first.",
@@ -2341,7 +3033,7 @@ impl SettingsWindow {
         let mut mode_card = card(theme)
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(theme.font_px(12.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted)
                     .child(t!("Connection mode")),
@@ -2349,7 +3041,7 @@ impl SettingsWindow {
             .child(mode_row)
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(self.proxy_mode.description()),
             );
@@ -2389,7 +3081,7 @@ impl SettingsWindow {
                 .child(divider(theme))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(theme.font_px(12.))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.text_muted)
                         .child(t!("Proxy protocol")),
@@ -2427,7 +3119,7 @@ impl SettingsWindow {
                 )
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(theme.font_px(11.))
                         .text_color(theme.danger)
                         .child(t!("Proxy credentials are stored as plain text in settings.json. The file is private (0600) and credentials are never logged or written to exports, but this build does not use a system keyring. Prefer a proxy that does not require a password.")),
                 );
@@ -2438,19 +3130,19 @@ impl SettingsWindow {
             .child(divider(theme))
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(t!("The proxy is applied to each account's WebKit data manager when the account opens. Existing connections keep their route, so reopen an account if the change does not take effect.")),
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(t!("Test connection checks web.whatsapp.com through the configured route without blocking the interface. HTTP and SOCKS5 proxies are tested end to end; an HTTPS proxy is checked for reachability before the TLS handshake.")),
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_muted)
                     .child(tr!(
                         "Saved configuration: {summary}",
@@ -2487,7 +3179,7 @@ impl SettingsWindow {
         if let Some(notice) = self.proxy_feedback.clone() {
             mode_card = mode_card.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(if notice.error {
                         theme.danger
                     } else {
@@ -2543,14 +3235,14 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Interface language")),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(t!(
                                 "Translates the native shell and its windows. WhatsApp Web content keeps its own language."
@@ -2624,7 +3316,7 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Global shortcut")),
@@ -2637,12 +3329,33 @@ impl SettingsWindow {
                     .when_some(error, |style, error| {
                         style.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(theme.font_px(11.))
                                 .text_color(theme.danger)
                                 .child(error),
                         )
                     })
                     .child(div().flex().gap(px(8.)).child(button(
+                        "reset-shortcut",t!("Reset"),
+                        theme,
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            let default = "Ctrl+Shift+W".to_string();
+                            this.shortcut_field.update(cx, |field, cx| {
+                                field.set_content(default.clone(), cx);
+                            });
+                            if let Ok(shortcut) = Shortcut::parse("Ctrl+Shift+W") {
+                                let result = this.model.update(cx, |model, cx| {
+                                    model.set_shortcut(shortcut, cx)
+                                });
+                                match result {
+                                    Ok(()) => this.shortcut_error = None,
+                                    Err(error) => this.shortcut_error = Some(error),
+                                }
+                            }
+                            cx.notify();
+                        }),
+                    ))
+                    .child(button(
                         "apply-shortcut",t!("Apply shortcut"),
                         theme,
                         true,
@@ -2668,14 +3381,14 @@ impl SettingsWindow {
                     )))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(t!("Global shortcuts require an X11 or XWayland session.")),
                     )
                     .child(divider(theme))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Boss key")),
@@ -2688,7 +3401,7 @@ impl SettingsWindow {
                     .when_some(boss_error, |style, error| {
                         style.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(theme.font_px(11.))
                                 .text_color(theme.danger)
                                 .child(error),
                         )
@@ -2719,14 +3432,14 @@ impl SettingsWindow {
                     )))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(t!("The boss key uses the same X11/XWayland grab and can conflict with desktop shortcuts.")),
                     )
                     .child(divider(theme))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Command palette")),
@@ -2739,7 +3452,7 @@ impl SettingsWindow {
                     .when_some(palette_error, |style, error| {
                         style.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(theme.font_px(11.))
                                 .text_color(theme.danger)
                                 .child(error),
                         )
@@ -2784,7 +3497,7 @@ impl SettingsWindow {
                     )))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(t!("A global palette shortcut takes precedence over WhatsApp Web's own Ctrl+K chat search.")),
                     ),
@@ -2793,7 +3506,7 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Downloads")),
@@ -2806,7 +3519,7 @@ impl SettingsWindow {
                     .when_some(downloads_error, |style, error| {
                         style.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(theme.font_px(11.))
                                 .text_color(theme.danger)
                                 .child(error),
                         )
@@ -2888,7 +3601,7 @@ impl SettingsWindow {
                     ))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(tr!(
                                 "The download history keeps the last {count} entries. Existing files are never overwritten; collisions get a numbered suffix.",
@@ -2900,20 +3613,20 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("First-run guide")),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .text_color(theme.text_muted)
                             .child(t!("Review the WhatsApp Web login, the QR steps, account isolation, tray and close behavior, notifications, the app lock, and where OxideZap stores data.")),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(onboarding_status),
                     )
@@ -2974,7 +3687,7 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child("Battery saver mode"),
@@ -2982,13 +3695,13 @@ impl SettingsWindow {
                     .child(mode_row)
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(settings.performance.mode.description()),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(
                                 "Automatic reads the power source from /sys/class/power_supply and stays in normal mode when no battery can be read. Changes apply immediately; no restart is needed.",
@@ -2997,7 +3710,7 @@ impl SettingsWindow {
                     .child(divider(theme))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .text_color(if saver_active {
                                 theme.accent
                             } else {
@@ -3007,7 +3720,7 @@ impl SettingsWindow {
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(format!(
                                 "Power source: {}. {} mode.",
@@ -3020,7 +3733,7 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child("What battery saver changes"),
@@ -3047,7 +3760,7 @@ impl SettingsWindow {
                     ))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(
                                 "These are qualitative cadence reductions, not benchmarked FPS or watt savings. WebKit does not expose per-view CPU or GPU use, and WhatsApp Web plus WebKit still dominate power consumption.",
@@ -3071,7 +3784,7 @@ impl SettingsWindow {
                     .child(divider(theme))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Release hidden accounts after")),
@@ -3079,7 +3792,7 @@ impl SettingsWindow {
                     .child(delay_row)
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(t!("Reactivating reloads WhatsApp Web, which takes a few seconds. The current scroll position or an unsent draft may be lost.")),
                     )
@@ -3100,7 +3813,7 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Status")),
@@ -3132,7 +3845,7 @@ impl SettingsWindow {
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(tr!(
                                 "The estimate assumes about {size} per released WebKit web process. WebKit does not expose per-view memory, so this is not a measurement.",
@@ -3170,7 +3883,7 @@ impl SettingsWindow {
                     .when_some(feedback, |style, notice| {
                         style.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(theme.font_px(11.))
                                 .text_color(if notice.error {
                                     theme.danger
                                 } else {
@@ -3184,14 +3897,14 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("What suspension keeps")),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .text_color(theme.text_muted)
                             .child(t!("Suspending never deletes the account, its WebKit profile, cookies, local storage, or the WhatsApp login. It only destroys the running view, which lets WebKit terminate that account's web process. Downloads, calls, and recordings always block suspension, and nothing is released while the app is locked or quitting.")),
                     ),
@@ -3276,7 +3989,7 @@ impl SettingsWindow {
                         .justify_between()
                         .child(
                             div()
-                                .text_size(px(14.))
+                                .text_size(theme.font_px(14.))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(t!("Lock after idle time")),
@@ -3296,7 +4009,7 @@ impl SettingsWindow {
 
         let mut password_card = card(theme).child(
             div()
-                .text_size(px(12.))
+                .text_size(theme.font_px(12.))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text_muted)
                 .child(if has_password {
@@ -3324,7 +4037,7 @@ impl SettingsWindow {
             .when_some(error, |style, error| {
                 style.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(theme.font_px(11.))
                         .text_color(theme.danger)
                         .child(error),
                 )
@@ -3393,7 +4106,7 @@ impl SettingsWindow {
                     .bg(theme.surface_alt)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .text_color(theme.text)
                             .child(t!("Remove password protection?")),
                     )
@@ -3500,14 +4213,14 @@ impl SettingsWindow {
                                     .gap(px(3.))
                                     .child(
                                         div()
-                                            .text_size(px(17.))
+                                            .text_size(theme.font_px(17.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
                                             .child("OxideZap"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(12.))
+                                            .text_size(theme.font_px(12.))
                                             .text_color(theme.text_muted)
                                             .child(tr!(
                                                 "Version {version}",
@@ -3517,14 +4230,14 @@ impl SettingsWindow {
                                     .when(update.development, |style| {
                                         style.child(
                                             div()
-                                                .text_size(px(11.))
+                                                .text_size(theme.font_px(11.))
                                                 .text_color(theme.text_faint)
                                                 .child(t!("Development build")),
                                         )
                                     })
                                     .child(
                                         div()
-                                            .text_size(px(11.))
+                                            .text_size(theme.font_px(11.))
                                             .text_color(theme.text_faint)
                                             .child(t!("Rust · GPUI · WebKitGTK")),
                                     ),
@@ -3533,7 +4246,7 @@ impl SettingsWindow {
                     .child(divider(theme))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .text_color(theme.text_muted)
                             .child(t!("OxideZap is an unofficial, independent project. It is not affiliated with, endorsed by, or sponsored by WhatsApp or Meta. WhatsApp is a trademark of Meta Platforms, Inc.")),
                     )
@@ -3567,14 +4280,14 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(14.))
+                            .text_size(theme.font_px(14.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.text)
                             .child("Diagnostics"),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .text_color(theme.text_muted)
                             .child(
                                 "Preview, copy, or save a privacy-scrubbed report with versions, session details, settings states, and recent errors. It never includes chats, account names or ids, cookies, proxy credentials, the app-lock hash, or full home paths.",
@@ -3619,7 +4332,7 @@ impl SettingsWindow {
                     .when_some(diagnostics_feedback, |style, notice| {
                         style.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(theme.font_px(11.))
                                 .text_color(if notice.error {
                                     theme.danger
                                 } else {
@@ -3640,7 +4353,7 @@ impl SettingsWindow {
                                 .border_1()
                                 .border_color(theme.border)
                                 .font_family("monospace")
-                                .text_size(px(10.))
+                                .text_size(theme.font_px(10.))
                                 .text_color(theme.text_muted)
                                 .child(preview),
                         )
@@ -3652,7 +4365,7 @@ impl SettingsWindow {
                         .border_color(theme.accent)
                         .child(
                             div()
-                                .text_size(px(14.))
+                                .text_size(theme.font_px(14.))
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme.text)
                                 .child(tr!(
@@ -3662,7 +4375,7 @@ impl SettingsWindow {
                         )
                         .child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(theme.font_px(12.))
                                 .text_color(theme.text_muted)
                                 .child(t!("A newer release is published on GitHub. OxideZap does not download or install it automatically.")),
                         )
@@ -3709,7 +4422,7 @@ impl SettingsWindow {
                     .when_some(status, |style, status| {
                         style.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(theme.font_px(11.))
                                 .text_color(theme.text_faint)
                                 .child(status),
                         )
@@ -3719,20 +4432,20 @@ impl SettingsWindow {
                 card(theme)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
                             .child(t!("Built with")),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme.font_px(12.))
                             .text_color(theme.text)
                             .child(t!("GPUI for the native shell · WebKitGTK for WhatsApp Web · Rust for everything in between.")),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.font_px(11.))
                             .text_color(theme.text_faint)
                             .child(t!("MIT licensed. The source code is available on GitHub.")),
                     ),
@@ -3778,14 +4491,14 @@ fn writing_card(
     card(theme)
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(theme.font_px(12.))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text_muted)
                 .child(t!("Writing")),
         )
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(theme.font_px(13.))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text)
                 .child(t!("Spell check language")),
@@ -3804,7 +4517,7 @@ fn writing_card(
         ))
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(theme.font_px(11.))
                 .text_color(theme.text_faint)
                 .child(t!("Automatic follows the desktop locale. WebKitGTK only checks languages whose hunspell dictionaries are installed. Changes apply to open accounts; WhatsApp Web still controls its own composer and Enter-to-send behavior.")),
         )
@@ -3839,11 +4552,13 @@ impl Render for SettingsWindow {
                 model.update_state.clone(),
             )
         };
+        window.set_rem_size(theme.rem_size());
 
         let content = match self.section {
             SettingsSection::Accounts => self.render_accounts(&settings, theme, cx),
             SettingsSection::Storage => self.render_storage(&settings, theme, cx),
             SettingsSection::Appearance => self.render_appearance(&settings, theme, cx),
+            SettingsSection::Accessibility => self.render_accessibility(&settings, theme, cx),
             SettingsSection::Notifications => self.render_notifications(&settings, theme, cx),
             SettingsSection::Network => self.render_network(&settings, theme, cx),
             SettingsSection::General => self.render_general(&settings, theme, cx),
@@ -3876,14 +4591,14 @@ impl Render for SettingsWindow {
                             .flex_col()
                             .child(
                                 div()
-                                    .text_size(px(13.))
+                                    .text_size(theme.font_px(13.))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(theme.text)
                                     .child("OxideZap"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(theme.font_px(10.))
                                     .text_color(theme.text_faint)
                                     .child(t!("Settings")),
                             ),
@@ -3895,6 +4610,7 @@ impl Render for SettingsWindow {
             SettingsSection::Accounts,
             SettingsSection::Storage,
             SettingsSection::Appearance,
+            SettingsSection::Accessibility,
             SettingsSection::Notifications,
             SettingsSection::Network,
             SettingsSection::General,
@@ -3919,7 +4635,7 @@ impl Render for SettingsWindow {
         sidebar = sidebar.child(div().flex_1()).child(
             div()
                 .px(px(8.))
-                .text_size(px(10.))
+                .text_size(theme.font_px(10.))
                 .text_color(theme.text_faint)
                 .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
         );
@@ -3963,13 +4679,13 @@ fn storage_stat(label: &'static str, value: String, theme: Theme) -> impl IntoEl
         .gap(px(3.))
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(theme.font_px(11.))
                 .text_color(theme.text_faint)
                 .child(label),
         )
         .child(
             div()
-                .text_size(px(16.))
+                .text_size(theme.font_px(16.))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.text)
                 .child(value),
@@ -3985,7 +4701,7 @@ fn avatar(initial: &str, theme: Theme) -> impl IntoElement {
         .rounded_full()
         .bg(theme.accent)
         .text_color(theme.accent_text)
-        .text_size(px(15.))
+        .text_size(theme.font_px(15.))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .child(initial.to_uppercase())
 }
@@ -4019,7 +4735,7 @@ fn performance_change_line(text: &'static str, theme: Theme) -> impl IntoElement
     div()
         .flex()
         .gap(px(6.))
-        .text_size(px(12.))
+        .text_size(theme.font_px(12.))
         .text_color(theme.text_muted)
         .child("•")
         .child(text)

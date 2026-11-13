@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Sender, bounded, unbounded};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 /// On-disk account storage inspection and cleanup. The implementation lives in
@@ -212,6 +213,212 @@ impl ThemeMode {
     }
 }
 
+/// Optional theme override for one account. `Inherit` follows the global
+/// [`Settings::theme`], so an account can keep following the desktop while
+/// another account pins its own theme. Older settings files have no appearance
+/// field and deserialize to `Inherit`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountTheme {
+    #[default]
+    Inherit,
+    System,
+    Light,
+    Dark,
+}
+
+impl AccountTheme {
+    pub fn label(self) -> &'static str {
+        match self {
+            AccountTheme::Inherit => t!("Use global"),
+            AccountTheme::System => ThemeMode::System.label(),
+            AccountTheme::Light => ThemeMode::Light.label(),
+            AccountTheme::Dark => ThemeMode::Dark.label(),
+        }
+    }
+
+    pub fn is_inherit(&self) -> bool {
+        matches!(self, AccountTheme::Inherit)
+    }
+
+    /// The theme this override pins, or `None` when it inherits the global one.
+    pub fn theme_mode(self) -> Option<ThemeMode> {
+        match self {
+            AccountTheme::Inherit => None,
+            AccountTheme::System => Some(ThemeMode::System),
+            AccountTheme::Light => Some(ThemeMode::Light),
+            AccountTheme::Dark => Some(ThemeMode::Dark),
+        }
+    }
+}
+
+/// Per-account appearance overrides. Every field is optional: a missing or
+/// cleared value inherits the corresponding global setting.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AccountAppearance {
+    #[serde(skip_serializing_if = "AccountTheme::is_inherit")]
+    pub theme: AccountTheme,
+    /// `None` inherits the global WhatsApp zoom.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zoom: Option<f64>,
+}
+
+impl AccountAppearance {
+    /// True when the account follows the global appearance in every respect.
+    pub fn is_inherit(&self) -> bool {
+        self.theme.is_inherit() && self.zoom.is_none()
+    }
+
+    /// Clamps a stored override. A non-finite zoom is treated as "inherit"
+    /// instead of being written back as a meaningless value.
+    pub fn normalize(&mut self) {
+        self.zoom = self.zoom.filter(|zoom| zoom.is_finite()).map(clamp_zoom);
+    }
+
+    pub fn resolve_theme(&self, global: ThemeMode) -> ThemeMode {
+        self.theme.theme_mode().unwrap_or(global)
+    }
+
+    pub fn resolve_zoom(&self, global: f64) -> f64 {
+        self.zoom
+            .map(clamp_zoom)
+            .unwrap_or_else(|| clamp_zoom(global))
+    }
+
+    pub fn set_theme(&mut self, theme: AccountTheme) -> bool {
+        if self.theme == theme {
+            return false;
+        }
+        self.theme = theme;
+        true
+    }
+
+    pub fn set_zoom(&mut self, zoom: Option<f64>) -> bool {
+        let zoom = zoom.filter(|zoom| zoom.is_finite()).map(clamp_zoom);
+        match (self.zoom, zoom) {
+            (None, None) => false,
+            (Some(current), Some(next)) if (current - next).abs() < f64::EPSILON => false,
+            _ => {
+                self.zoom = zoom;
+                true
+            }
+        }
+    }
+}
+
+/// Preset native-shell text sizes. The stored value is an integer percentage
+/// so `settings.json` stays readable, and deserialization accepts either a
+/// number or a string such as `"115"` or `"115%"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FontScale(u32);
+
+impl Default for FontScale {
+    fn default() -> Self {
+        Self::PERCENT_100
+    }
+}
+
+impl FontScale {
+    pub const PERCENT_100: Self = Self(100);
+    pub const PERCENT_115: Self = Self(115);
+    pub const PERCENT_130: Self = Self(130);
+    pub const ALL: [Self; 3] = [Self::PERCENT_100, Self::PERCENT_115, Self::PERCENT_130];
+
+    pub const fn percent(self) -> u32 {
+        self.0
+    }
+
+    pub fn factor(self) -> f32 {
+        self.0 as f32 / 100.0
+    }
+
+    /// Snaps a percentage to the nearest supported preset. Non-finite values
+    /// fall back to 100% and out-of-range values are clamped, so an edited
+    /// settings file can never disable the native shell or make its text
+    /// unbounded.
+    pub fn from_percent(percent: f64) -> Self {
+        if !percent.is_finite() {
+            return Self::default();
+        }
+        let clamped = percent.clamp(
+            Self::PERCENT_100.percent() as f64,
+            Self::PERCENT_130.percent() as f64,
+        );
+        Self::ALL
+            .into_iter()
+            .min_by(|left, right| {
+                (left.percent() as f64 - clamped)
+                    .abs()
+                    .total_cmp(&(right.percent() as f64 - clamped).abs())
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn parse(value: &str) -> Self {
+        value
+            .trim()
+            .trim_end_matches('%')
+            .parse::<f64>()
+            .map(Self::from_percent)
+            .unwrap_or_default()
+    }
+}
+
+impl Serialize for FontScale {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u32(self.percent())
+    }
+}
+
+impl<'de> Deserialize<'de> for FontScale {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Number(f64),
+            Text(String),
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Number(percent) => Self::from_percent(percent),
+            Repr::Text(value) => Self::parse(&value),
+        })
+    }
+}
+
+/// Native-shell accessibility preferences. Missing fields in older settings
+/// files fall back to the pre-accessibility behavior: normal contrast, 100%
+/// text, and no extra motion reduction.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AccessibilitySettings {
+    pub high_contrast: bool,
+    pub font_scale: FontScale,
+    pub reduce_motion: bool,
+}
+
+impl AccessibilitySettings {
+    pub fn normalize(&mut self) {
+        self.font_scale = FontScale::from_percent(self.font_scale.percent() as f64);
+    }
+}
+
+/// Shared motion policy used by the settings window, the GPUI model, and the
+/// WebKit thread. The reduced-motion stylesheet is active when either battery
+/// saver or the independent Reduce motion preference asks for it. The
+/// preference never enables battery saver and battery saver never changes the
+/// preference, so the two controls stay independent.
+pub fn reduce_motion_active(battery_saver: bool, reduce_motion: bool) -> bool {
+    battery_saver || reduce_motion
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SavedBounds {
     pub x: f32,
@@ -333,6 +540,147 @@ pub fn restore_account_bounds(
     }
 }
 
+/// Maximum number of grapheme clusters accepted for a custom account avatar.
+pub const ACCOUNT_AVATAR_MAX_GRAPHEMES: usize = 2;
+
+/// Accessible accent colors offered in Settings > Accounts. Every entry keeps
+/// at least a 4.5:1 contrast ratio with white, the WCAG AA minimum for normal
+/// text, so an avatar label stays readable in both themes.
+#[allow(dead_code)]
+pub const ACCOUNT_COLORS: [&str; 8] = [
+    "#0f766e", "#15803d", "#3f6212", "#a16207", "#b91c1c", "#be185d", "#7c3aed", "#1d4ed8",
+];
+
+/// A validated per-account accent color. Values are stored in settings as a
+/// normalized lowercase `#rrggbb` string so hand-edited files keep a stable
+/// shape and are compared in one representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AccountColor {
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+impl AccountColor {
+    pub const WHITE: Self = Self::new(0xff, 0xff, 0xff);
+    /// Black is used as the dark foreground because it guarantees at least a
+    /// 4.5:1 ratio with one of the two choices for every possible background.
+    pub const INK: Self = Self::new(0x00, 0x00, 0x00);
+
+    pub const fn new(red: u8, green: u8, blue: u8) -> Self {
+        Self { red, green, blue }
+    }
+
+    /// Parses `#rgb`, `#rrggbb`, or the same values without the leading `#`.
+    /// Uppercase input is accepted and normalized by [`Self::to_hex`].
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        let value = value.strip_prefix('#').unwrap_or(value);
+        if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return None;
+        }
+        match value.len() {
+            3 => {
+                let mut digits = value.chars().map(hex_digit);
+                let red = digits.next()?? * 17;
+                let green = digits.next()?? * 17;
+                let blue = digits.next()?? * 17;
+                Some(Self::new(red, green, blue))
+            }
+            6 => {
+                let red = u8::from_str_radix(&value[0..2], 16).ok()?;
+                let green = u8::from_str_radix(&value[2..4], 16).ok()?;
+                let blue = u8::from_str_radix(&value[4..6], 16).ok()?;
+                Some(Self::new(red, green, blue))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn to_hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.red, self.green, self.blue)
+    }
+
+    /// `0xRRGGBB`, ready for GPUI's `rgb`.
+    pub fn rgb(self) -> u32 {
+        let [red, green, blue] = self.channels();
+        u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue)
+    }
+
+    pub fn channels(self) -> [u8; 3] {
+        [self.red, self.green, self.blue]
+    }
+
+    /// WCAG 2.x relative luminance.
+    pub fn relative_luminance(self) -> f64 {
+        fn linear(channel: u8) -> f64 {
+            let channel = f64::from(channel) / 255.0;
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * linear(self.red) + 0.7152 * linear(self.green) + 0.0722 * linear(self.blue)
+    }
+
+    /// WCAG contrast ratio between two colors, from 1.0 to 21.0.
+    pub fn contrast_ratio(self, other: Self) -> f64 {
+        let left = self.relative_luminance();
+        let right = other.relative_luminance();
+        let (lighter, darker) = if left >= right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// Picks white or black to keep the avatar label readable on this
+    /// background, including light custom colors.
+    pub fn readable_text(self) -> Self {
+        if self.contrast_ratio(Self::WHITE) >= self.contrast_ratio(Self::INK) {
+            Self::WHITE
+        } else {
+            Self::INK
+        }
+    }
+}
+
+fn hex_digit(ch: char) -> Option<u8> {
+    ch.to_digit(16).map(|digit| digit as u8)
+}
+
+/// Validates a user-supplied avatar label: one emoji, one character, or up to
+/// two grapheme clusters. Empty input clears the avatar and uses the name
+/// initial instead.
+pub fn normalize_avatar_label(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    if UnicodeSegmentation::graphemes(value, true).count() > ACCOUNT_AVATAR_MAX_GRAPHEMES {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// The identity rendered for an account everywhere in the native shell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountIdentity {
+    pub label: String,
+    pub accent: Option<AccountColor>,
+}
+
+impl Default for AccountIdentity {
+    fn default() -> Self {
+        Self {
+            label: "?".to_string(),
+            accent: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Account {
     pub id: String,
@@ -347,6 +695,13 @@ pub struct Account {
     pub muted: bool,
     #[serde(default = "notification_sound_default")]
     pub notification_sound: bool,
+    /// Optional avatar label: one emoji or up to two characters. An absent
+    /// value falls back to the deterministic first letter of the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    /// Optional accent color stored as a normalized lowercase `#rrggbb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
     /// Keeps this account's window above other windows through the window
     /// manager's `_NET_WM_STATE_ABOVE` state.
     #[serde(default)]
@@ -363,6 +718,10 @@ pub struct Account {
     /// window manager reported when the window was closed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bounds_by_monitor: BTreeMap<String, SavedBounds>,
+    /// Optional theme and WhatsApp zoom for this account. Older settings files
+    /// have no appearance object, so the account inherits the global setting.
+    #[serde(default, skip_serializing_if = "AccountAppearance::is_inherit")]
+    pub appearance: AccountAppearance,
 }
 
 fn notification_sound_default() -> bool {
@@ -379,11 +738,14 @@ impl Account {
             maximized: false,
             muted: false,
             notification_sound: true,
+            avatar: None,
+            accent: None,
             always_on_top: false,
             mini_mode: false,
             normal_bounds: None,
             mini_bounds: None,
             bounds_by_monitor: BTreeMap::new(),
+            appearance: AccountAppearance::default(),
         }
     }
 
@@ -396,11 +758,14 @@ impl Account {
             maximized: false,
             muted: false,
             notification_sound: true,
+            avatar: None,
+            accent: None,
             always_on_top: false,
             mini_mode: false,
             normal_bounds: None,
             mini_bounds: None,
             bounds_by_monitor: BTreeMap::new(),
+            appearance: AccountAppearance::default(),
         }
     }
 
@@ -410,6 +775,65 @@ impl Account {
             .find(|ch| !ch.is_whitespace())
             .map(|ch| ch.to_uppercase().to_string())
             .unwrap_or_else(|| "?".to_string())
+    }
+
+    /// The label rendered inside the account avatar. A user-selected emoji or
+    /// characters win; otherwise the deterministic name initial is used.
+    pub fn avatar_label(&self) -> String {
+        self.avatar.clone().unwrap_or_else(|| self.initial())
+    }
+
+    pub fn accent_color(&self) -> Option<AccountColor> {
+        self.accent.as_deref().and_then(AccountColor::parse)
+    }
+
+    pub fn identity(&self) -> AccountIdentity {
+        AccountIdentity {
+            label: self.avatar_label(),
+            accent: self.accent_color(),
+        }
+    }
+
+    /// `None` clears the accent. Invalid colors are rejected without changing
+    /// the current value.
+    pub fn set_accent(&mut self, accent: Option<&str>) -> bool {
+        let accent = match accent {
+            None => None,
+            Some(value) => match AccountColor::parse(value) {
+                Some(color) => Some(color.to_hex()),
+                None => return false,
+            },
+        };
+        if self.accent == accent {
+            return false;
+        }
+        self.accent = accent;
+        true
+    }
+
+    /// `None` or an empty value clears the avatar and restores the initial.
+    /// Invalid labels are rejected without changing the current value.
+    pub fn set_avatar(&mut self, avatar: Option<&str>) -> bool {
+        let avatar = match avatar {
+            None => None,
+            Some(value) if value.trim().is_empty() => None,
+            Some(value) => match normalize_avatar_label(value) {
+                Some(value) => Some(value),
+                None => return false,
+            },
+        };
+        if self.avatar == avatar {
+            return false;
+        }
+        self.avatar = avatar;
+        true
+    }
+
+    pub fn reset_identity(&mut self) -> bool {
+        let changed = self.accent.is_some() || self.avatar.is_some();
+        self.accent = None;
+        self.avatar = None;
+        changed
     }
 
     /// Remembers the normal bounds on the monitor that contains the window and
@@ -440,6 +864,21 @@ impl Account {
             };
             self.bounds_by_monitor.remove(&oldest);
         }
+    }
+
+    /// Keeps only identity values that still parse, so a hand-edited or
+    /// imported file with an invalid color or a huge avatar falls back to the
+    /// default identity instead of breaking rendering.
+    fn normalize_identity(&mut self) {
+        self.accent = self
+            .accent
+            .take()
+            .and_then(|value| AccountColor::parse(&value))
+            .map(AccountColor::to_hex);
+        self.avatar = self
+            .avatar
+            .take()
+            .and_then(|value| normalize_avatar_label(&value));
     }
 }
 
@@ -2014,6 +2453,72 @@ fn format_remaining(target: SystemTime, now: SystemTime) -> String {
     }
 }
 
+/// How much of a WhatsApp message a native notification may reveal.
+///
+/// The value is persisted as a stable slug. Unknown slugs fall back to `Full`,
+/// which keeps settings files written before this option existed readable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotificationPrivacy {
+    /// Sender and message text, the behavior before this option existed.
+    #[default]
+    Full,
+    /// Sender name only, with a generic body.
+    SenderOnly,
+    /// A generic message with no sender or content.
+    Hidden,
+}
+
+impl NotificationPrivacy {
+    pub const ALL: [Self; 3] = [Self::Full, Self::SenderOnly, Self::Hidden];
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::SenderOnly => "sender_only",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => t!("Full preview"),
+            Self::SenderOnly => t!("Sender only"),
+            Self::Hidden => t!("Hidden"),
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Full => t!("Shows the sender and the message text."),
+            Self::SenderOnly => t!("Shows the sender name but hides the message text."),
+            Self::Hidden => t!("Shows a generic message with no sender or content."),
+        }
+    }
+}
+
+impl Serialize for NotificationPrivacy {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.slug())
+    }
+}
+
+impl<'de> Deserialize<'de> for NotificationPrivacy {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.trim().to_ascii_lowercase().as_str() {
+            "sender_only" | "sender-only" | "sender" => Self::SenderOnly,
+            "hidden" | "minimal" | "none" => Self::Hidden,
+            _ => Self::Full,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
@@ -2024,7 +2529,16 @@ pub struct Settings {
     pub zoom: f64,
     pub notifications: bool,
     pub connection_notifications: bool,
+    /// Prefixes the window title with the account's unread count, for example
+    /// `(3) OxideZap — Work`. Disabling it keeps the tray badge and titlebar
+    /// badge unchanged.
+    pub show_unread_in_title: bool,
     pub do_not_disturb: DoNotDisturbSettings,
+    /// How much of a message a native notification may reveal.
+    pub notification_privacy: NotificationPrivacy,
+    /// Downgrades every notification to `Hidden` while the app lock is active.
+    /// Enabled by default so locking the app never exposes notification text.
+    pub hide_notification_previews_when_locked: bool,
     pub close_to_tray: bool,
     pub start_at_login: bool,
     pub automatic_update_checks: bool,
@@ -2058,6 +2572,9 @@ pub struct Settings {
     /// Experimental WhatsApp Web CSS. Missing fields in older settings files
     /// fall back to the disabled default.
     pub appearance: AppearanceSettings,
+    /// High contrast, native text size, and reduced motion. Missing fields in
+    /// older settings files fall back to the pre-accessibility defaults.
+    pub accessibility: AccessibilitySettings,
     /// Whether the user finished or skipped the first-run guide. It is
     /// persisted so the guide is shown only once; Settings > General can
     /// reopen it at any time without changing this value.
@@ -2077,7 +2594,10 @@ impl Default for Settings {
             zoom: 1.0,
             notifications: true,
             connection_notifications: true,
+            show_unread_in_title: true,
             do_not_disturb: DoNotDisturbSettings::default(),
+            notification_privacy: NotificationPrivacy::Full,
+            hide_notification_previews_when_locked: true,
             close_to_tray: true,
             start_at_login: false,
             automatic_update_checks: true,
@@ -2098,6 +2618,7 @@ impl Default for Settings {
             memory: MemorySettings::default(),
             performance: performance::PerformanceSettings::default(),
             appearance: AppearanceSettings::default(),
+            accessibility: AccessibilitySettings::default(),
             onboarding_completed: false,
             onboarding_version: 0,
         }
@@ -2194,6 +2715,7 @@ impl Settings {
         self.writing.normalize();
         self.do_not_disturb.normalize();
         self.appearance.normalize();
+        self.accessibility.normalize();
         self.network.proxy.manual.normalize();
         if let Some(directory) = self.downloads_directory.take() {
             self.downloads_directory = crate::paths::valid_directory_setting(&directory)
@@ -2201,6 +2723,8 @@ impl Settings {
         }
         self.ensure_first_account();
         for account in &mut self.accounts {
+            account.appearance.normalize();
+            account.normalize_identity();
             account.normalize_bounds();
         }
         if self
@@ -2267,6 +2791,21 @@ impl Settings {
         true
     }
 
+    pub fn set_account_accent(&mut self, id: &str, accent: Option<&str>) -> bool {
+        self.account_mut(id)
+            .is_some_and(|account| account.set_accent(accent))
+    }
+
+    pub fn set_account_avatar(&mut self, id: &str, avatar: Option<&str>) -> bool {
+        self.account_mut(id)
+            .is_some_and(|account| account.set_avatar(avatar))
+    }
+
+    pub fn reset_account_identity(&mut self, id: &str) -> bool {
+        self.account_mut(id)
+            .is_some_and(|account| account.reset_identity())
+    }
+
     pub fn set_unread(&mut self, id: &str, unread: u32) -> bool {
         let Some(account) = self.account_mut(id) else {
             return false;
@@ -2310,6 +2849,22 @@ impl Settings {
         } else {
             self.do_not_disturb.set_off()
         }
+    }
+
+    pub fn set_notification_privacy(&mut self, privacy: NotificationPrivacy) -> bool {
+        if self.notification_privacy == privacy {
+            return false;
+        }
+        self.notification_privacy = privacy;
+        true
+    }
+
+    pub fn set_hide_notification_previews_when_locked(&mut self, enabled: bool) -> bool {
+        if self.hide_notification_previews_when_locked == enabled {
+            return false;
+        }
+        self.hide_notification_previews_when_locked = enabled;
+        true
     }
 
     /// A muted account, the global Do Not Disturb state, or the recurring
@@ -2366,12 +2921,85 @@ impl Settings {
         true
     }
 
+    pub fn set_high_contrast(&mut self, high_contrast: bool) -> bool {
+        if self.accessibility.high_contrast == high_contrast {
+            return false;
+        }
+        self.accessibility.high_contrast = high_contrast;
+        true
+    }
+
+    pub fn set_font_scale(&mut self, font_scale: FontScale) -> bool {
+        if self.accessibility.font_scale == font_scale {
+            return false;
+        }
+        self.accessibility.font_scale = font_scale;
+        true
+    }
+
+    pub fn set_reduce_motion(&mut self, reduce_motion: bool) -> bool {
+        if self.accessibility.reduce_motion == reduce_motion {
+            return false;
+        }
+        self.accessibility.reduce_motion = reduce_motion;
+        true
+    }
+
     pub fn set_theme(&mut self, theme: ThemeMode) -> bool {
         if self.theme == theme {
             return false;
         }
         self.theme = theme;
         true
+    }
+
+    /// Theme actually used by an account window: its own override wins, then
+    /// the global theme.
+    pub fn effective_theme(&self, id: &str) -> ThemeMode {
+        self.account(id)
+            .map(|account| account.appearance.resolve_theme(self.theme))
+            .unwrap_or(self.theme)
+    }
+
+    /// WhatsApp zoom actually applied to an account: its own override wins,
+    /// then the global zoom. Both are clamped to the supported range.
+    pub fn effective_zoom(&self, id: &str) -> f64 {
+        self.account(id)
+            .map(|account| account.appearance.resolve_zoom(self.zoom))
+            .unwrap_or_else(|| clamp_zoom(self.zoom))
+    }
+
+    pub fn set_account_theme(&mut self, id: &str, theme: AccountTheme) -> bool {
+        let Some(account) = self.account_mut(id) else {
+            return false;
+        };
+        account.appearance.set_theme(theme)
+    }
+
+    pub fn set_account_zoom(&mut self, id: &str, zoom: Option<f64>) -> bool {
+        let Some(account) = self.account_mut(id) else {
+            return false;
+        };
+        account.appearance.set_zoom(zoom)
+    }
+
+    /// Copies one account's appearance overrides to every other account. This
+    /// is an explicit bulk action; ordinary changes never touch other accounts.
+    pub fn apply_account_appearance_to_all(&mut self, source_id: &str) -> bool {
+        let Some(appearance) = self
+            .account(source_id)
+            .map(|account| account.appearance.clone())
+        else {
+            return false;
+        };
+        let mut changed = false;
+        for account in &mut self.accounts {
+            if account.id != source_id && account.appearance != appearance {
+                account.appearance = appearance.clone();
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn first_account_id(&self) -> Option<String> {
@@ -2390,6 +3018,16 @@ pub fn clamp_zoom(zoom: f64) -> f64 {
         return 1.0;
     }
     zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// Human-readable effective appearance for the account titlebar and the
+/// per-account settings, for example `Dark · 110%`.
+pub fn appearance_summary(theme: ThemeMode, zoom: f64) -> String {
+    tr!(
+        "{theme} · {zoom}%",
+        theme = theme.label(),
+        zoom = percent(zoom)
+    )
 }
 
 /// Decides whether the first-run guide should open at startup.
@@ -2607,6 +3245,25 @@ fn describe_changes(current: &Settings, imported: &Settings) -> Vec<String> {
             to = percent(imported.zoom)
         ));
     }
+    if current.accessibility.high_contrast != imported.accessibility.high_contrast {
+        changes.push(tr!(
+            "High contrast: {state}",
+            state = on_off(imported.accessibility.high_contrast)
+        ));
+    }
+    if current.accessibility.font_scale != imported.accessibility.font_scale {
+        changes.push(tr!(
+            "Text size: {from}% -> {to}%",
+            from = current.accessibility.font_scale.percent(),
+            to = imported.accessibility.font_scale.percent()
+        ));
+    }
+    if current.accessibility.reduce_motion != imported.accessibility.reduce_motion {
+        changes.push(tr!(
+            "Reduce motion: {state}",
+            state = on_off(imported.accessibility.reduce_motion)
+        ));
+    }
     if current.appearance != imported.appearance {
         changes.push(tr!(
             "Experimental CSS: {state} (custom CSS is never imported)",
@@ -2623,6 +3280,21 @@ fn describe_changes(current: &Settings, imported: &Settings) -> Vec<String> {
         changes.push(tr!(
             "Connection notifications: {state}",
             state = on_off(imported.connection_notifications)
+        ));
+    }
+    if current.notification_privacy != imported.notification_privacy {
+        changes.push(tr!(
+            "Notification privacy: {from} -> {to}",
+            from = current.notification_privacy.label(),
+            to = imported.notification_privacy.label()
+        ));
+    }
+    if current.hide_notification_previews_when_locked
+        != imported.hide_notification_previews_when_locked
+    {
+        changes.push(tr!(
+            "Hide previews when locked: {state}",
+            state = on_off(imported.hide_notification_previews_when_locked)
         ));
     }
     if current.do_not_disturb.summary() != imported.do_not_disturb.summary() {
@@ -3001,6 +3673,8 @@ mod tests {
         assert!(settings.notifications);
         assert!(settings.connection_notifications);
         assert_eq!(settings.do_not_disturb.mode, DoNotDisturbMode::Off);
+        assert_eq!(settings.notification_privacy, NotificationPrivacy::Full);
+        assert!(settings.hide_notification_previews_when_locked);
         assert_eq!(
             settings.do_not_disturb.schedule.start,
             DEFAULT_QUIET_HOURS_START
@@ -3177,6 +3851,53 @@ mod tests {
 
         assert!(!settings.message_notifications_enabled("missing"));
         assert!(!settings.notification_sound_enabled("missing"));
+    }
+
+    #[test]
+    fn notification_privacy_persists_as_stable_slugs() {
+        let mut settings = Settings::default();
+        assert!(settings.set_notification_privacy(NotificationPrivacy::SenderOnly));
+        assert!(!settings.set_notification_privacy(NotificationPrivacy::SenderOnly));
+
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"notification_privacy\":\"sender_only\""));
+        let loaded: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.notification_privacy, NotificationPrivacy::SenderOnly);
+
+        settings.notification_privacy = NotificationPrivacy::Hidden;
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"notification_privacy\":\"hidden\""));
+        let loaded: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.notification_privacy, NotificationPrivacy::Hidden);
+    }
+
+    #[test]
+    fn legacy_settings_default_to_full_previews_and_locked_masking() {
+        let json = br#"{"version":1,"accounts":[]}"#;
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+        assert_eq!(settings.notification_privacy, NotificationPrivacy::Full);
+        assert!(settings.hide_notification_previews_when_locked);
+    }
+
+    #[test]
+    fn unknown_notification_privacy_falls_back_to_full_previews() {
+        let json = br#"{"version":1,"accounts":[],"notification_privacy":"future-mode"}"#;
+        let settings: Settings = serde_json::from_slice(json).unwrap();
+        assert_eq!(settings.notification_privacy, NotificationPrivacy::Full);
+    }
+
+    #[test]
+    fn notification_privacy_setters_only_report_real_changes() {
+        let mut settings = Settings::default();
+        assert!(!settings.set_hide_notification_previews_when_locked(true));
+        assert!(settings.set_hide_notification_previews_when_locked(false));
+        assert!(!settings.hide_notification_previews_when_locked);
+        assert!(!settings.set_notification_privacy(NotificationPrivacy::Full));
+        assert!(settings.set_notification_privacy(NotificationPrivacy::SenderOnly));
+        assert_eq!(
+            settings.notification_privacy,
+            NotificationPrivacy::SenderOnly
+        );
     }
 
     #[test]
@@ -3603,6 +4324,133 @@ mod tests {
         assert!(!settings.set_zoom(MAX_ZOOM));
     }
 
+    fn appearance_settings() -> Settings {
+        Settings {
+            accounts: vec![
+                Account::with_id("work", "Work"),
+                Account::with_id("home", "Home"),
+            ],
+            active_account: Some("work".to_string()),
+            theme: ThemeMode::Light,
+            zoom: 1.1,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn account_appearance_overrides_the_global_setting_only_for_that_account() {
+        let mut settings = appearance_settings();
+
+        assert_eq!(settings.effective_theme("work"), ThemeMode::Light);
+        assert_eq!(settings.effective_zoom("work"), 1.1);
+
+        assert!(settings.set_account_theme("work", AccountTheme::Dark));
+        assert!(settings.set_account_zoom("work", Some(0.8)));
+
+        assert_eq!(settings.effective_theme("work"), ThemeMode::Dark);
+        assert_eq!(settings.effective_zoom("work"), 0.8);
+        assert_eq!(settings.effective_theme("home"), ThemeMode::Light);
+        assert_eq!(settings.effective_zoom("home"), 1.1);
+
+        assert!(settings.set_account_theme("work", AccountTheme::Inherit));
+        assert!(settings.set_account_zoom("work", None));
+
+        assert_eq!(settings.effective_theme("work"), ThemeMode::Light);
+        assert_eq!(settings.effective_zoom("work"), 1.1);
+    }
+
+    #[test]
+    fn account_zoom_overrides_are_clamped_and_non_finite_values_inherit() {
+        let mut settings = appearance_settings();
+
+        assert!(settings.set_account_zoom("work", Some(0.1)));
+        assert_eq!(settings.effective_zoom("work"), MIN_ZOOM);
+
+        assert!(settings.set_account_zoom("work", Some(9.0)));
+        assert_eq!(settings.effective_zoom("work"), MAX_ZOOM);
+
+        assert!(settings.set_account_zoom("work", Some(f64::NAN)));
+        assert!(settings.accounts[0].appearance.zoom.is_none());
+        assert_eq!(settings.effective_zoom("work"), 1.1);
+
+        settings.accounts[0].appearance.zoom = Some(2.0);
+        settings.normalize();
+        assert_eq!(settings.effective_zoom("work"), MAX_ZOOM);
+    }
+
+    #[test]
+    fn legacy_accounts_without_appearance_inherit_the_global_setting() {
+        let json = br#"{
+            "version": 1,
+            "theme": "dark",
+            "zoom": 1.25,
+            "accounts": [{"id": "a", "name": "Work"}],
+            "active_account": "a"
+        }"#;
+        let mut settings: Settings = serde_json::from_slice(json).unwrap();
+
+        assert!(settings.accounts[0].appearance.is_inherit());
+        assert_eq!(settings.effective_theme("a"), ThemeMode::Dark);
+        assert_eq!(settings.effective_zoom("a"), 1.25);
+
+        settings.normalize();
+        assert!(settings.accounts[0].appearance.is_inherit());
+        assert_eq!(settings.effective_theme("a"), ThemeMode::Dark);
+    }
+
+    #[test]
+    fn account_appearance_uses_stable_names_and_stays_out_of_default_files() {
+        let mut account = Account::with_id("a", "Work");
+        account.appearance.theme = AccountTheme::Dark;
+        account.appearance.zoom = Some(1.1);
+
+        let json = serde_json::to_string(&account).unwrap();
+        assert!(json.contains("\"appearance\""));
+        assert!(json.contains("\"theme\":\"dark\""));
+        assert!(json.contains("\"zoom\":1.1"));
+
+        let restored: Account = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.appearance, account.appearance);
+
+        let default_json = serde_json::to_string(&Account::with_id("b", "Home")).unwrap();
+        assert!(!default_json.contains("appearance"));
+    }
+
+    #[test]
+    fn applying_one_account_appearance_to_all_keeps_runtime_state() {
+        let mut settings = appearance_settings();
+        settings.accounts[0].appearance.theme = AccountTheme::Dark;
+        settings.accounts[0].appearance.zoom = Some(1.25);
+        settings.accounts[1].unread = 4;
+        settings.accounts[1].muted = true;
+
+        assert!(settings.apply_account_appearance_to_all("work"));
+        assert_eq!(settings.accounts[1].appearance.theme, AccountTheme::Dark);
+        assert_eq!(settings.accounts[1].appearance.zoom, Some(1.25));
+        assert_eq!(settings.accounts[1].unread, 4);
+        assert!(settings.accounts[1].muted);
+        assert!(!settings.apply_account_appearance_to_all("work"));
+    }
+
+    #[test]
+    fn export_and_import_keep_account_appearance_but_not_runtime_state() {
+        let mut settings = exported_fixture();
+        settings.accounts[0].appearance.theme = AccountTheme::Light;
+        settings.accounts[0].appearance.zoom = Some(MIN_ZOOM);
+
+        let export = SettingsExport::new(&settings, UNIX_EPOCH);
+        let json = export.to_json().unwrap();
+        assert!(json.contains("\"appearance\""));
+        assert!(json.contains("\"theme\": \"light\""));
+        assert!(json.contains("\"zoom\": 0.8"));
+
+        let restored = SettingsExport::from_bytes(json.as_bytes()).unwrap();
+        assert_eq!(restored.accounts[0].appearance.theme, AccountTheme::Light);
+        assert_eq!(restored.accounts[0].appearance.zoom, Some(MIN_ZOOM));
+        assert_eq!(restored.accounts[0].unread, 0);
+        assert!(restored.accounts[0].bounds.is_none());
+    }
+
     #[test]
     fn unread_counts_are_tracked() {
         let mut settings = Settings::default();
@@ -3789,6 +4637,180 @@ mod tests {
     fn account_initials_are_derived_from_the_name() {
         assert_eq!(Account::with_id("a", "  work").initial(), "W");
         assert_eq!(Account::with_id("a", "").initial(), "?");
+    }
+
+    #[test]
+    fn account_colors_parse_and_normalize_hex_values() {
+        assert_eq!(
+            AccountColor::parse("#1D4ED8").map(AccountColor::to_hex),
+            Some("#1d4ed8".to_string())
+        );
+        assert_eq!(
+            AccountColor::parse("1d4ed8").map(AccountColor::to_hex),
+            Some("#1d4ed8".to_string())
+        );
+        assert_eq!(
+            AccountColor::parse(" #ABC ").map(AccountColor::to_hex),
+            Some("#aabbcc".to_string())
+        );
+        assert_eq!(
+            AccountColor::parse("#1d4ed8").map(AccountColor::rgb),
+            Some(0x1d4ed8)
+        );
+        for invalid in [
+            "",
+            "#12",
+            "#1234",
+            "#12345",
+            "#12345678",
+            "#gggggg",
+            "red",
+            "##ffffff",
+        ] {
+            assert_eq!(AccountColor::parse(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn account_palette_colors_are_accessible_with_white_text() {
+        for hex in ACCOUNT_COLORS {
+            let color = AccountColor::parse(hex).expect("every palette entry is a valid color");
+            assert_eq!(color.to_hex(), hex);
+            assert_eq!(
+                color.readable_text(),
+                AccountColor::WHITE,
+                "{hex} should use white text"
+            );
+            assert!(
+                color.contrast_ratio(AccountColor::WHITE) >= 4.5,
+                "{hex} is not accessible with white text"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_colors_choose_a_readable_foreground() {
+        let light = AccountColor::parse("#f8fafc").expect("a light color");
+        assert_eq!(light.readable_text(), AccountColor::INK);
+
+        for value in 0u16..=255 {
+            let value = value as u8;
+            let color = AccountColor::new(value, value, value);
+            let contrast = color.contrast_ratio(color.readable_text());
+            assert!(contrast >= 4.5, "grayscale {value} only reaches {contrast}");
+        }
+    }
+
+    #[test]
+    fn account_avatar_falls_back_to_a_deterministic_initial() {
+        let account = Account::with_id("a", "  work");
+        assert_eq!(account.avatar_label(), "W");
+        assert_eq!(Account::with_id("a", "").avatar_label(), "?");
+        assert_eq!(Account::with_id("a", "Personal").identity().label, "P");
+    }
+
+    #[test]
+    fn account_avatar_accepts_one_emoji_or_two_characters() {
+        assert_eq!(normalize_avatar_label(" 🦊 ").as_deref(), Some("🦊"));
+        assert_eq!(normalize_avatar_label("👨‍👩‍👧‍👦").as_deref(), Some("👨‍👩‍👧‍👦"));
+        assert_eq!(normalize_avatar_label("AB").as_deref(), Some("AB"));
+        assert_eq!(normalize_avatar_label("ABC"), None);
+        assert_eq!(normalize_avatar_label(""), None);
+        assert_eq!(normalize_avatar_label("a\nb"), None);
+    }
+
+    #[test]
+    fn account_identity_setters_normalize_and_reject_invalid_values() {
+        let mut account = Account::with_id("a", "Work");
+        assert!(account.set_accent(Some("#1D4ED8")));
+        assert_eq!(account.accent.as_deref(), Some("#1d4ed8"));
+        assert!(!account.set_accent(Some("blue")));
+        assert_eq!(account.accent.as_deref(), Some("#1d4ed8"));
+
+        assert!(account.set_avatar(Some("🦊")));
+        assert!(!account.set_avatar(Some("ABC")));
+        assert_eq!(account.avatar_label(), "🦊");
+        assert!(account.set_accent(None));
+        assert!(account.set_avatar(None));
+        assert!(account.identity().accent.is_none());
+        assert_eq!(account.identity().label, "W");
+    }
+
+    #[test]
+    fn resetting_an_account_identity_clears_color_and_avatar() {
+        let mut settings = Settings {
+            accounts: vec![Account::with_id("a", "Work")],
+            active_account: Some("a".to_string()),
+            ..Settings::default()
+        };
+        assert!(settings.set_account_accent("a", Some("#1d4ed8")));
+        assert!(settings.set_account_avatar("a", Some("🦊")));
+        assert!(settings.reset_account_identity("a"));
+        let account = settings.account("a").expect("the account");
+        assert!(account.accent.is_none());
+        assert!(account.avatar.is_none());
+        assert_eq!(account.identity().label, "W");
+        assert!(!settings.reset_account_identity("a"));
+    }
+
+    #[test]
+    fn legacy_accounts_default_to_the_fallback_identity() {
+        let json = br#"{"id":"a","name":"Work","unread":0}"#;
+        let account: Account = serde_json::from_slice(json).unwrap();
+
+        assert!(account.accent.is_none());
+        assert!(account.avatar.is_none());
+        assert_eq!(
+            account.identity(),
+            AccountIdentity {
+                label: "W".to_string(),
+                accent: None,
+            }
+        );
+    }
+
+    #[test]
+    fn account_identity_round_trips_through_settings_json() {
+        let mut account = Account::with_id("a", "Work");
+        assert!(account.set_accent(Some("#1d4ed8")));
+        assert!(account.set_avatar(Some("🦊")));
+        let json = serde_json::to_string(&account).unwrap();
+
+        assert!(json.contains("\"accent\":\"#1d4ed8\""));
+        assert!(json.contains("\"avatar\":\"🦊\""));
+        let restored: Account = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, account);
+    }
+
+    #[test]
+    fn untouched_accounts_do_not_write_identity_fields() {
+        let json = br#"{"version":1,"accounts":[{"id":"a","name":"Work"}],"active_account":"a"}"#;
+        let mut settings: Settings = serde_json::from_slice(json).unwrap();
+        settings.normalize();
+
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert!(saved["accounts"][0].get("accent").is_none());
+        assert!(saved["accounts"][0].get("avatar").is_none());
+    }
+
+    #[test]
+    fn normalization_discards_invalid_identity_values() {
+        let json = br#"{"accounts":[{"id":"a","name":"Work","accent":"nope","avatar":"   "}],"active_account":"a"}"#;
+        let mut settings: Settings = serde_json::from_slice(json).unwrap();
+        settings.normalize();
+
+        assert!(settings.accounts[0].accent.is_none());
+        assert!(settings.accounts[0].avatar.is_none());
+    }
+
+    #[test]
+    fn normalization_rewrites_identity_values_to_their_canonical_form() {
+        let json = r##"{"accounts":[{"id":"a","name":"Work","accent":"#1D4ED8","avatar":" 🦊 "}],"active_account":"a"}"##;
+        let mut settings: Settings = serde_json::from_str(json).unwrap();
+        settings.normalize();
+
+        assert_eq!(settings.accounts[0].accent.as_deref(), Some("#1d4ed8"));
+        assert_eq!(settings.accounts[0].avatar.as_deref(), Some("🦊"));
     }
 
     #[test]
@@ -4085,6 +5107,8 @@ mod tests {
             height: 800.0,
         });
         account.maximized = true;
+        account.set_accent(Some("#1d4ed8"));
+        account.set_avatar(Some("🦊"));
         Settings {
             accounts: vec![account],
             active_account: Some("acc-1".to_string()),
@@ -4151,6 +5175,49 @@ mod tests {
         assert_eq!(restored.boss_key, "Ctrl+Alt+B");
         assert_eq!(restored.accounts.len(), 1);
         assert_eq!(restored.accounts[0].name, "Work");
+        assert_eq!(restored.accounts[0].accent.as_deref(), Some("#1d4ed8"));
+        assert_eq!(restored.accounts[0].avatar.as_deref(), Some("🦊"));
+    }
+
+    #[test]
+    fn export_round_trips_accessibility_and_reports_changes() {
+        let current = Settings::default();
+        let imported = Settings {
+            accessibility: AccessibilitySettings {
+                high_contrast: true,
+                font_scale: FontScale::PERCENT_130,
+                reduce_motion: true,
+            },
+            ..Settings::default()
+        };
+        let json = SettingsExport::new(&imported, UNIX_EPOCH)
+            .to_json()
+            .unwrap();
+        assert!(json.contains("\"high_contrast\": true"));
+        assert!(json.contains("\"font_scale\": 130"));
+        assert!(json.contains("\"reduce_motion\": true"));
+
+        let restored = SettingsExport::from_bytes(json.as_bytes()).unwrap();
+        assert_eq!(restored.accessibility, imported.accessibility);
+
+        let preview = ImportPreview::from_bytes(json.as_bytes(), &current).unwrap();
+        assert!(
+            preview.changes.contains(&"High contrast: on".to_string()),
+            "{:?}",
+            preview.changes
+        );
+        assert!(
+            preview
+                .changes
+                .contains(&"Text size: 100% -> 130%".to_string()),
+            "{:?}",
+            preview.changes
+        );
+        assert!(
+            preview.changes.contains(&"Reduce motion: on".to_string()),
+            "{:?}",
+            preview.changes
+        );
     }
 
     #[test]

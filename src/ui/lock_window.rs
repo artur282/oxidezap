@@ -89,6 +89,7 @@ impl Render for LockWindow {
         }
 
         let theme = self.model.read(cx).theme(window);
+        window.set_rem_size(theme.rem_size());
         let password_field = self.password_field.clone();
         let error = self.error.clone();
 
@@ -127,7 +128,7 @@ impl Render for LockWindow {
                                     .child(icon(ICON_SHIELD, 16.0, theme.accent))
                                     .child(
                                         div()
-                                            .text_size(px(18.))
+                                            .text_size(theme.font_px(18.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(theme.text)
                                             .child(t!("OxideZap is locked")),
@@ -135,7 +136,7 @@ impl Render for LockWindow {
                             )
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(theme.font_px(12.))
                                     .text_color(theme.text_muted)
                                     .child(t!(
                                         "Enter your password to return to WhatsApp. Account windows stay hidden until you unlock."
@@ -151,7 +152,7 @@ impl Render for LockWindow {
                             .when_some(error, |style, error| {
                                 style.child(
                                     div()
-                                        .text_size(px(11.))
+                                        .text_size(theme.font_px(11.))
                                         .text_color(theme.danger)
                                         .child(error),
                                 )
@@ -180,7 +181,7 @@ impl Render for LockWindow {
                                 }),
                             )),
                     )
-                    .child(div().text_size(px(10.)).text_color(theme.text_faint).child(
+                    .child(div().text_size(theme.font_px(10.)).text_color(theme.text_faint).child(
                         t!("The password is stored as an Argon2id hash in your config directory."),
                     )),
             )

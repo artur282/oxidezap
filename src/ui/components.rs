@@ -66,7 +66,7 @@ impl Render for TextTooltip {
             .border_1()
             .border_color(self.theme.border)
             .text_color(self.theme.text)
-            .text_size(px(11.))
+            .text_size(self.theme.font_px(11.))
             .child(self.label.clone())
     }
 }
@@ -147,7 +147,7 @@ pub fn button(
         .border_1()
         .border_color(border)
         .text_color(text)
-        .text_size(px(13.))
+        .text_size(theme.font_px(13.))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .focus(focus_ring(focus_color))
@@ -212,14 +212,14 @@ pub fn section_header(
         .gap(px(6.))
         .child(
             div()
-                .text_size(px(22.))
+                .text_size(theme.font_px(22.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.text)
                 .child(title),
         )
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(theme.font_px(13.))
                 .text_color(theme.text_muted)
                 .child(description),
         )
@@ -277,14 +277,14 @@ pub fn toggle_row(
                 .gap(px(2.))
                 .child(
                     div()
-                        .text_size(px(14.))
+                        .text_size(theme.font_px(14.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.text)
                         .child(title),
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(theme.font_px(12.))
                         .text_color(theme.text_muted)
                         .child(description),
                 ),
@@ -343,7 +343,7 @@ pub fn sidebar_item(
             theme.surface
         })
         .text_color(if active { theme.text } else { theme.text_muted })
-        .text_size(px(13.))
+        .text_size(theme.font_px(13.))
         .focus(move |style| {
             style
                 .border_2()
@@ -368,7 +368,7 @@ pub fn unread_badge(count: u32, theme: Theme) -> impl IntoElement {
         .rounded_full()
         .bg(theme.accent)
         .text_color(theme.accent_text)
-        .text_size(px(10.))
+        .text_size(theme.font_px(10.))
         .font_weight(FontWeight::SEMIBOLD)
         .child(if count > 99 {
             "99+".to_string()
@@ -390,7 +390,7 @@ pub fn labeled_field(
         .gap(px(6.))
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(theme.font_px(12.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.text_muted)
                 .child(label),
@@ -398,7 +398,7 @@ pub fn labeled_field(
         .when_some(description, |style, description| {
             style.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.font_px(11.))
                     .text_color(theme.text_faint)
                     .child(description),
             )

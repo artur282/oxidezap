@@ -270,7 +270,22 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     ),
     ("About", "Acerca de"),
     ("About OxideZap", "Acerca de OxideZap"),
+    ("Accessibility", "Accesibilidad"),
+    ("Identity", "Identidad"),
+    (
+        "Use a hex color such as #1d4ed8.",
+        "Usa un color hexadecimal como #1d4ed8.",
+    ),
+    (
+        "Use up to two characters or one emoji. Empty shows the account initial.",
+        "Usa hasta dos caracteres o un emoji. Vacío muestra la inicial de la cuenta.",
+    ),
+    (
+        "Use up to two characters or one emoji.",
+        "Usa hasta dos caracteres o un emoji.",
+    ),
     ("Account", "Cuenta"),
+    ("Account appearance", "Apariencia de la cuenta"),
     ("Account data", "Datos de la cuenta"),
     ("Account isolation", "Aislamiento de cuentas"),
     ("Account name", "Nombre de la cuenta"),
@@ -306,6 +321,10 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     ("App", "Aplicación"),
     ("App lock", "Bloqueo de la aplicación"),
     ("Appearance", "Apariencia"),
+    (
+        "Appearance applied to all accounts.",
+        "Apariencia aplicada a todas las cuentas.",
+    ),
     ("Apply boss key", "Aplicar atajo de jefe"),
     ("Apply experimental CSS", "Aplicar CSS experimental"),
     ("Apply folder", "Aplicar carpeta"),
@@ -314,6 +333,11 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     ("Apply proxy settings", "Aplicar ajustes del proxy"),
     ("Apply quiet hours", "Aplicar horario de silencio"),
     ("Apply shortcut", "Aplicar atajo"),
+    (
+        "Apply this account's appearance to all accounts?",
+        "¿Aplicar la apariencia de esta cuenta a todas las cuentas?",
+    ),
+    ("Apply to all accounts", "Aplicar a todas las cuentas"),
     (
         "Ask GitHub for the latest release at most once every 24 hours. The request contains no personal data.",
         "Consulta a GitHub la última versión como máximo una vez cada 24 horas. La solicitud no contiene datos personales.",
@@ -329,6 +353,10 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     (
         "At least {count} characters.",
         "Al menos {count} caracteres.",
+    ),
+    (
+        "Use a stronger palette for text, backgrounds, and borders in the native shell. The System, Light, and Dark choice still picks the base palette; WhatsApp Web content is unchanged.",
+        "Usa una paleta con más contraste para el texto, los fondos y los bordes de la carcasa nativa. La opción Sistema, Claro u Oscuro sigue eligiendo la paleta base; el contenido de WhatsApp Web no cambia.",
     ),
     (
         "Use at least {count} characters.",
@@ -347,6 +375,7 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "Automatic update checks are off.",
         "Las comprobaciones automáticas de actualizaciones están desactivadas.",
     ),
+    ("Avatar", "Avatar"),
     ("Back", "Atrás"),
     ("Backup and restore", "Copia de seguridad y restauración"),
     (
@@ -450,6 +479,10 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "Notificaciones de conexión: {state}",
     ),
     ("Connection restored", "Conexión restaurada"),
+    (
+        "Contrast, text size, and motion preferences for the native shell. They are saved with your settings and included in exports.",
+        "Preferencias de contraste, tamaño del texto y movimiento para la carcasa nativa. Se guardan con tu configuración y se incluyen en las exportaciones.",
+    ),
     ("Copy", "Copiar"),
     ("Correct while I type", "Corregir mientras escribo"),
     (
@@ -536,6 +569,7 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "Creating a fresh WebKit view. Your session is kept and the page will reconnect automatically.",
         "Creando una vista de WebKit nueva. Tu sesión se conserva y la página se reconectará automáticamente.",
     ),
+    ("Custom color", "Color personalizado"),
     ("Dark", "Oscuro"),
     ("Data folder: {path}", "Carpeta de datos: {path}"),
     (
@@ -682,11 +716,19 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     ("For 1 hour", "Durante 1 hora"),
     ("Free disk space", "Espacio libre en disco"),
     (
+        "GPUI 0.2.2 has no AccessKit/AT-SPI bridge, so screen readers cannot inspect these native controls. Keyboard focus and the visible focus ring still work, and WhatsApp Web keeps WebKit's own accessibility tree.",
+        "GPUI 0.2.2 no tiene un puente AccessKit/AT-SPI, así que los lectores de pantalla no pueden inspeccionar estos controles nativos. El foco de teclado y el anillo de foco visible siguen funcionando, y WhatsApp Web conserva el árbol de accesibilidad propio de WebKit.",
+    ),
+    (
         "GPUI for the native shell · WebKitGTK for WhatsApp Web · Rust for everything in between.",
         "GPUI para la carcasa nativa · WebKitGTK para WhatsApp Web · Rust para todo lo demás.",
     ),
     ("General", "General"),
     ("GitHub repository", "Repositorio de GitHub"),
+    (
+        "Global appearance: {appearance}",
+        "Apariencia global: {appearance}",
+    ),
     ("Global shortcut", "Atajo global"),
     (
         "Global shortcut: {from} -> {to}",
@@ -715,6 +757,8 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "Hide or restore every window",
         "Ocultar o restaurar todas las ventanas",
     ),
+    ("High contrast", "Alto contraste"),
+    ("High contrast: {state}", "Alto contraste: {state}"),
     ("Host", "Host"),
     ("Image copied", "Imagen copiada"),
     ("Import", "Importar"),
@@ -859,10 +903,6 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     ("Notification sound", "Sonido de notificación"),
     ("Notifications", "Notificaciones"),
     ("Notifications and sound", "Notificaciones y sonido"),
-    (
-        "Notifications are also suppressed while the app is locked.",
-        "Las notificaciones también se suprimen mientras la aplicación está bloqueada.",
-    ),
     ("Notifications, silent", "Notificaciones, silenciosas"),
     ("Off", "Desactivado"),
     ("Offline", "Desconectado"),
@@ -911,6 +951,10 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "Opcional, guardada como texto plano",
     ),
     ("Organize by account", "Organizar por cuenta"),
+    (
+        "Other accounts will use the same theme and zoom overrides. Their sessions and window bounds are kept.",
+        "Las demás cuentas usarán el mismo tema y los mismos ajustes de zoom. Sus sesiones y límites de ventana se conservan.",
+    ),
     ("Organize by month", "Organizar por mes"),
     ("OxideZap Downloads", "Descargas de OxideZap"),
     ("OxideZap Locked", "OxideZap bloqueado"),
@@ -963,6 +1007,10 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     ),
     ("Password", "Contraseña"),
     (
+        "Pause CSS animations and transitions in WhatsApp Web. The native shell has no animated transitions today; any future native transition must honor this setting too. It works independently of battery saver.",
+        "Pausa las animaciones y transiciones CSS de WhatsApp Web. La carcasa nativa no tiene transiciones animadas hoy; cualquier transición nativa futura también deberá respetar esta opción. Funciona independientemente del ahorro de batería.",
+    ),
+    (
         "Pause native notifications and sounds from every account. Unread counts, window titles, and the tray badge keep updating.",
         "Pausa las notificaciones nativas y los sonidos de todas las cuentas. Los contadores sin leer, los títulos de ventana y la insignia de la bandeja siguen actualizándose.",
     ),
@@ -985,6 +1033,7 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "Preferences reset to their defaults. Your accounts were kept and a backup was written to {path}.",
         "Preferencias restablecidas a sus valores predeterminados. Tus cuentas se conservaron y se escribió una copia de seguridad en {path}.",
     ),
+    ("Preview text", "Texto de vista previa"),
     ("Progress", "Progreso"),
     (
         "Proxy credentials are stored as plain text in settings.json. The file is private (0600) and credentials are never logged or written to exports, but this build does not use a system keyring. Prefer a proxy that does not require a password.",
@@ -1036,6 +1085,12 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "Reduce animation and polling work without turning off notifications, downloads, calls, the app lock, or security checks.",
         "Reduce el trabajo de animación y sondeo sin desactivar notificaciones, descargas, llamadas, el bloqueo de la aplicación ni las comprobaciones de seguridad.",
     ),
+    ("Reduce motion", "Reducir movimiento"),
+    (
+        "Reduce motion is independent of battery saver and stays active when the saver is off or the device is on AC power.",
+        "Reducir movimiento es independiente del ahorro de batería y sigue activo cuando el ahorro está desactivado o el dispositivo usa corriente alterna.",
+    ),
+    ("Reduce motion: {state}", "Reducir movimiento: {state}"),
     ("Refresh", "Actualizar"),
     (
         "Release hidden accounts after",
@@ -1080,6 +1135,7 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "Requerir contraseña para desbloquear",
     ),
     ("Reset", "Restablecer"),
+    ("Reset identity", "Restablecer identidad"),
     (
         "Reset preferences to their defaults?",
         "¿Restablecer las preferencias a sus valores predeterminados?",
@@ -1140,6 +1196,7 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     ),
     ("Set password", "Configurar contraseña"),
     ("Settings", "Ajustes"),
+    ("Settings — {appearance}", "Ajustes — {appearance}"),
     (
         "Settings exported to {path}.",
         "Configuración exportada a {path}.",
@@ -1488,12 +1545,22 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "El atajo de mostrar/ocultar debe ser distinto del atajo de la paleta de comandos.",
     ),
     ("Text files (*.txt)", "Archivos de texto (*.txt)"),
+    ("Text size", "Tamaño del texto"),
+    (
+        "Text size: {from}% -> {to}%",
+        "Tamaño del texto: {from}% -> {to}%",
+    ),
+    (
+        "Text size scales the Settings window, the lock screen, and the native text in account windows. Icons, spacing, window chrome, text-field contents, the command palette, and the other native windows keep their fixed sizes; WhatsApp Web zoom is separate.",
+        "El tamaño del texto escala la ventana de Ajustes, la pantalla de bloqueo y el texto nativo de las ventanas de cuenta. Los iconos, el espaciado, el marco de la ventana, el contenido de los campos de texto, la paleta de comandos y las demás ventanas nativas mantienen sus tamaños fijos; el zoom de WhatsApp Web es independiente.",
+    ),
     ("Theme", "Tema"),
     (
         "Theme, zoom, notifications, startup, the global shortcut, the app-lock password, and the first-run guide status are reset. Accounts and their WhatsApp sessions are kept, and the first-run guide opens again. A dated backup is written first.",
         "Se restablecen el tema, el zoom, las notificaciones, el inicio, el atajo global, la contraseña del bloqueo y el estado de la guía inicial. Las cuentas y sus sesiones de WhatsApp se conservan, y la guía inicial se abre de nuevo. Antes se escribe una copia de seguridad con fecha.",
     ),
     ("Theme: {from} -> {to}", "Tema: {from} -> {to}"),
+    ("This account: {appearance}", "Esta cuenta: {appearance}"),
     (
         "This closes the account, deletes its WebKit profile, and removes it from OxideZap. This cannot be undone.",
         "Esto cierra la cuenta, elimina su perfil de WebKit y la quita de OxideZap. No se puede deshacer.",
@@ -1505,6 +1572,10 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     (
         "This guide makes no network requests. The app collects no analytics and never asks for your phone number or WhatsApp credentials.",
         "Esta guía no hace solicitudes de red. La aplicación no recopila analíticas y nunca pide tu número de teléfono ni tus credenciales de WhatsApp.",
+    ),
+    (
+        "This text is shown at {percent}% of its base size.",
+        "Este texto se muestra al {percent}% de su tamaño base.",
     ),
     ("Total account data", "Datos totales de las cuentas"),
     (
@@ -1521,6 +1592,14 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     (
         "Type the account name to confirm",
         "Escribe el nombre de la cuenta para confirmar",
+    ),
+    (
+        "Unread count in window title",
+        "Contador sin leer en el título de la ventana",
+    ),
+    (
+        "Prefix the title with the account's unread count, for example (3) OxideZap — Work.",
+        "Prefija el título con el contador sin leer de la cuenta, por ejemplo (3) OxideZap — Work.",
     ),
     ("Unavailable", "No disponible"),
     ("Unlock", "Desbloquear"),
@@ -1541,6 +1620,8 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     ),
     ("Use dark theme", "Usar tema oscuro"),
     ("Use default", "Usar predeterminada"),
+    ("Use global", "Usar configuración global"),
+    ("Use global ({value})", "Usar global ({value})"),
     ("Use light theme", "Usar tema claro"),
     (
         "Use modifiers plus one key, for example Ctrl+Shift+W.",
@@ -1549,6 +1630,14 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
     (
         "Use the desktop network settings",
         "Usar la configuración de red del escritorio",
+    ),
+    (
+        "Use up to two characters or one emoji. Empty shows the account initial.",
+        "Usa hasta dos caracteres o un emoji. Vacío muestra la inicial de la cuenta.",
+    ),
+    (
+        "Use up to two characters or one emoji.",
+        "Usa hasta dos caracteres o un emoji.",
     ),
     ("Username", "Usuario"),
     ("Version {version}", "Versión {version}"),
@@ -1601,8 +1690,8 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "Las notificaciones de WhatsApp Web las entrega el servicio de notificaciones del escritorio.",
     ),
     (
-        "WhatsApp Web zoom is limited to {min}%–{max}%. The native UI keeps its own size.",
-        "El zoom de WhatsApp Web está limitado a {min}%–{max}%. La interfaz nativa mantiene su propio tamaño.",
+        "WhatsApp Web zoom is limited to {min}%–{max}%. It does not resize the native UI; use Accessibility for native text size.",
+        "El zoom de WhatsApp Web está limitado a {min}%–{max}%. No cambia el tamaño de la interfaz nativa; usa Accesibilidad para el tamaño del texto nativo.",
     ),
     (
         "WhatsApp keeps handling the account, the QR login, and your messages. OxideZap only provides the desktop window around it.",
@@ -1750,9 +1839,71 @@ const SPANISH_KEYS: &[(&str, &str)] = &[
         "{result} Resuelto desde la configuración del proxy del sistema del escritorio.",
     ),
     ("{size} · {state}", "{size} · {state}"),
+    ("{theme} · {zoom}%", "{theme} · {zoom}%"),
     (
         "↑/↓ Move · Enter Run · Esc Close",
         "↑/↓ Mover · Enter Ejecutar · Esc Cerrar",
+    ),
+    ("Hidden", "Oculto"),
+    ("Full preview", "Vista previa completa"),
+    (
+        "Hide previews when locked: {state}",
+        "Ocultar vistas previas al bloquear: {state}",
+    ),
+    (
+        "Hide previews while OxideZap is locked",
+        "Ocultar vistas previas mientras OxideZap está bloqueado",
+    ),
+    ("Message from {sender}", "Mensaje de {sender}"),
+    ("New WhatsApp message", "Nuevo mensaje de WhatsApp"),
+    ("Notification privacy", "Privacidad de notificaciones"),
+    (
+        "Notification privacy controls what the native notification shows. Unread counts, window titles, the tray badge, and the click target never change.",
+        "La privacidad de notificaciones controla qué muestra la notificación nativa. Los contadores sin leer, los títulos de ventana, la insignia de la bandeja y el destino del clic nunca cambian.",
+    ),
+    (
+        "Notification privacy: {from} -> {to}",
+        "Privacidad de notificaciones: {from} -> {to}",
+    ),
+    (
+        "Open OxideZap for details.",
+        "Abre OxideZap para ver los detalles.",
+    ),
+    ("Open OxideZap to read it.", "Abre OxideZap para leerlo."),
+    ("Preview", "Vista previa"),
+    ("See you at 18:00.", "Nos vemos a las 18:00."),
+    ("Sender only", "Solo remitente"),
+    (
+        "Sender only falls back to Hidden when WhatsApp does not provide a sender.",
+        "Solo remitente recurre a Oculto cuando WhatsApp no proporciona un remitente.",
+    ),
+    (
+        "Shows a generic message with no sender or content.",
+        "Muestra un mensaje genérico sin remitente ni contenido.",
+    ),
+    (
+        "Shows the sender and the message text.",
+        "Muestra el remitente y el texto del mensaje.",
+    ),
+    (
+        "Shows the sender name but hides the message text.",
+        "Muestra el nombre del remitente pero oculta el texto del mensaje.",
+    ),
+    (
+        "The notification daemon and the operating system may still store or show content on their own lock screen; OxideZap cannot control that.",
+        "El demonio de notificaciones y el sistema operativo pueden seguir guardando o mostrando contenido en su propia pantalla de bloqueo; OxideZap no puede controlarlo.",
+    ),
+    (
+        "The selected level applies to message and system notifications such as downloads and errors. Connection and crash notifications keep their full text.",
+        "El nivel seleccionado se aplica a los mensajes y a las notificaciones del sistema, como descargas y errores. Las notificaciones de conexión y de fallos conservan su texto completo.",
+    ),
+    (
+        "This is what a message notification looks like with the current selection.",
+        "Así se ve una notificación de mensaje con la selección actual.",
+    ),
+    (
+        "While the app is locked, notifications use the Hidden level regardless of the selection above.",
+        "Mientras la aplicación está bloqueada, las notificaciones usan el nivel Oculto independientemente de la selección anterior.",
     ),
 ];
 
@@ -1790,7 +1941,15 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         }
         "About" => Some("Acerca de"),
         "About OxideZap" => Some("Acerca de OxideZap"),
+        "Accessibility" => Some("Accesibilidad"),
+        "Identity" => Some("Identidad"),
+        "Use a hex color such as #1d4ed8." => Some("Usa un color hexadecimal como #1d4ed8."),
+        "Use up to two characters or one emoji. Empty shows the account initial." => {
+            Some("Usa hasta dos caracteres o un emoji. Vacío muestra la inicial de la cuenta.")
+        }
+        "Use up to two characters or one emoji." => Some("Usa hasta dos caracteres o un emoji."),
         "Account" => Some("Cuenta"),
+        "Account appearance" => Some("Apariencia de la cuenta"),
         "Account data" => Some("Datos de la cuenta"),
         "Account isolation" => Some("Aislamiento de cuentas"),
         "Account name" => Some("Nombre de la cuenta"),
@@ -1823,6 +1982,7 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         "App" => Some("Aplicación"),
         "App lock" => Some("Bloqueo de la aplicación"),
         "Appearance" => Some("Apariencia"),
+        "Appearance applied to all accounts." => Some("Apariencia aplicada a todas las cuentas."),
         "Apply boss key" => Some("Aplicar atajo de jefe"),
         "Apply experimental CSS" => Some("Aplicar CSS experimental"),
         "Apply folder" => Some("Aplicar carpeta"),
@@ -1831,6 +1991,10 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         "Apply proxy settings" => Some("Aplicar ajustes del proxy"),
         "Apply quiet hours" => Some("Aplicar horario de silencio"),
         "Apply shortcut" => Some("Aplicar atajo"),
+        "Apply this account's appearance to all accounts?" => {
+            Some("¿Aplicar la apariencia de esta cuenta a todas las cuentas?")
+        }
+        "Apply to all accounts" => Some("Aplicar a todas las cuentas"),
         "Ask GitHub for the latest release at most once every 24 hours. The request contains no personal data." => {
             Some(
                 "Consulta a GitHub la última versión como máximo una vez cada 24 horas. La solicitud no contiene datos personales.",
@@ -1843,6 +2007,11 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
             "Pide al servicio de notificaciones del escritorio que reproduzca un sonido de mensaje.",
         ),
         "At least {count} characters." => Some("Al menos {count} caracteres."),
+        "Use a stronger palette for text, backgrounds, and borders in the native shell. The System, Light, and Dark choice still picks the base palette; WhatsApp Web content is unchanged." => {
+            Some(
+                "Usa una paleta con más contraste para el texto, los fondos y los bordes de la carcasa nativa. La opción Sistema, Claro u Oscuro sigue eligiendo la paleta base; el contenido de WhatsApp Web no cambia.",
+            )
+        }
         "Use at least {count} characters." => Some("Usa al menos {count} caracteres."),
         "Automatic" => Some("Automático"),
         "Automatic follows the desktop locale. WebKitGTK only checks languages whose hunspell dictionaries are installed. Changes apply to open accounts; WhatsApp Web still controls its own composer and Enter-to-send behavior." => {
@@ -1858,6 +2027,7 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         "Automatic update checks are off." => {
             Some("Las comprobaciones automáticas de actualizaciones están desactivadas.")
         }
+        "Avatar" => Some("Avatar"),
         "Back" => Some("Atrás"),
         "Backup and restore" => Some("Copia de seguridad y restauración"),
         "Best effort: depends on the desktop exposing a ScreenSaver D-Bus interface." => Some(
@@ -1946,6 +2116,11 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         ),
         "Connection notifications: {state}" => Some("Notificaciones de conexión: {state}"),
         "Connection restored" => Some("Conexión restaurada"),
+        "Contrast, text size, and motion preferences for the native shell. They are saved with your settings and included in exports." => {
+            Some(
+                "Preferencias de contraste, tamaño del texto y movimiento para la carcasa nativa. Se guardan con tu configuración y se incluyen en las exportaciones.",
+            )
+        }
         "Copy" => Some("Copiar"),
         "Correct while I type" => Some("Corregir mientras escribo"),
         "Could not authenticate with the SOCKS proxy: {error}" => {
@@ -1999,6 +2174,7 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
                 "Creando una vista de WebKit nueva. Tu sesión se conserva y la página se reconectará automáticamente.",
             )
         }
+        "Custom color" => Some("Color personalizado"),
         "Dark" => Some("Oscuro"),
         "Data folder: {path}" => Some("Carpeta de datos: {path}"),
         "Data {data} · Cache {cache} · Total {total}{partial}" => {
@@ -2122,6 +2298,11 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         "Follow the system theme" => Some("Seguir el tema del sistema"),
         "For 1 hour" => Some("Durante 1 hora"),
         "Free disk space" => Some("Espacio libre en disco"),
+        "GPUI 0.2.2 has no AccessKit/AT-SPI bridge, so screen readers cannot inspect these native controls. Keyboard focus and the visible focus ring still work, and WhatsApp Web keeps WebKit's own accessibility tree." => {
+            Some(
+                "GPUI 0.2.2 no tiene un puente AccessKit/AT-SPI, así que los lectores de pantalla no pueden inspeccionar estos controles nativos. El foco de teclado y el anillo de foco visible siguen funcionando, y WhatsApp Web conserva el árbol de accesibilidad propio de WebKit.",
+            )
+        }
         "GPUI for the native shell · WebKitGTK for WhatsApp Web · Rust for everything in between." => {
             Some(
                 "GPUI para la carcasa nativa · WebKitGTK para WhatsApp Web · Rust para todo lo demás.",
@@ -2129,6 +2310,7 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         }
         "General" => Some("General"),
         "GitHub repository" => Some("Repositorio de GitHub"),
+        "Global appearance: {appearance}" => Some("Apariencia global: {appearance}"),
         "Global shortcut" => Some("Atajo global"),
         "Global shortcut: {from} -> {to}" => Some("Atajo global: {from} -> {to}"),
         "Global shortcuts" => Some("Atajos globales"),
@@ -2143,6 +2325,8 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
             Some("Oculta todas las ventanas de cuenta tras una pantalla de bloqueo.")
         }
         "Hide or restore every window" => Some("Ocultar o restaurar todas las ventanas"),
+        "High contrast" => Some("Alto contraste"),
+        "High contrast: {state}" => Some("Alto contraste: {state}"),
         "Host" => Some("Host"),
         "Image copied" => Some("Imagen copiada"),
         "Import" => Some("Importar"),
@@ -2251,9 +2435,6 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         "Notification sound" => Some("Sonido de notificación"),
         "Notifications" => Some("Notificaciones"),
         "Notifications and sound" => Some("Notificaciones y sonido"),
-        "Notifications are also suppressed while the app is locked." => {
-            Some("Las notificaciones también se suprimen mientras la aplicación está bloqueada.")
-        }
         "Notifications, silent" => Some("Notificaciones, silenciosas"),
         "Off" => Some("Desactivado"),
         "Offline" => Some("Desconectado"),
@@ -2287,6 +2468,11 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         "Optional, e.g. Ctrl+Shift+K" => Some("Opcional, p. ej. Ctrl+Shift+K"),
         "Optional, stored as plain text" => Some("Opcional, guardada como texto plano"),
         "Organize by account" => Some("Organizar por cuenta"),
+        "Other accounts will use the same theme and zoom overrides. Their sessions and window bounds are kept." => {
+            Some(
+                "Las demás cuentas usarán el mismo tema y los mismos ajustes de zoom. Sus sesiones y límites de ventana se conservan.",
+            )
+        }
         "Organize by month" => Some("Organizar por mes"),
         "OxideZap Downloads" => Some("Descargas de OxideZap"),
         "OxideZap Locked" => Some("OxideZap bloqueado"),
@@ -2331,6 +2517,11 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         "OxideZap — {count} unread message" => Some("OxideZap — {count} mensaje sin leer"),
         "OxideZap — {count} unread messages" => Some("OxideZap — {count} mensajes sin leer"),
         "Password" => Some("Contraseña"),
+        "Pause CSS animations and transitions in WhatsApp Web. The native shell has no animated transitions today; any future native transition must honor this setting too. It works independently of battery saver." => {
+            Some(
+                "Pausa las animaciones y transiciones CSS de WhatsApp Web. La carcasa nativa no tiene transiciones animadas hoy; cualquier transición nativa futura también deberá respetar esta opción. Funciona independientemente del ahorro de batería.",
+            )
+        }
         "Pause native notifications and sounds from every account. Unread counts, window titles, and the tray badge keep updating." => {
             Some(
                 "Pausa las notificaciones nativas y los sonidos de todas las cuentas. Los contadores sin leer, los títulos de ventana y la insignia de la bandeja siguen actualizándose.",
@@ -2351,6 +2542,7 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
                 "Preferencias restablecidas a sus valores predeterminados. Tus cuentas se conservaron y se escribió una copia de seguridad en {path}.",
             )
         }
+        "Preview text" => Some("Texto de vista previa"),
         "Progress" => Some("Progreso"),
         "Proxy credentials are stored as plain text in settings.json. The file is private (0600) and credentials are never logged or written to exports, but this build does not use a system keyring. Prefer a proxy that does not require a password." => {
             Some(
@@ -2394,6 +2586,13 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
                 "Reduce el trabajo de animación y sondeo sin desactivar notificaciones, descargas, llamadas, el bloqueo de la aplicación ni las comprobaciones de seguridad.",
             )
         }
+        "Reduce motion" => Some("Reducir movimiento"),
+        "Reduce motion is independent of battery saver and stays active when the saver is off or the device is on AC power." => {
+            Some(
+                "Reducir movimiento es independiente del ahorro de batería y sigue activo cuando el ahorro está desactivado o el dispositivo usa corriente alterna.",
+            )
+        }
+        "Reduce motion: {state}" => Some("Reducir movimiento: {state}"),
         "Refresh" => Some("Actualizar"),
         "Release hidden accounts after" => Some("Liberar cuentas ocultas tras"),
         "Release hidden accounts now" => Some("Liberar cuentas ocultas ahora"),
@@ -2417,6 +2616,7 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         "Report an issue" => Some("Informar de un problema"),
         "Require a password to unlock" => Some("Requerir contraseña para desbloquear"),
         "Reset" => Some("Restablecer"),
+        "Reset identity" => Some("Restablecer identidad"),
         "Reset preferences to their defaults?" => {
             Some("¿Restablecer las preferencias a sus valores predeterminados?")
         }
@@ -2469,6 +2669,7 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         }
         "Set password" => Some("Configurar contraseña"),
         "Settings" => Some("Ajustes"),
+        "Settings — {appearance}" => Some("Ajustes — {appearance}"),
         "Settings exported to {path}." => Some("Configuración exportada a {path}."),
         "Settings imported. The previous settings were backed up to {path}." => {
             Some("Configuración importada. La configuración anterior se guardó en {path}.")
@@ -2750,6 +2951,13 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
             "El atajo de mostrar/ocultar debe ser distinto del atajo de la paleta de comandos.",
         ),
         "Text files (*.txt)" => Some("Archivos de texto (*.txt)"),
+        "Text size" => Some("Tamaño del texto"),
+        "Text size: {from}% -> {to}%" => Some("Tamaño del texto: {from}% -> {to}%"),
+        "Text size scales the Settings window, the lock screen, and the native text in account windows. Icons, spacing, window chrome, text-field contents, the command palette, and the other native windows keep their fixed sizes; WhatsApp Web zoom is separate." => {
+            Some(
+                "El tamaño del texto escala la ventana de Ajustes, la pantalla de bloqueo y el texto nativo de las ventanas de cuenta. Los iconos, el espaciado, el marco de la ventana, el contenido de los campos de texto, la paleta de comandos y las demás ventanas nativas mantienen sus tamaños fijos; el zoom de WhatsApp Web es independiente.",
+            )
+        }
         "Theme" => Some("Tema"),
         "Theme, zoom, notifications, startup, the global shortcut, the app-lock password, and the first-run guide status are reset. Accounts and their WhatsApp sessions are kept, and the first-run guide opens again. A dated backup is written first." => {
             Some(
@@ -2757,6 +2965,7 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
             )
         }
         "Theme: {from} -> {to}" => Some("Tema: {from} -> {to}"),
+        "This account: {appearance}" => Some("Esta cuenta: {appearance}"),
         "This closes the account, deletes its WebKit profile, and removes it from OxideZap. This cannot be undone." => {
             Some(
                 "Esto cierra la cuenta, elimina su perfil de WebKit y la quita de OxideZap. No se puede deshacer.",
@@ -2769,6 +2978,9 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
             Some(
                 "Esta guía no hace solicitudes de red. La aplicación no recopila analíticas y nunca pide tu número de teléfono ni tus credenciales de WhatsApp.",
             )
+        }
+        "This text is shown at {percent}% of its base size." => {
+            Some("Este texto se muestra al {percent}% de su tamaño base.")
         }
         "Total account data" => Some("Datos totales de las cuentas"),
         "Translates the native shell and its windows. WhatsApp Web content keeps its own language." => {
@@ -2783,6 +2995,12 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
             Some("Escribe el nombre de la cuenta exactamente para confirmar.")
         }
         "Type the account name to confirm" => Some("Escribe el nombre de la cuenta para confirmar"),
+        "Unread count in window title" => Some("Contador sin leer en el título de la ventana"),
+        "Prefix the title with the account's unread count, for example (3) OxideZap — Work." => {
+            Some(
+                "Prefija el título con el contador sin leer de la cuenta, por ejemplo (3) OxideZap — Work.",
+            )
+        }
         "Unavailable" => Some("No disponible"),
         "Unlock" => Some("Desbloquear"),
         "Unsupported and experimental" => Some("No compatible y experimental"),
@@ -2799,6 +3017,8 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         }
         "Use dark theme" => Some("Usar tema oscuro"),
         "Use default" => Some("Usar predeterminada"),
+        "Use global" => Some("Usar configuración global"),
+        "Use global ({value})" => Some("Usar global ({value})"),
         "Use light theme" => Some("Usar tema claro"),
         "Use modifiers plus one key, for example Ctrl+Shift+W." => {
             Some("Usa modificadores más una tecla, por ejemplo Ctrl+Shift+W.")
@@ -2836,9 +3056,9 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
         "WhatsApp Web notifications are delivered by the desktop notification service." => Some(
             "Las notificaciones de WhatsApp Web las entrega el servicio de notificaciones del escritorio.",
         ),
-        "WhatsApp Web zoom is limited to {min}%–{max}%. The native UI keeps its own size." => {
+        "WhatsApp Web zoom is limited to {min}%–{max}%. It does not resize the native UI; use Accessibility for native text size." => {
             Some(
-                "El zoom de WhatsApp Web está limitado a {min}%–{max}%. La interfaz nativa mantiene su propio tamaño.",
+                "El zoom de WhatsApp Web está limitado a {min}%–{max}%. No cambia el tamaño de la interfaz nativa; usa Accesibilidad para el tamaño del texto nativo.",
             )
         }
         "WhatsApp keeps handling the account, the QR login, and your messages. OxideZap only provides the desktop window around it." => {
@@ -2950,7 +3170,60 @@ fn spanish_translation(key: &str) -> Option<&'static str> {
             Some("{result} Resuelto desde la configuración del proxy del sistema del escritorio.")
         }
         "{size} · {state}" => Some("{size} · {state}"),
+        "{theme} · {zoom}%" => Some("{theme} · {zoom}%"),
         "↑/↓ Move · Enter Run · Esc Close" => Some("↑/↓ Mover · Enter Ejecutar · Esc Cerrar"),
+        "Hidden" => Some("Oculto"),
+        "Full preview" => Some("Vista previa completa"),
+        "Hide previews when locked: {state}" => Some("Ocultar vistas previas al bloquear: {state}"),
+        "Hide previews while OxideZap is locked" => {
+            Some("Ocultar vistas previas mientras OxideZap está bloqueado")
+        }
+        "Message from {sender}" => Some("Mensaje de {sender}"),
+        "New WhatsApp message" => Some("Nuevo mensaje de WhatsApp"),
+        "Notification privacy" => Some("Privacidad de notificaciones"),
+        "Notification privacy controls what the native notification shows. Unread counts, window titles, the tray badge, and the click target never change." => {
+            Some(
+                "La privacidad de notificaciones controla qué muestra la notificación nativa. Los contadores sin leer, los títulos de ventana, la insignia de la bandeja y el destino del clic nunca cambian.",
+            )
+        }
+        "Notification privacy: {from} -> {to}" => {
+            Some("Privacidad de notificaciones: {from} -> {to}")
+        }
+        "Open OxideZap for details." => Some("Abre OxideZap para ver los detalles."),
+        "Open OxideZap to read it." => Some("Abre OxideZap para leerlo."),
+        "Preview" => Some("Vista previa"),
+        "See you at 18:00." => Some("Nos vemos a las 18:00."),
+        "Sender only" => Some("Solo remitente"),
+        "Sender only falls back to Hidden when WhatsApp does not provide a sender." => {
+            Some("Solo remitente recurre a Oculto cuando WhatsApp no proporciona un remitente.")
+        }
+        "Shows a generic message with no sender or content." => {
+            Some("Muestra un mensaje genérico sin remitente ni contenido.")
+        }
+        "Shows the sender and the message text." => {
+            Some("Muestra el remitente y el texto del mensaje.")
+        }
+        "Shows the sender name but hides the message text." => {
+            Some("Muestra el nombre del remitente pero oculta el texto del mensaje.")
+        }
+        "The notification daemon and the operating system may still store or show content on their own lock screen; OxideZap cannot control that." => {
+            Some(
+                "El demonio de notificaciones y el sistema operativo pueden seguir guardando o mostrando contenido en su propia pantalla de bloqueo; OxideZap no puede controlarlo.",
+            )
+        }
+        "The selected level applies to message and system notifications such as downloads and errors. Connection and crash notifications keep their full text." => {
+            Some(
+                "El nivel seleccionado se aplica a los mensajes y a las notificaciones del sistema, como descargas y errores. Las notificaciones de conexión y de fallos conservan su texto completo.",
+            )
+        }
+        "This is what a message notification looks like with the current selection." => {
+            Some("Así se ve una notificación de mensaje con la selección actual.")
+        }
+        "While the app is locked, notifications use the Hidden level regardless of the selection above." => {
+            Some(
+                "Mientras la aplicación está bloqueada, las notificaciones usan el nivel Oculto independientemente de la selección anterior.",
+            )
+        }
         _ => None,
     }
 }
