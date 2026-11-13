@@ -370,7 +370,7 @@ Window modes are stored per account in `settings.json` as `always_on_top`, `mini
 
 Per-account appearance is stored under each account in `settings.json` as `appearance`, with an optional `theme` (`system`, `light`, or `dark`) and `zoom` (a number from `0.8` to `1.5`). Missing values mean **Use global**. The account override is resolved when the window opens and on every settings change: the account's own theme is used for its GPUI window, its zoom is pushed to its own WebKit view with `SetZoom`, and other accounts are not modified. The global Appearance page remains the default for accounts that inherit and for new accounts. **Apply to all accounts** is the only bulk action; it copies the current account's overrides to every other account and leaves sessions, unread counts, and window bounds untouched.
 
-`--smoke-test` starts the application under X11 with a local HTML page, verifies that the GPUI window and the WebKit composed surface (or fallback transient overlay) have the expected geometry, prints `SMOKE OK`, and exits with status 0.
+`--smoke-test` starts the application under X11 with a local HTML page, verifies that the GPUI window and the WebKit transient overlay have the expected geometry, prints `SMOKE OK`, and exits with status 0.
 
 ## Configuration
 
@@ -538,27 +538,31 @@ The policy is applied inside OxideZap before the text is handed to `org.freedesk
 
 ## Architecture
 
-OxideZap runs a GPUI shell and a separate GTK/WebKit thread in one process. The GPUI window is the real application window: it owns the taskbar entry, the custom titlebar, and all native chrome. On X11/XWayland, GPUI Fast window composition places a native child surface for the `WebKitWebView` between the GPUI base content and its overlays.
+OxideZap runs a GPUI shell and a separate GTK/WebKit thread in one process. The GPUI window is the real application window: it owns the taskbar entry, the custom titlebar, and all native chrome. A borderless GTK `Toplevel` containing the `WebKitWebView` is positioned over the GPUI content area.
 
 ```text
 GPUI window (taskbar entry)
 +-------------------------------------------------+
 | custom titlebar (GPUI)                          |
 +-------------------------------------------------+
-| GPUI Fast composition surface                   |
-|   GTK child window + WebKitGTK                  |
-|   https://web.whatsapp.com                      |
+|                                                 |
+|   GTK transient overlay                         |
+|   WebKitGTK + https://web.whatsapp.com          |
+|                                                 |
 +-------------------------------------------------+
-| deferred GPUI overlays (palette, menus)         |
-+-------------------------------------------------+
+
+  WM_TRANSIENT_FOR = GPUI XID
+  skip_taskbar, skip_pager
+  geometry synchronized every 100 ms
 ```
 
 - **GPUI Fast 0.1.15** owns the native shell, retained-mode views, settings window, lock window, tray, notifications, global shortcut, and the main event loop. See [`docs/gpui-fast.md`](docs/gpui-fast.md) for the version policy, A/B method, and rollback.
 - **WebKitGTK** owns the WhatsApp Web page on a dedicated thread with its own GLib loop.
-- Each account creates one GPUI Fast composition surface. A borderless GTK `Popup` is reparented into that surface, and `set_bounds` places it in the content area below the 42 px titlebar. The old `WM_TRANSIENT_FOR`/100 ms `configure` path is retained only as a fallback when the composition surface cannot be created.
-- The composed page fills the content area without the old 4 px inset. Deferred GPUI overlays (command palette, menus, dialogs) are composited above the page; without an X11 compositing manager those overlays may be clipped, in which case the fallback path applies.
+- The GTK window is a **borderless transient** of the GPUI window (`WM_TRANSIENT_FOR`) with `skip_taskbar` and `skip_pager` set. It is positioned below the 42 px GPUI titlebar and resized to match the GPUI content area, with a 4 px inset so the GPUI edge-resize handles remain reachable.
+- The overlay geometry is synchronized **every 100 ms** by reading the GPUI window geometry over X11 and moving or resizing the GTK window when it drifts.
+- **Window composition is experimental.** The GPUI Fast composition path exists behind `OXIDEZAP_COMPOSITION=1`, but GTK's foreign-window embedding currently aborts on this stack; the transient overlay remains the default. See #38 in [`docs/gpui-fast.md`](docs/gpui-fast.md).
 - **Accounts are isolated** with separate `WebKitWebsiteDataManager` data and cache directories.
-- On a Wayland session the application runs through **XWayland**, because WebKitGTK embeds only into X11 windows. Native Wayland support is on the roadmap.
+- On a Wayland session the application runs through **XWayland**, because embedding a foreign GTK surface into a Wayland client is not portable. Native Wayland support is on the roadmap.
 
 The two threads communicate over channels. The GPUI side sends commands such as create, show, hide, suspend, load, zoom, reload, and quit; the WebKit side reports ready state, load state, titles (from which unread counts are derived), notifications, downloads, media capture state, external links, and crashes. Media actions reuse this loop: the injected menu sends a validated `begin`/`chunk`/`end` sequence, the GTK thread writes the bytes through the download layout, and the path appears in the Download Center. When the media menu is disabled, its message handler stays registered but the injected script stops opening the menu.
 
@@ -631,7 +635,7 @@ Run the X11/WebKit integration smoke test on a real X11 display:
 DISPLAY=:0 cargo run -- --smoke-test
 ```
 
-The smoke test prints `SMOKE OK` and exits with status 0 when the GPUI window and the WebKit composed surface (or fallback transient overlay) are positioned correctly. It needs a Vulkan-capable display; Xvfb does not provide the DRI3 support GPUI needs for presentation. CI runs formatting, Clippy, unit tests, and a release build on Ubuntu 24.04; the smoke test is a local check.
+The smoke test prints `SMOKE OK` and exits with status 0 when the GPUI window and the WebKit transient overlay are positioned correctly. It needs a Vulkan-capable display; Xvfb does not provide the DRI3 support GPUI needs for presentation. CI runs formatting, Clippy, unit tests, and a release build on Ubuntu 24.04; the smoke test is a local check.
 
 ### Packaging artifacts
 

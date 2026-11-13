@@ -51,6 +51,9 @@ impl AccountWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<u32> {
+        if std::env::var("OXIDEZAP_COMPOSITION").ok().as_deref() != Some("1") {
+            return None;
+        }
         if let Some(xid) = self.composition_xid {
             return Some(xid);
         }

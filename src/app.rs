@@ -4730,9 +4730,10 @@ impl AppModel {
         let ok = if composition {
             viewable
                 && i32::from(gtk_geometry.x) == 0
-                && i32::from(gtk_geometry.y) == 0
-                && u32::from(gtk_geometry.width) >= expected_width.saturating_sub(2)
-                && u32::from(gtk_geometry.height) >= expected_height.saturating_sub(2)
+                && i32::from(gtk_geometry.y) == titlebar
+                && u32::from(gtk_geometry.width) >= u32::from(gpui_geometry.width).saturating_sub(2)
+                && u32::from(gtk_geometry.height)
+                    >= u32::from(gpui_geometry.height).saturating_sub(titlebar as u32 + 2)
         } else {
             transient == Some(gpui_xid)
                 && viewable

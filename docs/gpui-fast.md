@@ -46,24 +46,19 @@ The difference is within run-to-run noise for a single sample, but the fork is
 not slower in this shell. A proper benchmark should repeat the sample and open
 Settings and an active chat; those numbers are not claimed here.
 
-## Window composition
+## Window composition (experimental)
 
-Each account window calls `Window::enable_window_composition()` and creates one
-native X11 surface. A borderless GTK `Popup` containing WebKitGTK is reparented
-into that surface; `set_bounds` places the surface in the GPUI content area and
-`SetEmbeddedBounds` keeps the GTK child the same size. The old
-`WM_TRANSIENT_FOR`/periodic `configure` path remains as a fallback when the
-surface cannot be created.
+The composition code remains available behind `OXIDEZAP_COMPOSITION=1`, but it
+is **not enabled by default**. The current GTK/WebKit embedding path creates an
+X11 container and hands it to `GtkWindow`; on this X11/GTK stack GTK aborts
+with a `gtk_widget_get_frame_clock` assertion during startup. The default path
+therefore stays on the proven `WM_TRANSIENT_FOR` overlay with its 4 px inset
+and periodic geometry sync.
 
-The composition surface has no 4 px inset: the page fills the content area and
-GPUI's deferred overlays (command palette, menus, dialogs) are composited above
-it. On X11 without a compositing manager, GPUI overlays above the page can be
-clipped by the native child window; the fallback path keeps the old transient
-overlay behavior.
-
-Known validation gaps: interactive clicks, IME, drag-and-drop, and a real
-StatusNotifier host were not automated. The smoke test verifies the composed
-GTK window is viewable at `(0, 0)` with the expected content size.
+The composition path is tracked by #38 and needs a different GTK embedding
+approach (or a WebKitGTK child-window API) before it can become the default.
+Do not enable it in production. The smoke test covers the default overlay; the
+composition smoke branch exists only for future work.
 
 ## Rollback
 

@@ -20,6 +20,8 @@ use webkit2gtk::{
     UserStyleLevel, UserStyleSheet, WebContextExt, WebProcessTerminationReason, WebViewExt,
     WebViewExtManual, WebsiteDataManagerExt,
 };
+use x11rb::connection::Connection as _;
+use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
 
 use crate::app::downloads::{
     DOWNLOAD_PROGRESS_INTERVAL, DownloadLayout, discard_empty_reservation, sanitize_filename,
@@ -1050,6 +1052,54 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn create_composition_container(parent_xid: u32) -> Result<u32> {
+    let (connection, screen_num) =
+        x11rb::connect(None).context("could not connect to X11 for composition")?;
+    let _screen = &connection.setup().roots[screen_num];
+    let parent_depth = connection
+        .get_geometry(parent_xid)
+        .context("could not inspect the composition surface")?
+        .reply()
+        .context("could not read the composition surface geometry")?
+        .depth;
+    let parent_visual = connection
+        .get_window_attributes(parent_xid)
+        .context("could not inspect the composition surface attributes")?
+        .reply()
+        .context("could not read the composition surface attributes")?
+        .visual;
+    let window = connection
+        .generate_id()
+        .context("could not allocate a composition container id")?;
+    connection
+        .create_window(
+            parent_depth,
+            window,
+            parent_xid,
+            0,
+            0,
+            800,
+            600,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            parent_visual,
+            &CreateWindowAux::new(),
+        )
+        .context("could not create the composition container")?
+        .check()
+        .context("X11 rejected the composition container")?;
+    connection
+        .map_window(window)
+        .context("could not map the composition container")?
+        .check()
+        .context("X11 rejected mapping the composition container")?;
+    connection
+        .flush()
+        .context("could not flush the composition container")?;
+    Ok(window)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn create_entry(
     account_id: &str,
     data_dir: &Path,
@@ -1081,11 +1131,7 @@ fn create_entry(
         crate::paths::create_private_dir(account_dir)?;
     }
 
-    let window = gtk::Window::new(if composition_xid.is_some() {
-        gtk::WindowType::Popup
-    } else {
-        gtk::WindowType::Toplevel
-    });
+    let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title("OxideZap content");
     window.set_decorated(false);
     window.set_skip_taskbar_hint(true);
@@ -1172,27 +1218,39 @@ fn create_entry(
 
     let (overlay, drop_hint) = build_drop_overlay(&webview);
     setup_drop_target(&webview, account_id, drop_paste, drop_hint, drop_events);
-    window.add(&overlay);
-    window.realize();
 
-    let gdk_window = window
-        .window()
-        .context("the GTK window has no GDK window after realize")?;
-    let x11_window = gdk_window
-        .clone()
-        .downcast::<gdkx11::X11Window>()
-        .map_err(|_| anyhow!("the GTK window is not an X11 window"))?;
-    let xid = x11_window.xid() as u32;
-
-    if let Some(parent_xid) = composition_xid {
+    let embedded_xid = if let Some(parent_xid) = composition_xid {
+        let container_xid = create_composition_container(parent_xid)?;
         let display =
             gtk::gdk::Display::default().context("no GDK display for the composition surface")?;
         let display = display
             .downcast::<gdkx11::X11Display>()
             .map_err(|_| anyhow!("the GDK display is not X11"))?;
-        let parent = gdkx11::X11Window::foreign_new_for_display(&display, parent_xid as u64);
-        gdk_window.reparent(parent.upcast_ref::<gtk::gdk::Window>(), 0, 0);
-        gdk_window.move_resize(0, 0, 800, 600);
+        let parent = gdkx11::X11Window::foreign_new_for_display(&display, container_xid as u64);
+        window.set_has_window(true);
+        window.connect_realize(move |window| window.set_window(parent.clone().into()));
+        window.realize();
+        window.add(&overlay);
+        window.show_all();
+        Some(container_xid)
+    } else {
+        window.add(&overlay);
+        window.realize();
+        None
+    };
+
+    let xid = window
+        .window()
+        .map(|gdk_window| {
+            gdk_window
+                .downcast::<gdkx11::X11Window>()
+                .map(|x11| x11.xid() as u32)
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    if composition_xid.is_some() {
+        window.show_all();
     }
 
     if let Some(html) = html {
@@ -1206,7 +1264,7 @@ fn create_entry(
         webview,
         xid,
         parent_xid: None,
-        composition_xid,
+        composition_xid: embedded_xid,
         visible: show,
         scale,
         zoom,
