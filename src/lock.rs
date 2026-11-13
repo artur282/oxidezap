@@ -1,8 +1,6 @@
 use anyhow::Result;
-use argon2::{
-    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
-    password_hash::{SaltString, rand_core::OsRng},
-};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
+use rand_core::OsRng;
 
 pub const MIN_PASSWORD_LENGTH: usize = 6;
 

@@ -57,7 +57,7 @@ impl LockWindow {
             self.error = Some(t!("Incorrect password.").to_string());
             self.password_field.update(cx, |field, cx| field.clear(cx));
             let focus = self.password_field.read(cx).focus_handle(cx);
-            window.focus(&focus);
+            window.focus(&focus, cx);
             cx.notify();
         }
     }
@@ -76,7 +76,7 @@ impl Focusable for LockWindow {
 impl Render for LockWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if window.focused(cx).is_none() {
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
         }
         window.set_window_title(t!("Welcome to OxideZap"));
 

@@ -228,7 +228,7 @@ impl TextField {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
 
         if event.modifiers.shift {
@@ -545,7 +545,14 @@ impl Element for TextFieldElement {
         }
 
         let line = prepaint.line.clone();
-        let _ = line.paint(bounds.origin, window.line_height(), window, cx);
+        let _ = line.paint(
+            bounds.origin,
+            window.line_height(),
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
 
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()

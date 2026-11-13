@@ -11,7 +11,7 @@ pub mod downloads;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::{
-    App, Bounds, Context, Entity, Pixels, SharedString, Timer, TitlebarOptions, Window,
+    App, Bounds, Context, Entity, Pixels, SharedString, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
     WindowOptions, point, prelude::*, px, size,
 };
@@ -1109,6 +1109,7 @@ pub struct AppModel {
     instance_listener: Option<InstanceListener>,
     account_windows: HashMap<String, WindowHandle<AccountWindow>>,
     account_xids: HashMap<String, u32>,
+    composition_xids: HashMap<String, u32>,
     crash_recovery: HashMap<String, CrashRecovery>,
     connection: HashMap<String, ConnectionTracker>,
     active_downloads: HashMap<String, u32>,
@@ -1232,6 +1233,7 @@ impl AppModel {
             instance_listener,
             account_windows: HashMap::new(),
             account_xids: HashMap::new(),
+            composition_xids: HashMap::new(),
             crash_recovery: HashMap::new(),
             connection: HashMap::new(),
             active_downloads: HashMap::new(),
@@ -1295,7 +1297,7 @@ impl AppModel {
                 let interval = weak
                     .update(cx, |model, _| model.poll_interval())
                     .unwrap_or(PerformanceCadence::NORMAL.pump);
-                Timer::after(interval).await;
+                smol::Timer::after(interval).await;
                 if weak.update(cx, |model, cx| model.poll(cx)).is_err() {
                     break;
                 }
@@ -1439,6 +1441,20 @@ impl AppModel {
 
     /// Theme for one account window. The account override wins; otherwise the
     /// global theme applies. Other windows keep using [`Self::theme`].
+    pub fn set_composition_xid(&mut self, account_id: &str, xid: u32) {
+        self.composition_xids.insert(account_id.to_string(), xid);
+    }
+
+    pub fn set_embedded_bounds(
+        &mut self,
+        account_id: &str,
+        width: i32,
+        height: i32,
+        _cx: &mut Context<Self>,
+    ) {
+        self.gtk.set_embedded_bounds(account_id, width, height);
+    }
+
     pub fn account_theme(&self, account_id: &str, window: &Window) -> Theme {
         Theme::resolve(
             self.settings.effective_theme(account_id),
@@ -3248,6 +3264,7 @@ impl AppModel {
         self.gtk.send(GtkCommand::Create {
             account_id: account_id.to_string(),
             parent_xid,
+            composition_xid: self.composition_xids.get(account_id).copied(),
             data_dir: self.paths.account_data_dir(account_id),
             cache_dir: self.paths.account_cache_dir(account_id),
             url,
@@ -4435,7 +4452,7 @@ impl AppModel {
             return;
         };
         cx.spawn(async move |model, cx| {
-            Timer::after(SETTINGS_SAVE_DEBOUNCE).await;
+            smol::Timer::after(SETTINGS_SAVE_DEBOUNCE).await;
             let _ = model.update(cx, |model, _cx| {
                 if model.save_debounce.timer_fired(generation) {
                     model.flush_settings();
@@ -4588,7 +4605,7 @@ impl AppModel {
         let known_windows = known_windows.to_vec();
         cx.spawn(async move |_, cx| {
             for _ in 0..ACCOUNT_TAG_ATTEMPTS {
-                Timer::after(ACCOUNT_TAG_RETRY_INTERVAL).await;
+                smol::Timer::after(ACCOUNT_TAG_RETRY_INTERVAL).await;
                 match weak.update(cx, |model, _| {
                     model.try_tag_account(&id, &title, &known_windows)
                 }) {
@@ -4709,12 +4726,21 @@ impl AppModel {
         let expected_width = u32::from(gpui_geometry.width).saturating_sub((margin * 2) as u32);
         let expected_height =
             u32::from(gpui_geometry.height).saturating_sub(titlebar as u32 + margin as u32);
-        let ok = transient == Some(gpui_xid)
-            && viewable
-            && i32::from(gtk_geometry.x) == expected_x
-            && i32::from(gtk_geometry.y) == expected_y
-            && u32::from(gtk_geometry.width) == expected_width
-            && u32::from(gtk_geometry.height) == expected_height;
+        let composition = self.composition_xids.contains_key(&account_id);
+        let ok = if composition {
+            viewable
+                && i32::from(gtk_geometry.x) == 0
+                && i32::from(gtk_geometry.y) == 0
+                && u32::from(gtk_geometry.width) >= expected_width.saturating_sub(2)
+                && u32::from(gtk_geometry.height) >= expected_height.saturating_sub(2)
+        } else {
+            transient == Some(gpui_xid)
+                && viewable
+                && i32::from(gtk_geometry.x) == expected_x
+                && i32::from(gtk_geometry.y) == expected_y
+                && u32::from(gtk_geometry.width) == expected_width
+                && u32::from(gtk_geometry.height) == expected_height
+        };
 
         if ok {
             println!(
@@ -4801,6 +4827,7 @@ fn open_command_palette_deferred(
         window_min_size: None,
         window_decorations: Some(WindowDecorations::Server),
         tabbing_identifier: None,
+        ..Default::default()
     };
 
     let model_for_view = model.clone();
@@ -4907,6 +4934,7 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
         window_min_size: Some(size(px(min_width), px(min_height))),
         window_decorations: Some(WindowDecorations::Client),
         tabbing_identifier: None,
+        ..Default::default()
     };
 
     let known_windows = model
@@ -4959,6 +4987,7 @@ fn open_account_window_deferred(model: Entity<AppModel>, account_id: String, cx:
         }
     };
 
+    let _ = handle.update(cx, |view, window, cx| view.ensure_composition(window, cx));
     model.update(cx, |model, cx| {
         model.pending_accounts.remove(&account_id);
         model.finish_open_account(account, handle, html, known_windows, cx);
@@ -4994,6 +5023,7 @@ fn open_settings_window_deferred(model: Entity<AppModel>, cx: &mut App) {
         window_min_size: Some(size(px(780.0), px(540.0))),
         window_decorations: Some(WindowDecorations::Client),
         tabbing_identifier: None,
+        ..Default::default()
     };
 
     let model_for_view = model.clone();
@@ -5045,6 +5075,7 @@ fn open_onboarding_window_deferred(model: Entity<AppModel>, cx: &mut App) {
         window_min_size: Some(size(px(620.0), px(520.0))),
         window_decorations: Some(WindowDecorations::Client),
         tabbing_identifier: None,
+        ..Default::default()
     };
 
     let model_for_view = model.clone();
@@ -5096,6 +5127,7 @@ fn open_downloads_window_deferred(model: Entity<AppModel>, cx: &mut App) {
         window_min_size: Some(size(px(820.0), px(480.0))),
         window_decorations: Some(WindowDecorations::Client),
         tabbing_identifier: None,
+        ..Default::default()
     };
 
     let model_for_view = model.clone();
@@ -5137,6 +5169,7 @@ fn open_lock_window_deferred(model: Entity<AppModel>, cx: &mut App) {
         window_min_size: Some(size(px(460.0), px(420.0))),
         window_decorations: Some(WindowDecorations::Client),
         tabbing_identifier: None,
+        ..Default::default()
     };
 
     let model_for_view = model.clone();
@@ -5145,7 +5178,7 @@ fn open_lock_window_deferred(model: Entity<AppModel>, cx: &mut App) {
         window.set_app_id("oxidezap-lock");
         let view = cx.new(|cx| LockWindow::new(model_for_view.clone(), cx));
         let focus = view.read(cx).password_focus(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         window.on_window_should_close(cx, |_, _| false);
         view
     }) {

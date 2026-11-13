@@ -2,9 +2,10 @@ use std::time::Duration;
 
 use gpui::{
     App, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, MouseButton, Render, ResizeEdge, SharedString, Subscription, Timer, Window, div,
-    prelude::*, px, rgb, rgba,
+    KeyDownEvent, MouseButton, Render, ResizeEdge, SharedString, Subscription, Window,
+    WindowCompositionSurface, div, prelude::*, px, rgb, rgba,
 };
+use raw_window_handle::RawWindowHandle;
 
 use crate::app::{AccountViewState, AppModel, ConnectionState};
 use crate::assets::{ICON_GEAR, ICON_LOCK, ICON_MINUS, ICON_PALETTE, ICON_SQUARE, ICON_X};
@@ -24,6 +25,9 @@ pub struct AccountWindow {
     appearance_subscription: Option<Subscription>,
     drop_hover: bool,
     drop_poll: bool,
+    composition_surface: Option<WindowCompositionSurface>,
+    composition_xid: Option<u32>,
+    composition_size: Option<(i32, i32)>,
 }
 
 impl AccountWindow {
@@ -36,7 +40,34 @@ impl AccountWindow {
             appearance_subscription: None,
             drop_hover: false,
             drop_poll: false,
+            composition_surface: None,
+            composition_xid: None,
+            composition_size: None,
         }
+    }
+
+    pub fn ensure_composition(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<u32> {
+        if let Some(xid) = self.composition_xid {
+            return Some(xid);
+        }
+        let composition = window.enable_window_composition().ok()?;
+        let surface = composition.create_native_surface().ok()?;
+        let handle = surface.platform_surface().ok()?.platform_handle().ok()?;
+        let handle = *handle.downcast::<RawWindowHandle>().ok()?;
+        let RawWindowHandle::Xcb(handle) = handle else {
+            return None;
+        };
+        let xid = handle.window.get();
+        self.composition_surface = Some(surface);
+        self.composition_xid = Some(xid);
+        let account_id = self.account_id.clone();
+        self.model
+            .update(cx, |model, _| model.set_composition_xid(&account_id, xid));
+        Some(xid)
     }
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -145,7 +176,7 @@ impl Focusable for AccountWindow {
 impl Render for AccountWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if window.focused(cx).is_none() {
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
         }
 
         // The theme is resolved from the window appearance on every render, so a
@@ -185,6 +216,25 @@ impl Render for AccountWindow {
             )
         };
         window.set_rem_size(theme.rem_size());
+        if let Some(surface) = &self.composition_surface {
+            let viewport = window.viewport_size();
+            let bounds = gpui::Bounds::new(
+                gpui::point(px(0.), px(TITLEBAR_HEIGHT)),
+                gpui::size(viewport.width, viewport.height - px(TITLEBAR_HEIGHT)),
+            )
+            .to_device_pixels(window.scale_factor());
+            if let Ok(platform) = surface.platform_surface() {
+                let _ = platform.set_bounds(bounds);
+            }
+            let size = (bounds.size.width.0, bounds.size.height.0);
+            if self.composition_size != Some(size) {
+                self.composition_size = Some(size);
+                let account_id = self.account_id.clone();
+                self.model.update(cx, |model, cx| {
+                    model.set_embedded_bounds(&account_id, size.0, size.1, cx);
+                });
+            }
+        }
         let appearance = appearance_summary(theme_mode, zoom);
 
         let drop_hover = self.drop_hover || cx.has_active_drag();
@@ -268,7 +318,7 @@ impl Render for AccountWindow {
                     let view = cx.weak_entity();
                     cx.spawn(async move |_, cx| {
                         loop {
-                            Timer::after(Duration::from_millis(100)).await;
+                            smol::Timer::after(Duration::from_millis(100)).await;
                             let keep_polling = view
                                 .update(cx, |this, cx| {
                                     if cx.has_active_drag() {

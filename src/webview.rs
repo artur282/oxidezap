@@ -211,6 +211,9 @@ pub enum GtkCommand {
         /// GPUI window the overlay is anchored to. `None` means discovery
         /// failed and the account tag will be used once as a fallback.
         parent_xid: Option<u32>,
+        /// GPUI Fast composition surface XID. When set, the GTK window is
+        /// reparented into this child surface instead of using WM transients.
+        composition_xid: Option<u32>,
         data_dir: PathBuf,
         cache_dir: PathBuf,
         url: String,
@@ -232,6 +235,11 @@ pub enum GtkCommand {
     },
     Hide {
         account_id: String,
+    },
+    SetEmbeddedBounds {
+        account_id: String,
+        width: i32,
+        height: i32,
     },
     SetZoom {
         account_id: String,
@@ -331,6 +339,14 @@ impl GtkHandle {
     pub fn hide(&self, account_id: &str) {
         self.send(GtkCommand::Hide {
             account_id: account_id.to_string(),
+        });
+    }
+
+    pub fn set_embedded_bounds(&self, account_id: &str, width: i32, height: i32) {
+        self.send(GtkCommand::SetEmbeddedBounds {
+            account_id: account_id.to_string(),
+            width,
+            height,
         });
     }
 
@@ -572,6 +588,7 @@ struct WebEntry {
     /// Cached GPUI window XID. Synchronization never scans the X11 tree while
     /// this XID is valid.
     parent_xid: Option<u32>,
+    composition_xid: Option<u32>,
     visible: bool,
     scale: f32,
     zoom: f64,
@@ -662,6 +679,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
         GtkCommand::Create {
             account_id,
             parent_xid,
+            composition_xid,
             data_dir,
             cache_dir,
             url,
@@ -687,6 +705,7 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
                 &writing,
                 &proxy,
                 &appearance,
+                composition_xid,
                 state.events.clone(),
                 state.download_layout.clone(),
                 state.downloads.clone(),
@@ -733,6 +752,20 @@ fn handle_command(command: GtkCommand, state: &mut GtkState) {
             if let Some(entry) = state.entries.get_mut(&account_id) {
                 entry.visible = false;
                 entry.hide();
+            }
+        }
+        GtkCommand::SetEmbeddedBounds {
+            account_id,
+            width,
+            height,
+        } => {
+            if let Some(entry) = state.entries.get(&account_id) {
+                if entry.composition_xid.is_some() {
+                    entry.window.resize(width, height);
+                    if let Some(gdk_window) = entry.window.window() {
+                        gdk_window.move_resize(0, 0, width, height);
+                    }
+                }
             }
         }
         GtkCommand::SetZoom { account_id, zoom } => {
@@ -1029,6 +1062,7 @@ fn create_entry(
     writing: &WritingSettings,
     proxy: &ProxySettings,
     appearance: &AppearanceSettings,
+    composition_xid: Option<u32>,
     events: Sender<GtkEvent>,
     download_layout: Rc<RefCell<DownloadLayout>>,
     download_registry: Rc<RefCell<HashMap<String, webkit2gtk::Download>>>,
@@ -1047,13 +1081,19 @@ fn create_entry(
         crate::paths::create_private_dir(account_dir)?;
     }
 
-    let window = gtk::Window::new(gtk::WindowType::Toplevel);
+    let window = gtk::Window::new(if composition_xid.is_some() {
+        gtk::WindowType::Popup
+    } else {
+        gtk::WindowType::Toplevel
+    });
     window.set_title("OxideZap content");
     window.set_decorated(false);
     window.set_skip_taskbar_hint(true);
     window.set_skip_pager_hint(true);
     window.set_resizable(true);
-    window.set_type_hint(gtk::gdk::WindowTypeHint::Utility);
+    if composition_xid.is_none() {
+        window.set_type_hint(gtk::gdk::WindowTypeHint::Utility);
+    }
     window.set_default_size(800, 600);
 
     let manager = webkit2gtk::WebsiteDataManager::builder()
@@ -1139,9 +1179,21 @@ fn create_entry(
         .window()
         .context("the GTK window has no GDK window after realize")?;
     let x11_window = gdk_window
+        .clone()
         .downcast::<gdkx11::X11Window>()
         .map_err(|_| anyhow!("the GTK window is not an X11 window"))?;
     let xid = x11_window.xid() as u32;
+
+    if let Some(parent_xid) = composition_xid {
+        let display =
+            gtk::gdk::Display::default().context("no GDK display for the composition surface")?;
+        let display = display
+            .downcast::<gdkx11::X11Display>()
+            .map_err(|_| anyhow!("the GDK display is not X11"))?;
+        let parent = gdkx11::X11Window::foreign_new_for_display(&display, parent_xid as u64);
+        gdk_window.reparent(parent.upcast_ref::<gtk::gdk::Window>(), 0, 0);
+        gdk_window.move_resize(0, 0, 800, 600);
+    }
 
     if let Some(html) = html {
         webview.load_html(html, Some(WHATSAPP_URL));
@@ -1154,6 +1206,7 @@ fn create_entry(
         webview,
         xid,
         parent_xid: None,
+        composition_xid,
         visible: show,
         scale,
         zoom,
@@ -2998,6 +3051,12 @@ fn sync_overlays(state: &mut GtkState) {
     for (account_id, entry) in state.entries.iter_mut() {
         if !entry.visible {
             entry.hide();
+            continue;
+        }
+        if entry.composition_xid.is_some() {
+            if !entry.window.is_visible() {
+                entry.window.show_all();
+            }
             continue;
         }
         let Some(parent) = resolve_parent_xid(x11, account_id, entry) else {

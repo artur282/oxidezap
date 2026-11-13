@@ -36,10 +36,10 @@ pub fn focus_direction(keystroke: &Keystroke) -> Option<FocusDirection> {
     })
 }
 
-pub fn handle_focus_traversal(event: &KeyDownEvent, window: &mut Window, _cx: &mut App) {
+pub fn handle_focus_traversal(event: &KeyDownEvent, window: &mut Window, cx: &mut App) {
     match focus_direction(&event.keystroke) {
-        Some(FocusDirection::Next) => window.focus_next(),
-        Some(FocusDirection::Previous) => window.focus_prev(),
+        Some(FocusDirection::Next) => window.focus_next(cx),
+        Some(FocusDirection::Previous) => window.focus_prev(cx),
         None => {}
     }
 }
@@ -410,7 +410,7 @@ pub fn labeled_field(
 mod tests {
     use super::*;
 
-    fn direction(keystroke: &str) -> Option<FocusDirection> {
+    fn direction(keystroke: &'static str) -> Option<FocusDirection> {
         focus_direction(&Keystroke::parse(keystroke).unwrap())
     }
 

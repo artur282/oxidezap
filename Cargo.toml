@@ -24,15 +24,19 @@ crossbeam-channel = "0.5"
 directories = "6"
 gdkx11 = "0.18"
 glib = "0.18"
-gpui = { version = "0.2.2", default-features = false, features = ["x11"] }
+gpui = { package = "gpui-fast", version = "0.1.15", default-features = false, features = ["x11"] }
+gpui_platform = { package = "gpui-fast-platform", version = "0.1.15", default-features = false, features = ["x11"] }
 gtk = "0.18"
 image = { version = "0.25", default-features = false, features = ["png"] }
 include_dir = "0.7"
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
-libc = "=0.2.180"
+libc = "0.2.183"
 notify-rust = "4"
 open = "5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
+smol = "2"
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"

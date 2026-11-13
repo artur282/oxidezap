@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, Entity, KeyDownEvent, Render, ScrollHandle,
-    SharedString, Subscription, Timer, Window, div, prelude::*, px, transparent_black,
+    SharedString, Subscription, Window, div, prelude::*, px, transparent_black,
 };
 
 use crate::app::AppModel;
@@ -547,12 +547,8 @@ impl CommandPalette {
         let poll_search = search.clone();
         cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(QUERY_POLL_INTERVAL).await;
-                let query = match poll_search.read_with(cx, |field, _| field.content().to_string())
-                {
-                    Ok(query) => query,
-                    Err(_) => break,
-                };
+                smol::Timer::after(QUERY_POLL_INTERVAL).await;
+                let query = poll_search.read_with(cx, |field, _| field.content().to_string());
                 let alive = this
                     .update(cx, |palette, cx| {
                         if palette.state.query() != query {
@@ -586,9 +582,9 @@ impl CommandPalette {
         }
     }
 
-    fn focus_search(&self, window: &mut Window, cx: &App) {
+    fn focus_search(&self, window: &mut Window, cx: &mut App) {
         let handle = self.search.read(cx).focus_handle(cx);
-        window.focus(&handle);
+        window.focus(&handle, cx);
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {

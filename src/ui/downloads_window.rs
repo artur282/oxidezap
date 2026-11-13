@@ -58,7 +58,7 @@ impl Focusable for DownloadsWindow {
 impl Render for DownloadsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if window.focused(cx).is_none() {
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
         }
         window.set_window_title(t!("OxideZap Downloads"));
         if self.appearance_subscription.is_none() {

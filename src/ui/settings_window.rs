@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, Render, SharedString, StatefulInteractiveElement, Subscription, Timer, Window,
-    div, prelude::*, px,
+    KeyDownEvent, Render, SharedString, StatefulInteractiveElement, Subscription, Window, div,
+    prelude::*, px,
 };
 
 use crate::app::downloads::{DOWNLOAD_HISTORY_LIMIT, valid_base_dir};
@@ -329,7 +329,7 @@ impl SettingsWindow {
         let closed_rename = self.renaming.is_some();
         if self.cancel_pending_dialog(cx) {
             if closed_rename {
-                window.defer(cx, |window, _cx| window.focus_next());
+                window.defer(cx, |window, cx| window.focus_next(cx));
             }
             return;
         }
@@ -4532,7 +4532,7 @@ impl Focusable for SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if window.focused(cx).is_none() {
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
         }
         window.set_window_title(t!("OxideZap Settings"));
 
@@ -4933,7 +4933,7 @@ async fn wait_for_file_choice(receiver: Receiver<Option<PathBuf>>) -> Option<Pat
         match receiver.try_recv() {
             Ok(path) => return path,
             Err(TryRecvError::Empty) => {
-                let _ = Timer::after(Duration::from_millis(50)).await;
+                let _ = smol::Timer::after(Duration::from_millis(50)).await;
             }
             Err(TryRecvError::Disconnected) => return None,
         }

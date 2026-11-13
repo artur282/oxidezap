@@ -29,7 +29,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::unbounded;
-use gpui::{AppContext, Application};
+use gpui::AppContext;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -439,36 +439,38 @@ fn main() -> Result<()> {
     };
 
     let settings_for_model = settings.clone();
-    Application::new().with_assets(Assets).run(move |cx| {
-        let model = cx.new(|cx| {
-            AppModel::new(
-                cx,
-                paths.clone(),
-                settings_for_model.clone(),
-                gtk.clone(),
-                gtk_events_rx,
-                x11,
-                tray,
-                tray_rx,
-                hotkey,
-                hotkey_rx,
-                instance_listener,
-                instance_rx,
-                badge,
-                smoke_state,
-                startup_html,
-                startup_url,
-                initial_action,
-                start_hidden,
-                first_run,
-            )
+    gpui_platform::application()
+        .with_assets(Assets)
+        .run(move |cx| {
+            let model = cx.new(|cx| {
+                AppModel::new(
+                    cx,
+                    paths.clone(),
+                    settings_for_model.clone(),
+                    gtk.clone(),
+                    gtk_events_rx,
+                    x11,
+                    tray,
+                    tray_rx,
+                    hotkey,
+                    hotkey_rx,
+                    instance_listener,
+                    instance_rx,
+                    badge,
+                    smoke_state,
+                    startup_html,
+                    startup_url,
+                    initial_action,
+                    start_hidden,
+                    first_run,
+                )
+            });
+            model.update(cx, |model, cx| {
+                model.start_pump(cx);
+                model.start(cx);
+            });
+            info!("OxideZap started");
         });
-        model.update(cx, |model, cx| {
-            model.start_pump(cx);
-            model.start(cx);
-        });
-        info!("OxideZap started");
-    });
 
     Ok(())
 }
