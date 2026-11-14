@@ -1,0 +1,51 @@
+name: Feature request
+description: Propose a new capability or a behavior change
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What exists today and what hurts?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the observable behavior, not the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ]
+        - [ ]
+        - [ ] Tests and documentation
+    validations:
+      required: true
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Suggested implementation
+      description: Optional. Files, APIs, or approach.
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and limits
+      description: What can fail, and what is explicitly not promised?
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of scope
+      description: What this request does not include.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and the roadmap before opening this one.
+          required: true
