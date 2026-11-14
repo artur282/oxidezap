@@ -149,8 +149,8 @@ The installer is user-local and does not require root. Release tags also publish
 It installs:
 
 - the binary to `~/.local/bin/oxidezap`;
-- the desktop entry to `~/.local/share/applications/oxidezap.desktop`;
-- the icon to `~/.local/share/icons/hicolor/scalable/apps/oxidezap.svg`;
+- the desktop entry to `~/.local/share/applications/io.github.artur282.OxideZap.desktop`;
+- the icons to `~/.local/share/icons/hicolor/` (scalable SVG and 64/128/256/512 PNGs);
 - AppStream metadata to `~/.local/share/metainfo/`;
 - the `whatsapp://` URL handler.
 
@@ -173,15 +173,19 @@ To remove the installed files without deleting your accounts or settings:
 ```bash
 install -Dm755 target/release/oxidezap ~/.local/bin/oxidezap
 install -Dm644 assets/oxidezap.svg \
-  ~/.local/share/icons/hicolor/scalable/apps/oxidezap.svg
-install -Dm644 packaging/oxidezap.desktop \
-  ~/.local/share/applications/oxidezap.desktop
+  ~/.local/share/icons/hicolor/scalable/apps/io.github.artur282.OxideZap.svg
+for size in 64 128 256 512; do
+  install -Dm644 "assets/oxidezap-${size}.png" \
+    "$HOME/.local/share/icons/hicolor/${size}x${size}/apps/io.github.artur282.OxideZap.png"
+done
+install -Dm644 packaging/io.github.artur282.OxideZap.desktop \
+  ~/.local/share/applications/io.github.artur282.OxideZap.desktop
 ```
 
 The packaged desktop entry uses `Exec=oxidezap %u`, so `~/.local/bin` must be in your `PATH`. The installer rewrites it to an absolute path instead. After a manual install, register the URL handler and refresh the desktop database:
 
 ```bash
-xdg-mime default oxidezap.desktop x-scheme-handler/whatsapp
+xdg-mime default io.github.artur282.OxideZap.desktop x-scheme-handler/whatsapp
 update-desktop-database ~/.local/share/applications
 ```
 

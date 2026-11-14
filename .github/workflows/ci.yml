@@ -76,7 +76,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            appstream desktop-file-utils python3-yaml
+            appstream appstream-compose desktop-file-utils python3-yaml
 
       - name: Check shell syntax
         run: |
@@ -85,13 +85,46 @@ jobs:
           bash -n packaging/appimage/build-appimage.sh
           bash -n packaging/flatpak/build-flatpak.sh
 
-      - name: Validate desktop entries
-        run: |
-          desktop-file-validate packaging/oxidezap.desktop
-          desktop-file-validate packaging/io.github.artur282.OxideZap.desktop
+      - name: Validate desktop entry
+        run: desktop-file-validate packaging/io.github.artur282.OxideZap.desktop
 
       - name: Validate AppStream metadata
         run: appstreamcli validate --no-net packaging/oxidezap.metainfo.xml
+
+      - name: Compose AppStream metadata for the Flatpak tree
+        run: |
+          set -eu
+          stage=$(mktemp -d)
+          trap 'rm -rf "$stage"' EXIT
+          mkdir -p \
+            "$stage/files/share/applications" \
+            "$stage/files/share/metainfo" \
+            "$stage/files/share/icons/hicolor/64x64/apps" \
+            "$stage/files/share/icons/hicolor/128x128/apps" \
+            "$stage/files/share/icons/hicolor/256x256/apps" \
+            "$stage/files/share/icons/hicolor/512x512/apps" \
+            "$stage/files/share/icons/hicolor/scalable/apps" \
+            "$stage/out"
+          install -m644 packaging/io.github.artur282.OxideZap.desktop \
+            "$stage/files/share/applications/"
+          install -m644 packaging/oxidezap.metainfo.xml \
+            "$stage/files/share/metainfo/io.github.artur282.OxideZap.metainfo.xml"
+          install -m644 assets/oxidezap.svg \
+            "$stage/files/share/icons/hicolor/scalable/apps/io.github.artur282.OxideZap.svg"
+          for size in 64 128 256 512; do
+            install -m644 "assets/oxidezap-${size}.png" \
+              "$stage/files/share/icons/hicolor/${size}x${size}/apps/io.github.artur282.OxideZap.png"
+          done
+          appstreamcli compose \
+            --origin=flatpak \
+            --no-net \
+            --no-color \
+            --prefix=/ \
+            --result-root="$stage/out" \
+            --data-dir="$stage/out/share/metainfo" \
+            --icons-dir="$stage/out/share/icons" \
+            --components=io.github.artur282.OxideZap,io.github.artur282.OxideZap.desktop \
+            "$stage/files"
 
       - name: Validate YAML
         run: |

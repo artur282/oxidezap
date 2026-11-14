@@ -56,9 +56,10 @@ jobs:
           cp target/release/oxidezap "dist/${name}/oxidezap"
           cp README.md LICENSE install.sh "dist/${name}/"
           chmod +x "dist/${name}/oxidezap" "dist/${name}/install.sh"
-          cp packaging/oxidezap.desktop packaging/oxidezap.metainfo.xml \
-            "dist/${name}/packaging/"
-          cp assets/oxidezap.svg "dist/${name}/assets/"
+          cp packaging/io.github.artur282.OxideZap.desktop \
+            packaging/oxidezap.metainfo.xml "dist/${name}/packaging/"
+          cp assets/oxidezap.svg assets/oxidezap-64.png assets/oxidezap-128.png \
+            assets/oxidezap-256.png assets/oxidezap-512.png "dist/${name}/assets/"
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
 
       - name: Upload release archive
@@ -151,6 +152,9 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Generate checksums
+        run: (cd dist && sha256sum * > SHA256SUMS)
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

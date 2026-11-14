@@ -2,11 +2,13 @@
 set -eu
 
 APP_NAME="OxideZap"
+APP_ID="io.github.artur282.OxideZap"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PREFIX="${PREFIX:-$HOME/.local}"
 BINDIR="$PREFIX/bin"
 APPDIR="$PREFIX/share/applications"
-ICONDIR="$PREFIX/share/icons/hicolor/scalable/apps"
+ICONS_ROOT="$PREFIX/share/icons/hicolor"
+ICONDIR="$ICONS_ROOT/scalable/apps"
 METAINFODIR="$PREFIX/share/metainfo"
 AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/oxidezap.desktop"
 
@@ -32,8 +34,15 @@ refresh_caches() {
         update-desktop-database "$APPDIR" >/dev/null 2>&1 || true
     fi
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-        gtk-update-icon-cache -q -t "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true
+        gtk-update-icon-cache -q -t "$ICONS_ROOT" >/dev/null 2>&1 || true
     fi
+}
+
+remove_icons() {
+    for size in 64 128 256 512; do
+        rm -f "$ICONS_ROOT/${size}x${size}/apps/$APP_ID.png"
+    done
+    rm -f "$ICONDIR/$APP_ID.svg" "$ICONDIR/oxidezap.svg"
 }
 
 BUILD_MODE="auto"
@@ -59,10 +68,11 @@ done
 if [ "$UNINSTALL" -eq 1 ]; then
     rm -f \
         "$BINDIR/oxidezap" \
+        "$APPDIR/$APP_ID.desktop" \
         "$APPDIR/oxidezap.desktop" \
-        "$ICONDIR/oxidezap.svg" \
-        "$METAINFODIR/io.github.artur282.OxideZap.metainfo.xml" \
+        "$METAINFODIR/$APP_ID.metainfo.xml" \
         "$AUTOSTART_FILE"
+    remove_icons
     refresh_caches
     echo "Removed $APP_NAME from $PREFIX."
     echo "Your settings and account data were kept:"
@@ -105,13 +115,19 @@ else
     exit 1
 fi
 
-DESKTOP_SOURCE="$SCRIPT_DIR/packaging/oxidezap.desktop"
+DESKTOP_SOURCE="$SCRIPT_DIR/packaging/$APP_ID.desktop"
 ICON_SOURCE="$SCRIPT_DIR/assets/oxidezap.svg"
 METAINFO_SOURCE="$SCRIPT_DIR/packaging/oxidezap.metainfo.xml"
 
 for file in "$DESKTOP_SOURCE" "$ICON_SOURCE"; do
     if [ ! -f "$file" ]; then
         echo "error: missing $file" >&2
+        exit 1
+    fi
+done
+for size in 64 128 256 512; do
+    if [ ! -f "$SCRIPT_DIR/assets/oxidezap-${size}.png" ]; then
+        echo "error: missing $SCRIPT_DIR/assets/oxidezap-${size}.png" >&2
         exit 1
     fi
 done
@@ -127,11 +143,15 @@ esac
 mkdir -p "$BINDIR" "$APPDIR" "$ICONDIR" "$METAINFODIR"
 
 install -m755 "$BINARY" "$BINDIR/oxidezap"
-install -m644 "$ICON_SOURCE" "$ICONDIR/oxidezap.svg"
+install -m644 "$ICON_SOURCE" "$ICONDIR/$APP_ID.svg"
+for size in 64 128 256 512; do
+    install -Dm644 "$SCRIPT_DIR/assets/oxidezap-${size}.png" \
+        "$ICONS_ROOT/${size}x${size}/apps/$APP_ID.png"
+done
 
 if [ -f "$METAINFO_SOURCE" ]; then
     install -m644 "$METAINFO_SOURCE" \
-        "$METAINFODIR/io.github.artur282.OxideZap.metainfo.xml"
+        "$METAINFODIR/$APP_ID.metainfo.xml"
 fi
 
 TMP_DESKTOP=$(mktemp)
@@ -140,14 +160,14 @@ EXEC_LINE="Exec=$EXEC_PATH %u" awk '
     /^Exec=/ { print ENVIRON["EXEC_LINE"]; next }
     { print }
 ' "$DESKTOP_SOURCE" > "$TMP_DESKTOP"
-install -m644 "$TMP_DESKTOP" "$APPDIR/oxidezap.desktop"
+install -m644 "$TMP_DESKTOP" "$APPDIR/$APP_ID.desktop"
 rm -f "$TMP_DESKTOP"
 trap - EXIT
 
 refresh_caches
 
 if command -v xdg-mime >/dev/null 2>&1; then
-    if xdg-mime default oxidezap.desktop x-scheme-handler/whatsapp >/dev/null 2>&1; then
+    if xdg-mime default "$APP_ID.desktop" x-scheme-handler/whatsapp >/dev/null 2>&1; then
         MIME_STATUS="registered"
     else
         MIME_STATUS="not registered (xdg-mime failed)"
@@ -158,10 +178,10 @@ fi
 
 echo "Installed $APP_NAME:"
 echo "  binary:   $BINDIR/oxidezap"
-echo "  desktop:  $APPDIR/oxidezap.desktop"
-echo "  icon:     $ICONDIR/oxidezap.svg"
+echo "  desktop:  $APPDIR/$APP_ID.desktop"
+echo "  icon:     $ICONDIR/$APP_ID.svg"
 if [ -f "$METAINFO_SOURCE" ]; then
-    echo "  metainfo: $METAINFODIR/io.github.artur282.OxideZap.metainfo.xml"
+    echo "  metainfo: $METAINFODIR/$APP_ID.metainfo.xml"
 fi
 echo "  whatsapp: $MIME_STATUS"
 echo
