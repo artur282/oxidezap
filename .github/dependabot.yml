@@ -5,6 +5,20 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # gtk-rs has to move in lockstep: webkit2gtk 2.0.2 pins gtk, gio and
+      # glib to ^0.18, while gtk 0.19 requires glib ^0.22 and Rust 1.92.
+      # Bumping one crate alone leaves two incompatible glib versions in the
+      # graph, so minor bumps of the family are handled by a coordinated
+      # upgrade instead of by Dependabot.
+      - dependency-name: gdkx11
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: glib
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: gtk
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: webkit2gtk
+        update-types: ["version-update:semver-minor"]
 
   - package-ecosystem: github-actions
     directory: "/"
