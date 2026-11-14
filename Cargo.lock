@@ -4190,7 +4190,6 @@ dependencies = [
  "libc",
  "notify-rust",
  "open",
- "rand_core 0.6.4",
  "raw-window-handle",
  "serde",
  "serde_json",
