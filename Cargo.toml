@@ -23,7 +23,7 @@ argon2 = "0.5"
 crossbeam-channel = "0.5"
 directories = "6"
 gdkx11 = "0.18"
-glib = "0.18"
+glib = "0.21"
 gpui = { package = "gpui-fast", version = "0.1.15", default-features = false, features = ["x11"] }
 gpui_platform = { package = "gpui-fast-platform", version = "0.1.15", default-features = false, features = ["x11"] }
 gtk = "0.18"
