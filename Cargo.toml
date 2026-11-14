@@ -33,7 +33,6 @@ ksni = { version = "0.3", default-features = false, features = ["blocking", "asy
 libc = "0.2.183"
 notify-rust = "4"
 open = "5"
-rand_core = { version = "0.6", features = ["getrandom"] }
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 smol = "2"
